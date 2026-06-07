@@ -22,13 +22,14 @@ type Lock struct {
 }
 
 type Lease struct {
-	ID         int64     `json:"id"`
-	LockName   string    `json:"lock_name"`
-	Holder     string    `json:"holder"`
-	LeaseSec   int       `json:"lease_sec"`
-	AcquiredAt time.Time `json:"acquired_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	Active     bool      `json:"active"`
+	ID            int64     `json:"id"`
+	LockName      string    `json:"lock_name"`
+	Holder        string    `json:"holder"`
+	LeaseSec      int       `json:"lease_sec"`
+	AcquiredAt    time.Time `json:"acquired_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Active        bool      `json:"active"`
+	RemainingSec  float64   `json:"remaining_sec,omitempty"`
 }
 
 type WaitQueueItem struct {

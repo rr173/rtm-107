@@ -132,15 +132,19 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 	}
 
 	if lock.Status == model.LockStatusHeld {
-		if lock.Holder == holder && lock.Reentrant && reentrant {
-			lock.Count++
-			lock.UpdatedAt = now
-			if err := m.storage.UpsertLock(lock); err != nil {
-				return nil, err
+		if lock.Holder == holder {
+			if lock.Reentrant && reentrant {
+				lock.Count++
+				lock.UpdatedAt = now
+				if err := m.storage.UpsertLock(lock); err != nil {
+					return nil, err
+				}
+				m.addHistoryLocked(lockName, holder, model.OpAcquire, fmt.Sprintf("reentrant acquire, count=%d", lock.Count))
+				lease, _ := m.storage.GetActiveLease(lockName)
+				fillLeaseRemaining(lease)
+				return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
 			}
-			m.addHistoryLocked(lockName, holder, model.OpAcquire, fmt.Sprintf("reentrant acquire, count=%d", lock.Count))
-			lease, _ := m.storage.GetActiveLease(lockName)
-			return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
+			return nil, fmt.Errorf("already hold this lock (non-reentrant)")
 		}
 
 		item := &model.WaitQueueItem{
@@ -189,6 +193,7 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 	m.setLeaseTimerLocked(lockName, time.Duration(leaseSec)*time.Second)
 	m.addHistoryLocked(lockName, holder, model.OpAcquire, fmt.Sprintf("acquired, lease=%ds", leaseSec))
 
+	fillLeaseRemaining(lease)
 	return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
 }
 
@@ -335,6 +340,7 @@ func (m *Manager) RenewLease(lockName, holder string, addSec int) (*model.Lease,
 
 	m.addHistoryLocked(lockName, holder, model.OpRenew, fmt.Sprintf("renewed +%ds", addSec))
 
+	fillLeaseRemaining(lease)
 	return lease, nil
 }
 
@@ -482,6 +488,7 @@ func (m *Manager) GetLockDetail(lockName string, withHistory bool) (*model.LockD
 	if lock.Status == model.LockStatusHeld {
 		lease, err := m.storage.GetActiveLease(lockName)
 		if err == nil && lease != nil {
+			fillLeaseRemaining(lease)
 			detail.Lease = lease
 		}
 	}
@@ -506,7 +513,15 @@ func (m *Manager) GetLockDetail(lockName string, withHistory bool) (*model.LockD
 func (m *Manager) ListActiveLeases() ([]model.Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.storage.ListActiveLeases()
+
+	leases, err := m.storage.ListActiveLeases()
+	if err != nil {
+		return nil, err
+	}
+	for i := range leases {
+		fillLeaseRemaining(&leases[i])
+	}
+	return leases, nil
 }
 
 func (m *Manager) GetLockHistory(lockName string, limit int) ([]model.OperationHistory, error) {
@@ -524,4 +539,15 @@ func (m *Manager) addHistoryLocked(lockName, holder string, op model.OperationTy
 		CreatedAt: time.Now(),
 	}
 	_ = m.storage.AddHistory(h)
+}
+
+func fillLeaseRemaining(lease *model.Lease) {
+	if lease == nil || !lease.Active {
+		return
+	}
+	remaining := time.Until(lease.ExpiresAt).Seconds()
+	if remaining < 0 {
+		remaining = 0
+	}
+	lease.RemainingSec = remaining
 }
