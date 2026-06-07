@@ -137,6 +137,7 @@ type CallerBinding struct {
 	UsedTokens        int       `json:"used_tokens"`
 	BorrowedTokens    int       `json:"borrowed_tokens"`
 	LentTokens        int       `json:"lent_tokens"`
+	ReservedTokens    int       `json:"reserved_tokens"`
 	LastRefillAt      time.Time `json:"last_refill_at,omitempty"`
 	WindowStartAt     time.Time `json:"window_start_at,omitempty"`
 	PrevWindowCount   int       `json:"prev_window_count,omitempty"`
@@ -202,6 +203,7 @@ type CallerStatus struct {
 	Remaining      int    `json:"remaining"`
 	BorrowedTokens int    `json:"borrowed_tokens"`
 	LentTokens     int    `json:"lent_tokens"`
+	ReservedTokens int    `json:"reserved_tokens"`
 	RateLimited    int64  `json:"rate_limited_count"`
 	WaitQueueLen   int    `json:"wait_queue_len,omitempty"`
 }
@@ -250,4 +252,39 @@ type BindCallerRequest struct {
 
 type AdjustQuotaRequest struct {
 	NewQuotaLimit int `json:"new_quota_limit" binding:"required,min=0"`
+}
+
+type ReservationStatus string
+
+const (
+	ReservationStatusPending   ReservationStatus = "pending"
+	ReservationStatusActive    ReservationStatus = "active"
+	ReservationStatusCompleted ReservationStatus = "completed"
+	ReservationStatusCancelled ReservationStatus = "cancelled"
+)
+
+type QuotaReservation struct {
+	ID         int64             `json:"id"`
+	PolicyName string            `json:"policy_name"`
+	CallerID   string            `json:"caller_id"`
+	Tokens     int               `json:"tokens"`
+	StartAt    time.Time         `json:"start_at"`
+	EndAt      time.Time         `json:"end_at"`
+	Status     ReservationStatus `json:"status"`
+	CreatedAt  time.Time         `json:"created_at"`
+	UpdatedAt  time.Time         `json:"updated_at"`
+}
+
+type CreateReservationRequest struct {
+	PolicyName string    `json:"policy_name" binding:"required"`
+	CallerID   string    `json:"caller_id" binding:"required"`
+	Tokens     int       `json:"tokens" binding:"required,min=1"`
+	StartAt    time.Time `json:"start_at" binding:"required"`
+	EndAt      time.Time `json:"end_at" binding:"required"`
+}
+
+type ReservationResult struct {
+	Success     bool              `json:"success"`
+	Message     string            `json:"message,omitempty"`
+	Reservation *QuotaReservation `json:"reservation,omitempty"`
 }

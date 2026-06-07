@@ -60,6 +60,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			rateLimit.GET("/stats", h.GetGlobalStats)
 			rateLimit.GET("/wait-queue", h.ListWaitQueue)
 			rateLimit.GET("/callers/:id/wait-queue", h.GetCallerWaitQueue)
+
+			reservations := rateLimit.Group("/reservations")
+			{
+				reservations.POST("", h.CreateReservation)
+				reservations.GET("", h.ListReservations)
+				reservations.GET("/:id", h.GetReservation)
+				reservations.POST("/:id/cancel", h.CancelReservation)
+			}
 		}
 	}
 }
@@ -461,4 +469,78 @@ func (h *Handler) GetCallerWaitQueue(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"wait_queue": items})
+}
+
+func (h *Handler) CreateReservation(c *gin.Context) {
+	var req model.CreateReservationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.rateLimiter.CreateReservation(req.PolicyName, req.CallerID, req.Tokens, req.StartAt, req.EndAt)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusBadRequest, result)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) GetReservation(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid reservation id"})
+		return
+	}
+
+	reservation, err := h.rateLimiter.GetReservation(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"reservation": reservation})
+}
+
+func (h *Handler) ListReservations(c *gin.Context) {
+	policyName := c.Query("policy")
+	callerID := c.Query("caller")
+	status := c.Query("status")
+
+	reservations, err := h.rateLimiter.ListReservations(policyName, callerID, status)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"reservations": reservations})
+}
+
+func (h *Handler) CancelReservation(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid reservation id"})
+		return
+	}
+
+	result, err := h.rateLimiter.CancelReservation(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusBadRequest, result)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
 }

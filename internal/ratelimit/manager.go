@@ -11,22 +11,24 @@ import (
 )
 
 type Manager struct {
-	storage    *storage.Storage
-	mu         sync.Mutex
-	policies   map[string]*model.RateLimitPolicy
-	bindings   map[string]*model.CallerBinding
-	waitQueue  []*model.RateLimitWaitItem
-	stopCh     chan struct{}
-	ticker     *time.Ticker
+	storage      *storage.Storage
+	mu           sync.Mutex
+	policies     map[string]*model.RateLimitPolicy
+	bindings     map[string]*model.CallerBinding
+	waitQueue    []*model.RateLimitWaitItem
+	reservations map[int64]*model.QuotaReservation
+	stopCh       chan struct{}
+	ticker       *time.Ticker
 }
 
 func NewManager(s *storage.Storage) *Manager {
 	return &Manager{
-		storage:   s,
-		policies:  make(map[string]*model.RateLimitPolicy),
-		bindings:  make(map[string]*model.CallerBinding),
-		waitQueue: make([]*model.RateLimitWaitItem, 0),
-		stopCh:    make(chan struct{}),
+		storage:      s,
+		policies:     make(map[string]*model.RateLimitPolicy),
+		bindings:     make(map[string]*model.CallerBinding),
+		waitQueue:    make([]*model.RateLimitWaitItem, 0),
+		reservations: make(map[int64]*model.QuotaReservation),
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -42,6 +44,9 @@ func (m *Manager) Start() error {
 	}
 	if err := m.loadWaitQueueLocked(); err != nil {
 		return fmt.Errorf("load wait queue: %w", err)
+	}
+	if err := m.loadReservationsLocked(); err != nil {
+		return fmt.Errorf("load reservations: %w", err)
 	}
 
 	m.ticker = time.NewTicker(500 * time.Millisecond)
@@ -106,6 +111,24 @@ func (m *Manager) loadWaitQueueLocked() error {
 	return nil
 }
 
+func (m *Manager) loadReservationsLocked() error {
+	reservations, err := m.storage.ListAllReservations("")
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range reservations {
+		r := &reservations[i]
+		if r.Status == model.ReservationStatusPending || r.Status == model.ReservationStatusActive {
+			if r.Status == model.ReservationStatusActive && r.EndAt.Before(now) {
+				r.Status = model.ReservationStatusCompleted
+			}
+			m.reservations[r.ID] = r
+		}
+	}
+	return nil
+}
+
 func (m *Manager) expDecayFactor(elapsed float64, windowSec float64) float64 {
 	if windowSec <= 0 {
 		return 0
@@ -125,6 +148,7 @@ func (m *Manager) effectiveLimit(b *model.CallerBinding) int {
 	}
 	limit += b.BorrowedTokens
 	limit -= b.LentTokens
+	limit += b.ReservedTokens
 	if limit < 0 {
 		limit = 0
 	}
@@ -204,6 +228,11 @@ func (m *Manager) refillTick() {
 	dirty := false
 
 	m.cleanupExpiredWaitItemsLocked(now)
+
+	reservationDirty := m.processReservationTickLocked(now)
+	if reservationDirty {
+		dirty = true
+	}
 
 	for _, b := range m.bindings {
 		policy, ok := m.policies[b.PolicyName]
@@ -304,6 +333,88 @@ func (m *Manager) cleanupExpiredWaitItemsLocked(now time.Time) {
 			_ = m.storage.RemoveWaitItem(id)
 		}
 	}
+}
+
+func (m *Manager) processReservationTickLocked(now time.Time) bool {
+	dirty := false
+
+	for _, r := range m.reservations {
+		if r.Status == model.ReservationStatusPending && !r.StartAt.After(now) {
+			if err := m.activateReservationLocked(r, now); err == nil {
+				dirty = true
+			}
+		}
+		if r.Status == model.ReservationStatusActive && !r.EndAt.After(now) {
+			if err := m.completeReservationLocked(r, now); err == nil {
+				dirty = true
+			}
+		}
+	}
+
+	return dirty
+}
+
+func (m *Manager) activateReservationLocked(r *model.QuotaReservation, now time.Time) error {
+	b, ok := m.bindings[r.CallerID]
+	if !ok {
+		log.Printf("[ratelimit-reservation] caller not found for activation: reservation=%d caller=%s", r.ID, r.CallerID)
+		r.Status = model.ReservationStatusCancelled
+		r.UpdatedAt = now
+		_ = m.storage.UpdateReservationStatus(r.ID, r.Status, now)
+		return fmt.Errorf("caller not found: %s", r.CallerID)
+	}
+
+	b.ReservedTokens += r.Tokens
+	b.UpdatedAt = now
+	r.Status = model.ReservationStatusActive
+	r.UpdatedAt = now
+
+	if err := m.storage.UpdateCallerBinding(b); err != nil {
+		b.ReservedTokens -= r.Tokens
+		b.UpdatedAt = now
+		return err
+	}
+	if err := m.storage.UpdateReservationStatus(r.ID, r.Status, now); err != nil {
+		b.ReservedTokens -= r.Tokens
+		b.UpdatedAt = now
+		_ = m.storage.UpdateCallerBinding(b)
+		r.Status = model.ReservationStatusPending
+		r.UpdatedAt = now
+		return err
+	}
+
+	log.Printf("[ratelimit-reservation] activated: id=%d policy=%s caller=%s tokens=%d", r.ID, r.PolicyName, r.CallerID, r.Tokens)
+	return nil
+}
+
+func (m *Manager) completeReservationLocked(r *model.QuotaReservation, now time.Time) error {
+	b, ok := m.bindings[r.CallerID]
+	if ok {
+		if b.ReservedTokens >= r.Tokens {
+			b.ReservedTokens -= r.Tokens
+		} else {
+			b.ReservedTokens = 0
+		}
+		b.UpdatedAt = now
+
+		effectiveLim := m.effectiveLimit(b)
+		if b.UsedTokens > effectiveLim {
+			b.UsedTokens = effectiveLim
+		}
+
+		if err := m.storage.UpdateCallerBinding(b); err != nil {
+			return err
+		}
+	}
+
+	r.Status = model.ReservationStatusCompleted
+	r.UpdatedAt = now
+	if err := m.storage.UpdateReservationStatus(r.ID, r.Status, now); err != nil {
+		return err
+	}
+
+	log.Printf("[ratelimit-reservation] completed: id=%d policy=%s caller=%s tokens=%d", r.ID, r.PolicyName, r.CallerID, r.Tokens)
+	return nil
 }
 
 func (m *Manager) tryGrantFromQueueLocked(now time.Time) int {
@@ -597,6 +708,7 @@ func (m *Manager) GetCallerStatus(callerID string) (*model.CallerStatus, error) 
 	}
 
 	now := time.Now()
+	m.processReservationTickLocked(now)
 	m.applyAlgorithmTick(b, policy, now)
 
 	effectiveLim := m.effectiveLimit(b)
@@ -618,6 +730,7 @@ func (m *Manager) GetCallerStatus(callerID string) (*model.CallerStatus, error) 
 		Remaining:      remaining,
 		BorrowedTokens: b.BorrowedTokens,
 		LentTokens:     b.LentTokens,
+		ReservedTokens: b.ReservedTokens,
 		RateLimited:    rateLimited,
 		WaitQueueLen:   waitCount,
 	}
@@ -631,6 +744,8 @@ func (m *Manager) ListCallerStatuses() ([]model.CallerStatus, error) {
 
 	now := time.Now()
 	var result []model.CallerStatus
+
+	m.processReservationTickLocked(now)
 
 	for _, b := range m.bindings {
 		policy, ok := m.policies[b.PolicyName]
@@ -658,6 +773,7 @@ func (m *Manager) ListCallerStatuses() ([]model.CallerStatus, error) {
 			Remaining:      remaining,
 			BorrowedTokens: b.BorrowedTokens,
 			LentTokens:     b.LentTokens,
+			ReservedTokens: b.ReservedTokens,
 			RateLimited:    rateLimited,
 			WaitQueueLen:   waitCount,
 		}
@@ -914,4 +1030,251 @@ func (m *Manager) ListWaitItems(callerID string) ([]model.RateLimitWaitItem, err
 		}
 	}
 	return items, nil
+}
+
+func (m *Manager) CreateReservation(policyName string, callerID string, tokens int, startAt time.Time, endAt time.Time) (*model.ReservationResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+
+	if !endAt.After(startAt) {
+		return &model.ReservationResult{
+			Success: false,
+			Message: "end time must be after start time",
+		}, nil
+	}
+
+	if endAt.Before(now) {
+		return &model.ReservationResult{
+			Success: false,
+			Message: "cannot reserve past time",
+		}, nil
+	}
+
+	if tokens <= 0 {
+		return &model.ReservationResult{
+			Success: false,
+			Message: "tokens must be positive",
+		}, nil
+	}
+
+	policy, ok := m.policies[policyName]
+	if !ok {
+		return &model.ReservationResult{
+			Success: false,
+			Message: fmt.Sprintf("policy not found: %s", policyName),
+		}, nil
+	}
+
+	if tokens > policy.MaxTokens {
+		return &model.ReservationResult{
+			Success: false,
+			Message: fmt.Sprintf("tokens exceeds policy max tokens: max=%d, requested=%d", policy.MaxTokens, tokens),
+		}, nil
+	}
+
+	if _, ok := m.bindings[callerID]; !ok {
+		return &model.ReservationResult{
+			Success: false,
+			Message: fmt.Sprintf("caller not found: %s", callerID),
+		}, nil
+	}
+
+	conflict, maxConcurrent := m.checkConflictLocked(policyName, startAt, endAt, tokens)
+	if conflict {
+		return &model.ReservationResult{
+			Success: false,
+			Message: fmt.Sprintf("reservation conflicts with existing reservations: max allowed concurrent tokens=%d", maxConcurrent),
+		}, nil
+	}
+
+	status := model.ReservationStatusPending
+	if !startAt.After(now) {
+		status = model.ReservationStatusActive
+	}
+
+	r := &model.QuotaReservation{
+		PolicyName: policyName,
+		CallerID:   callerID,
+		Tokens:     tokens,
+		StartAt:    startAt,
+		EndAt:      endAt,
+		Status:     status,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+
+	if err := m.storage.CreateReservation(r); err != nil {
+		return nil, err
+	}
+
+	m.reservations[r.ID] = r
+
+	if status == model.ReservationStatusActive {
+		b := m.bindings[callerID]
+		b.ReservedTokens += tokens
+		b.UpdatedAt = now
+		if err := m.storage.UpdateCallerBinding(b); err != nil {
+			delete(m.reservations, r.ID)
+			return nil, err
+		}
+		log.Printf("[ratelimit-reservation] created and activated: id=%d policy=%s caller=%s tokens=%d", r.ID, policyName, callerID, tokens)
+	} else {
+		log.Printf("[ratelimit-reservation] created: id=%d policy=%s caller=%s tokens=%d start=%v end=%v", r.ID, policyName, callerID, tokens, startAt, endAt)
+	}
+
+	copyR := *r
+	return &model.ReservationResult{
+		Success:     true,
+		Message:     "reservation created",
+		Reservation: &copyR,
+	}, nil
+}
+
+func (m *Manager) checkConflictLocked(policyName string, startAt time.Time, endAt time.Time, tokens int) (bool, int) {
+	policy, ok := m.policies[policyName]
+	if !ok {
+		return true, 0
+	}
+
+	maxTokens := policy.MaxTokens
+
+	type interval struct {
+		time   time.Time
+		delta  int
+	}
+
+	var events []interval
+	events = append(events, interval{time: startAt, delta: tokens})
+	events = append(events, interval{time: endAt, delta: -tokens})
+
+	for _, r := range m.reservations {
+		if r.PolicyName != policyName {
+			continue
+		}
+		if r.Status != model.ReservationStatusPending && r.Status != model.ReservationStatusActive {
+			continue
+		}
+		events = append(events, interval{time: r.StartAt, delta: r.Tokens})
+		events = append(events, interval{time: r.EndAt, delta: -r.Tokens})
+	}
+
+	for i := 0; i < len(events); i++ {
+		for j := i + 1; j < len(events); j++ {
+			if events[i].time.After(events[j].time) {
+				events[i], events[j] = events[j], events[i]
+			}
+		}
+	}
+
+	currentTokens := 0
+	for _, e := range events {
+		currentTokens += e.delta
+		if currentTokens > maxTokens {
+			return true, maxTokens
+		}
+	}
+
+	return false, maxTokens
+}
+
+func (m *Manager) CancelReservation(reservationID int64) (*model.ReservationResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+
+	r, ok := m.reservations[reservationID]
+	if !ok {
+		return &model.ReservationResult{
+			Success: false,
+			Message: fmt.Sprintf("reservation not found: %d", reservationID),
+		}, nil
+	}
+
+	if r.Status == model.ReservationStatusCompleted || r.Status == model.ReservationStatusCancelled {
+		return &model.ReservationResult{
+			Success: false,
+			Message: fmt.Sprintf("reservation already %s", r.Status),
+		}, nil
+	}
+
+	if r.Status == model.ReservationStatusActive {
+		b, ok := m.bindings[r.CallerID]
+		if ok {
+			if b.ReservedTokens >= r.Tokens {
+				b.ReservedTokens -= r.Tokens
+			} else {
+				b.ReservedTokens = 0
+			}
+			b.UpdatedAt = now
+
+			effectiveLim := m.effectiveLimit(b)
+			if b.UsedTokens > effectiveLim {
+				b.UsedTokens = effectiveLim
+			}
+
+			if err := m.storage.UpdateCallerBinding(b); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	r.Status = model.ReservationStatusCancelled
+	r.UpdatedAt = now
+
+	if err := m.storage.CancelReservation(reservationID, now); err != nil {
+		return nil, err
+	}
+
+	log.Printf("[ratelimit-reservation] cancelled: id=%d policy=%s caller=%s tokens=%d", r.ID, r.PolicyName, r.CallerID, r.Tokens)
+
+	copyR := *r
+	return &model.ReservationResult{
+		Success:     true,
+		Message:     "reservation cancelled",
+		Reservation: &copyR,
+	}, nil
+}
+
+func (m *Manager) GetReservation(reservationID int64) (*model.QuotaReservation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.reservations[reservationID]
+	if !ok {
+		return nil, fmt.Errorf("reservation not found: %d", reservationID)
+	}
+	copyR := *r
+	return &copyR, nil
+}
+
+func (m *Manager) ListReservations(policyName string, callerID string, status string) ([]model.QuotaReservation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var result []model.QuotaReservation
+	for _, r := range m.reservations {
+		if policyName != "" && r.PolicyName != policyName {
+			continue
+		}
+		if callerID != "" && r.CallerID != callerID {
+			continue
+		}
+		if status != "" && string(r.Status) != status {
+			continue
+		}
+		result = append(result, *r)
+	}
+
+	for i := 0; i < len(result); i++ {
+		for j := i + 1; j < len(result); j++ {
+			if result[i].StartAt.After(result[j].StartAt) {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+
+	return result, nil
 }

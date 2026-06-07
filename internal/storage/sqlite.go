@@ -109,6 +109,7 @@ func (s *Storage) initSchema() error {
 		used_tokens INTEGER NOT NULL DEFAULT 0,
 		borrowed_tokens INTEGER NOT NULL DEFAULT 0,
 		lent_tokens INTEGER NOT NULL DEFAULT 0,
+		reserved_tokens INTEGER NOT NULL DEFAULT 0,
 		last_refill_at DATETIME,
 		window_start_at DATETIME,
 		prev_window_count INTEGER NOT NULL DEFAULT 0,
@@ -146,15 +147,62 @@ func (s *Storage) initSchema() error {
 		timeout_at DATETIME NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS rl_reservations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		policy_name TEXT NOT NULL,
+		caller_id TEXT NOT NULL,
+		tokens INTEGER NOT NULL,
+		start_at DATETIME NOT NULL,
+		end_at DATETIME NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_rl_events_caller ON rl_events(caller_id);
 	CREATE INDEX IF NOT EXISTS idx_rl_events_policy ON rl_events(policy_name);
 	CREATE INDEX IF NOT EXISTS idx_rl_borrow_from ON rl_borrow_records(from_caller);
 	CREATE INDEX IF NOT EXISTS idx_rl_borrow_to ON rl_borrow_records(to_caller);
 	CREATE INDEX IF NOT EXISTS idx_rl_wait_caller ON rl_wait_queue(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_rl_reservations_policy ON rl_reservations(policy_name);
+	CREATE INDEX IF NOT EXISTS idx_rl_reservations_caller ON rl_reservations(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_rl_reservations_status ON rl_reservations(status);
+	CREATE INDEX IF NOT EXISTS idx_rl_reservations_start ON rl_reservations(start_at);
+	CREATE INDEX IF NOT EXISTS idx_rl_reservations_end ON rl_reservations(end_at);
 	`
 
 	_, err := s.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if err := s.migrateSchema(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Storage) migrateSchema() error {
+	columns := []string{"reserved_tokens"}
+	for _, col := range columns {
+		row := s.db.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('rl_caller_bindings') WHERE name = ?
+		`, col)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			log.Printf("[storage-migration] adding column %s to rl_caller_bindings", col)
+			_, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE rl_caller_bindings ADD COLUMN %s INTEGER NOT NULL DEFAULT 0", col))
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Storage) GetLock(name string) (*model.Lock, error) {
@@ -494,20 +542,21 @@ func (s *Storage) ListPolicies() ([]model.RateLimitPolicy, error) {
 
 func (s *Storage) UpsertCallerBinding(b *model.CallerBinding) error {
 	result, err := s.db.Exec(`
-		INSERT INTO rl_caller_bindings (caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO rl_caller_bindings (caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, reserved_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(caller_id) DO UPDATE SET
 			policy_name = excluded.policy_name,
 			quota_limit = excluded.quota_limit,
 			used_tokens = excluded.used_tokens,
 			borrowed_tokens = excluded.borrowed_tokens,
 			lent_tokens = excluded.lent_tokens,
+			reserved_tokens = excluded.reserved_tokens,
 			last_refill_at = excluded.last_refill_at,
 			window_start_at = excluded.window_start_at,
 			prev_window_count = excluded.prev_window_count,
 			curr_window_count = excluded.curr_window_count,
 			updated_at = excluded.updated_at
-	`, b.CallerID, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens,
+	`, b.CallerID, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens, b.ReservedTokens,
 		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.PrevWindowCount, b.CurrWindowCount, b.CreatedAt, b.UpdatedAt)
 	if err != nil {
 		return err
@@ -520,13 +569,13 @@ func (s *Storage) UpsertCallerBinding(b *model.CallerBinding) error {
 
 func (s *Storage) GetCallerBinding(callerID string) (*model.CallerBinding, error) {
 	row := s.db.QueryRow(`
-		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at
+		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, reserved_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at
 		FROM rl_caller_bindings WHERE caller_id = ?
 	`, callerID)
 
 	var b model.CallerBinding
 	var lastRefillAt, windowStartAt sql.NullTime
-	err := row.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens,
+	err := row.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens, &b.ReservedTokens,
 		&lastRefillAt, &windowStartAt, &b.PrevWindowCount, &b.CurrWindowCount, &b.CreatedAt, &b.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -545,7 +594,7 @@ func (s *Storage) GetCallerBinding(callerID string) (*model.CallerBinding, error
 
 func (s *Storage) ListCallerBindings() ([]model.CallerBinding, error) {
 	rows, err := s.db.Query(`
-		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at
+		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, reserved_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at
 		FROM rl_caller_bindings ORDER BY id
 	`)
 	if err != nil {
@@ -557,7 +606,7 @@ func (s *Storage) ListCallerBindings() ([]model.CallerBinding, error) {
 	for rows.Next() {
 		var b model.CallerBinding
 		var lastRefillAt, windowStartAt sql.NullTime
-		if err := rows.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens,
+		if err := rows.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens, &b.ReservedTokens,
 			&lastRefillAt, &windowStartAt, &b.PrevWindowCount, &b.CurrWindowCount, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -580,13 +629,14 @@ func (s *Storage) UpdateCallerBinding(b *model.CallerBinding) error {
 			used_tokens = ?,
 			borrowed_tokens = ?,
 			lent_tokens = ?,
+			reserved_tokens = ?,
 			last_refill_at = ?,
 			window_start_at = ?,
 			prev_window_count = ?,
 			curr_window_count = ?,
 			updated_at = ?
 		WHERE caller_id = ?
-	`, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens,
+	`, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens, b.ReservedTokens,
 		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.PrevWindowCount, b.CurrWindowCount, b.UpdatedAt, b.CallerID)
 	return err
 }
@@ -777,6 +827,211 @@ func (s *Storage) CountWaitItems(callerID string) (int, error) {
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM rl_wait_queue WHERE caller_id = ?`, callerID).Scan(&count)
 	return count, err
+}
+
+func (s *Storage) CreateReservation(r *model.QuotaReservation) error {
+	result, err := s.db.Exec(`
+		INSERT INTO rl_reservations (policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, r.PolicyName, r.CallerID, r.Tokens, r.StartAt, r.EndAt, r.Status, r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) GetReservation(id int64) (*model.QuotaReservation, error) {
+	row := s.db.QueryRow(`
+		SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+		FROM rl_reservations WHERE id = ?
+	`, id)
+
+	var r model.QuotaReservation
+	err := row.Scan(&r.ID, &r.PolicyName, &r.CallerID, &r.Tokens, &r.StartAt, &r.EndAt, &r.Status, &r.CreatedAt, &r.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Storage) UpdateReservationStatus(id int64, status model.ReservationStatus, updatedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE rl_reservations SET status = ?, updated_at = ? WHERE id = ?
+	`, status, updatedAt, id)
+	return err
+}
+
+func (s *Storage) CancelReservation(id int64, updatedAt time.Time) error {
+	return s.UpdateReservationStatus(id, model.ReservationStatusCancelled, updatedAt)
+}
+
+func (s *Storage) ListReservationsByPolicy(policyName string, status string) ([]model.QuotaReservation, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status != "" {
+		rows, err = s.db.Query(`
+			SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+			FROM rl_reservations WHERE policy_name = ? AND status = ? ORDER BY start_at
+		`, policyName, status)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+			FROM rl_reservations WHERE policy_name = ? ORDER BY start_at
+		`, policyName)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reservations []model.QuotaReservation
+	for rows.Next() {
+		var r model.QuotaReservation
+		if err := rows.Scan(&r.ID, &r.PolicyName, &r.CallerID, &r.Tokens, &r.StartAt, &r.EndAt, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, r)
+	}
+	return reservations, nil
+}
+
+func (s *Storage) ListReservationsByCaller(callerID string, status string) ([]model.QuotaReservation, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status != "" {
+		rows, err = s.db.Query(`
+			SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+			FROM rl_reservations WHERE caller_id = ? AND status = ? ORDER BY start_at
+		`, callerID, status)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+			FROM rl_reservations WHERE caller_id = ? ORDER BY start_at
+		`, callerID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reservations []model.QuotaReservation
+	for rows.Next() {
+		var r model.QuotaReservation
+		if err := rows.Scan(&r.ID, &r.PolicyName, &r.CallerID, &r.Tokens, &r.StartAt, &r.EndAt, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, r)
+	}
+	return reservations, nil
+}
+
+func (s *Storage) ListAllReservations(status string) ([]model.QuotaReservation, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status != "" {
+		rows, err = s.db.Query(`
+			SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+			FROM rl_reservations WHERE status = ? ORDER BY start_at
+		`, status)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+			FROM rl_reservations ORDER BY start_at
+		`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reservations []model.QuotaReservation
+	for rows.Next() {
+		var r model.QuotaReservation
+		if err := rows.Scan(&r.ID, &r.PolicyName, &r.CallerID, &r.Tokens, &r.StartAt, &r.EndAt, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, r)
+	}
+	return reservations, nil
+}
+
+func (s *Storage) ListReservationsInTimeRange(policyName string, startAt time.Time, endAt time.Time) ([]model.QuotaReservation, error) {
+	rows, err := s.db.Query(`
+		SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+		FROM rl_reservations
+		WHERE policy_name = ?
+		  AND status IN ('pending', 'active')
+		  AND start_at < ?
+		  AND end_at > ?
+		ORDER BY start_at
+	`, policyName, endAt, startAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reservations []model.QuotaReservation
+	for rows.Next() {
+		var r model.QuotaReservation
+		if err := rows.Scan(&r.ID, &r.PolicyName, &r.CallerID, &r.Tokens, &r.StartAt, &r.EndAt, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, r)
+	}
+	return reservations, nil
+}
+
+func (s *Storage) ListPendingReservationsToStart(now time.Time) ([]model.QuotaReservation, error) {
+	rows, err := s.db.Query(`
+		SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+		FROM rl_reservations
+		WHERE status = 'pending' AND start_at <= ?
+		ORDER BY start_at
+	`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reservations []model.QuotaReservation
+	for rows.Next() {
+		var r model.QuotaReservation
+		if err := rows.Scan(&r.ID, &r.PolicyName, &r.CallerID, &r.Tokens, &r.StartAt, &r.EndAt, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, r)
+	}
+	return reservations, nil
+}
+
+func (s *Storage) ListActiveReservationsToEnd(now time.Time) ([]model.QuotaReservation, error) {
+	rows, err := s.db.Query(`
+		SELECT id, policy_name, caller_id, tokens, start_at, end_at, status, created_at, updated_at
+		FROM rl_reservations
+		WHERE status = 'active' AND end_at <= ?
+		ORDER BY end_at
+	`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reservations []model.QuotaReservation
+	for rows.Next() {
+		var r model.QuotaReservation
+		if err := rows.Scan(&r.ID, &r.PolicyName, &r.CallerID, &r.Tokens, &r.StartAt, &r.EndAt, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, r)
+	}
+	return reservations, nil
 }
 
 func nullTime(t time.Time) interface{} {
