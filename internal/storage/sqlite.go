@@ -15,7 +15,7 @@ type Storage struct {
 }
 
 func New(path string) (*Storage, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -23,6 +23,8 @@ func New(path string) (*Storage, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
+
+	db.SetMaxOpenConns(1)
 
 	s := &Storage{db: db}
 	if err := s.initSchema(); err != nil {
@@ -86,6 +88,58 @@ func (s *Storage) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_leases_lock_name ON leases(lock_name);
 	CREATE INDEX IF NOT EXISTS idx_wait_queue_lock_name ON wait_queue(lock_name);
 	CREATE INDEX IF NOT EXISTS idx_history_lock_name ON op_history(lock_name);
+
+	CREATE TABLE IF NOT EXISTS rl_policies (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		algorithm TEXT NOT NULL,
+		window_sec INTEGER DEFAULT 0,
+		max_tokens INTEGER NOT NULL,
+		refill_rate REAL DEFAULT 0,
+		refill_unit TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS rl_caller_bindings (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		policy_name TEXT NOT NULL,
+		quota_limit INTEGER NOT NULL,
+		used_tokens INTEGER NOT NULL DEFAULT 0,
+		borrowed_tokens INTEGER NOT NULL DEFAULT 0,
+		lent_tokens INTEGER NOT NULL DEFAULT 0,
+		last_refill_at DATETIME,
+		window_start_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS rl_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		policy_name TEXT NOT NULL,
+		requested INTEGER NOT NULL,
+		granted INTEGER NOT NULL,
+		allowed INTEGER NOT NULL DEFAULT 1,
+		reason TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS rl_borrow_records (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_caller TEXT NOT NULL,
+		to_caller TEXT NOT NULL,
+		amount INTEGER NOT NULL,
+		status TEXT NOT NULL DEFAULT 'active',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		returned_at DATETIME
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_rl_events_caller ON rl_events(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_rl_events_policy ON rl_events(policy_name);
+	CREATE INDEX IF NOT EXISTS idx_rl_borrow_from ON rl_borrow_records(from_caller);
+	CREATE INDEX IF NOT EXISTS idx_rl_borrow_to ON rl_borrow_records(to_caller);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -375,4 +429,271 @@ func boolToInt(b bool) int {
 
 func (s *Storage) LogInfo(format string, v ...interface{}) {
 	log.Printf("[storage] "+format, v...)
+}
+
+func (s *Storage) CreatePolicy(p *model.RateLimitPolicy) error {
+	result, err := s.db.Exec(`
+		INSERT INTO rl_policies (name, algorithm, window_sec, max_tokens, refill_rate, refill_unit, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, p.Name, p.Algorithm, p.WindowSec, p.MaxTokens, p.RefillRate, p.RefillUnit, p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	p.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) GetPolicy(name string) (*model.RateLimitPolicy, error) {
+	row := s.db.QueryRow(`
+		SELECT id, name, algorithm, window_sec, max_tokens, refill_rate, refill_unit, created_at, updated_at
+		FROM rl_policies WHERE name = ?
+	`, name)
+
+	var p model.RateLimitPolicy
+	err := row.Scan(&p.ID, &p.Name, &p.Algorithm, &p.WindowSec, &p.MaxTokens, &p.RefillRate, &p.RefillUnit, &p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (s *Storage) ListPolicies() ([]model.RateLimitPolicy, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, algorithm, window_sec, max_tokens, refill_rate, refill_unit, created_at, updated_at
+		FROM rl_policies ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var policies []model.RateLimitPolicy
+	for rows.Next() {
+		var p model.RateLimitPolicy
+		if err := rows.Scan(&p.ID, &p.Name, &p.Algorithm, &p.WindowSec, &p.MaxTokens, &p.RefillRate, &p.RefillUnit, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		policies = append(policies, p)
+	}
+	return policies, nil
+}
+
+func (s *Storage) UpsertCallerBinding(b *model.CallerBinding) error {
+	result, err := s.db.Exec(`
+		INSERT INTO rl_caller_bindings (caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			policy_name = excluded.policy_name,
+			quota_limit = excluded.quota_limit,
+			used_tokens = excluded.used_tokens,
+			borrowed_tokens = excluded.borrowed_tokens,
+			lent_tokens = excluded.lent_tokens,
+			last_refill_at = excluded.last_refill_at,
+			window_start_at = excluded.window_start_at,
+			updated_at = excluded.updated_at
+	`, b.CallerID, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens,
+		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.CreatedAt, b.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if b.ID == 0 {
+		b.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetCallerBinding(callerID string) (*model.CallerBinding, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, created_at, updated_at
+		FROM rl_caller_bindings WHERE caller_id = ?
+	`, callerID)
+
+	var b model.CallerBinding
+	var lastRefillAt, windowStartAt sql.NullTime
+	err := row.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens,
+		&lastRefillAt, &windowStartAt, &b.CreatedAt, &b.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lastRefillAt.Valid {
+		b.LastRefillAt = lastRefillAt.Time
+	}
+	if windowStartAt.Valid {
+		b.WindowStartAt = windowStartAt.Time
+	}
+	return &b, nil
+}
+
+func (s *Storage) ListCallerBindings() ([]model.CallerBinding, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, created_at, updated_at
+		FROM rl_caller_bindings ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bindings []model.CallerBinding
+	for rows.Next() {
+		var b model.CallerBinding
+		var lastRefillAt, windowStartAt sql.NullTime
+		if err := rows.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens,
+			&lastRefillAt, &windowStartAt, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if lastRefillAt.Valid {
+			b.LastRefillAt = lastRefillAt.Time
+		}
+		if windowStartAt.Valid {
+			b.WindowStartAt = windowStartAt.Time
+		}
+		bindings = append(bindings, b)
+	}
+	return bindings, nil
+}
+
+func (s *Storage) UpdateCallerBinding(b *model.CallerBinding) error {
+	_, err := s.db.Exec(`
+		UPDATE rl_caller_bindings SET
+			policy_name = ?,
+			quota_limit = ?,
+			used_tokens = ?,
+			borrowed_tokens = ?,
+			lent_tokens = ?,
+			last_refill_at = ?,
+			window_start_at = ?,
+			updated_at = ?
+		WHERE caller_id = ?
+	`, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens,
+		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.UpdatedAt, b.CallerID)
+	return err
+}
+
+func (s *Storage) AddRateLimitEvent(e *model.RateLimitEvent) error {
+	allowedInt := 0
+	if e.Allowed {
+		allowedInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO rl_events (caller_id, policy_name, requested, granted, allowed, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, e.CallerID, e.PolicyName, e.Requested, e.Granted, allowedInt, e.Reason, e.CreatedAt)
+	if err != nil {
+		return err
+	}
+	e.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListRateLimitEvents(callerID string, limit int) ([]model.RateLimitEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, policy_name, requested, granted, allowed, reason, created_at
+		FROM rl_events WHERE caller_id = ? ORDER BY id DESC LIMIT ?
+	`, callerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []model.RateLimitEvent
+	for rows.Next() {
+		var e model.RateLimitEvent
+		var allowedInt int
+		if err := rows.Scan(&e.ID, &e.CallerID, &e.PolicyName, &e.Requested, &e.Granted, &allowedInt, &e.Reason, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.Allowed = allowedInt != 0
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+func (s *Storage) CountRateLimited(callerID string) (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM rl_events WHERE caller_id = ? AND allowed = 0`, callerID).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) CountAllEvents() (int64, int64, error) {
+	var total, allowed int64
+	row := s.db.QueryRow(`SELECT COUNT(*), SUM(CASE WHEN allowed = 1 THEN 1 ELSE 0 END) FROM rl_events`)
+	err := row.Scan(&total, &allowed)
+	return total, allowed, err
+}
+
+func (s *Storage) CreateBorrowRecord(r *model.QuotaBorrowRecord) error {
+	result, err := s.db.Exec(`
+		INSERT INTO rl_borrow_records (from_caller, to_caller, amount, status, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, r.FromCaller, r.ToCaller, r.Amount, r.Status, r.CreatedAt)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListActiveBorrows() ([]model.QuotaBorrowRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT id, from_caller, to_caller, amount, status, created_at, returned_at
+		FROM rl_borrow_records WHERE status = 'active' ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []model.QuotaBorrowRecord
+	for rows.Next() {
+		var r model.QuotaBorrowRecord
+		var returnedAt sql.NullTime
+		if err := rows.Scan(&r.ID, &r.FromCaller, &r.ToCaller, &r.Amount, &r.Status, &r.CreatedAt, &returnedAt); err != nil {
+			return nil, err
+		}
+		if returnedAt.Valid {
+			r.ReturnedAt = returnedAt.Time
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+func (s *Storage) ReturnBorrow(fromCaller, toCaller string, amount int, returnedAt time.Time) error {
+	row := s.db.QueryRow(`
+		SELECT id FROM rl_borrow_records
+		WHERE from_caller = ? AND to_caller = ? AND status = 'active' AND amount = ?
+		ORDER BY id LIMIT 1
+	`, fromCaller, toCaller, amount)
+
+	var id int64
+	err := row.Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(`
+		UPDATE rl_borrow_records SET status = 'returned', returned_at = ?
+		WHERE id = ?
+	`, returnedAt, id)
+	return err
+}
+
+func nullTime(t time.Time) interface{} {
+	if t.IsZero() {
+		return nil
+	}
+	return t
 }

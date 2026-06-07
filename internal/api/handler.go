@@ -3,17 +3,20 @@ package api
 import (
 	"net/http"
 	"rtm-107/internal/lock"
+	"rtm-107/internal/model"
+	"rtm-107/internal/ratelimit"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 )
 
 type Handler struct {
-	manager *lock.Manager
+	manager      *lock.Manager
+	rateLimiter  *ratelimit.Manager
 }
 
-func NewHandler(m *lock.Manager) *Handler {
-	return &Handler{manager: m}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -33,6 +36,29 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		}
 		api.GET("/leases", h.ListLeases)
 		api.GET("/wait-graph", h.GetWaitGraph)
+
+		rateLimit := api.Group("/ratelimit")
+		{
+			policies := rateLimit.Group("/policies")
+			{
+				policies.GET("", h.ListPolicies)
+				policies.GET("/:name", h.GetPolicy)
+				policies.POST("", h.CreatePolicy)
+			}
+			callers := rateLimit.Group("/callers")
+			{
+				callers.GET("", h.ListCallers)
+				callers.GET("/:id", h.GetCallerStatus)
+				callers.POST("/bind", h.BindCaller)
+				callers.POST("/:id/request", h.RequestTokens)
+				callers.POST("/:id/adjust", h.AdjustQuota)
+				callers.GET("/:id/history", h.GetCallerHistory)
+			}
+			rateLimit.POST("/borrow", h.BorrowQuota)
+			rateLimit.POST("/return", h.ReturnQuota)
+			rateLimit.GET("/borrows", h.ListBorrows)
+			rateLimit.GET("/stats", h.GetGlobalStats)
+		}
 	}
 }
 
@@ -218,4 +244,197 @@ func (h *Handler) GetWaitGraph(c *gin.Context) {
 		"nodes": graph.Nodes,
 		"edges": graph.Edges,
 	})
+}
+
+func (h *Handler) CreatePolicy(c *gin.Context) {
+	var req model.PolicyCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	policy, err := h.rateLimiter.CreatePolicy(req.Name, req.Algorithm, req.WindowSec, req.MaxTokens, req.RefillRate, req.RefillUnit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"policy": policy})
+}
+
+func (h *Handler) GetPolicy(c *gin.Context) {
+	name := c.Param("name")
+
+	policy, err := h.rateLimiter.GetPolicy(name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"policy": policy})
+}
+
+func (h *Handler) ListPolicies(c *gin.Context) {
+	policies, err := h.rateLimiter.ListPolicies()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"policies": policies})
+}
+
+func (h *Handler) BindCaller(c *gin.Context) {
+	var req model.BindCallerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	binding, err := h.rateLimiter.BindCaller(req.CallerID, req.PolicyName, req.QuotaLimit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"binding": binding})
+}
+
+func (h *Handler) RequestTokens(c *gin.Context) {
+	callerID := c.Param("id")
+
+	var req model.TokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.rateLimiter.RequestTokens(callerID, req.Tokens)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) GetCallerStatus(c *gin.Context) {
+	callerID := c.Param("id")
+
+	status, err := h.rateLimiter.GetCallerStatus(callerID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"caller": status})
+}
+
+func (h *Handler) ListCallers(c *gin.Context) {
+	statuses, err := h.rateLimiter.ListCallerStatuses()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"callers": statuses})
+}
+
+func (h *Handler) AdjustQuota(c *gin.Context) {
+	callerID := c.Param("id")
+
+	var req model.AdjustQuotaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := h.rateLimiter.AdjustQuota(callerID, req.NewQuotaLimit); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	status, err := h.rateLimiter.GetCallerStatus(callerID)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "caller": status})
+}
+
+func (h *Handler) BorrowQuota(c *gin.Context) {
+	var req model.BorrowRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.rateLimiter.BorrowQuota(req.FromCaller, req.ToCaller, req.Amount)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusBadRequest, result)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) ReturnQuota(c *gin.Context) {
+	var req model.ReturnRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.rateLimiter.ReturnQuota(req.FromCaller, req.ToCaller, req.Amount)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusBadRequest, result)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) GetGlobalStats(c *gin.Context) {
+	stats, err := h.rateLimiter.GetGlobalStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
+func (h *Handler) GetCallerHistory(c *gin.Context) {
+	callerID := c.Param("id")
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, _ := strconv.Atoi(limitStr)
+
+	history, err := h.rateLimiter.GetCallerHistory(callerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
+func (h *Handler) ListBorrows(c *gin.Context) {
+	records, err := h.rateLimiter.ListBorrowRecords()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"borrows": records})
 }
