@@ -29,8 +29,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			locks.POST("/:name/release", h.ReleaseLock)
 			locks.POST("/:name/renew", h.RenewLock)
 			locks.GET("/:name/history", h.GetLockHistory)
+			locks.POST("/batch/acquire", h.AcquireLocksBatch)
 		}
 		api.GET("/leases", h.ListLeases)
+		api.GET("/wait-graph", h.GetWaitGraph)
 	}
 }
 
@@ -86,6 +88,16 @@ func (h *Handler) AcquireLock(c *gin.Context) {
 	result, err := h.manager.AcquireLock(name, req.Holder, req.LeaseSec, req.Reentrant)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if result.Deadlock {
+		c.JSON(http.StatusConflict, gin.H{
+			"acquired":       false,
+			"deadlock":       true,
+			"deadlock_cycle": result.DeadlockCycle.Cycle,
+			"lock":           result.Lock,
+		})
 		return
 	}
 
@@ -158,4 +170,52 @@ func (h *Handler) ListLeases(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"leases": leases})
+}
+
+type BatchAcquireRequest struct {
+	LockNames []string `json:"lock_names" binding:"required,min=1"`
+	Holder    string   `json:"holder" binding:"required"`
+	LeaseSec  int      `json:"lease_sec" binding:"required,min=1"`
+	Reentrant bool     `json:"reentrant"`
+}
+
+func (h *Handler) AcquireLocksBatch(c *gin.Context) {
+	var req BatchAcquireRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.manager.AcquireLocksBatch(req.LockNames, req.Holder, req.LeaseSec, req.Reentrant)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !result.Acquired {
+		c.JSON(http.StatusConflict, gin.H{
+			"acquired":    false,
+			"failed_lock": result.FailedLock,
+			"failed_by":   result.FailedBy,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"acquired": true,
+		"locks":    result.Locks,
+		"leases":   result.Leases,
+	})
+}
+
+func (h *Handler) GetWaitGraph(c *gin.Context) {
+	graph, err := h.manager.GetWaitGraph()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"nodes": graph.Nodes,
+		"edges": graph.Edges,
+	})
 }

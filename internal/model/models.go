@@ -78,3 +78,33 @@ type LockStatusInfo struct {
 	RemainingSec   float64    `json:"remaining_sec,omitempty"`
 	WaitQueueLen   int        `json:"wait_queue_len"`
 }
+
+type WaitGraphEdge struct {
+	Waiter    string `json:"waiter"`
+	LockName  string `json:"lock_name"`
+	Holder    string `json:"holder"`
+}
+
+type DeadlockCycle struct {
+	Cycle []WaitGraphEdge `json:"cycle"`
+}
+
+type BatchAcquireRequest struct {
+	LockNames []string `json:"lock_names" binding:"required,min=1"`
+	Holder    string   `json:"holder" binding:"required"`
+	LeaseSec  int      `json:"lease_sec" binding:"required,min=1"`
+	Reentrant bool     `json:"reentrant"`
+}
+
+type BatchAcquireResult struct {
+	Acquired    bool     `json:"acquired"`
+	FailedLock  string   `json:"failed_lock,omitempty"`
+	FailedBy    string   `json:"failed_by,omitempty"`
+	Locks       []Lock   `json:"locks,omitempty"`
+	Leases      []Lease  `json:"leases,omitempty"`
+}
+
+type WaitGraph struct {
+	Edges []WaitGraphEdge `json:"edges"`
+	Nodes []string        `json:"nodes"`
+}
