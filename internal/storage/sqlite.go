@@ -111,6 +111,8 @@ func (s *Storage) initSchema() error {
 		lent_tokens INTEGER NOT NULL DEFAULT 0,
 		last_refill_at DATETIME,
 		window_start_at DATETIME,
+		prev_window_count INTEGER NOT NULL DEFAULT 0,
+		curr_window_count INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -136,10 +138,19 @@ func (s *Storage) initSchema() error {
 		returned_at DATETIME
 	);
 
+	CREATE TABLE IF NOT EXISTS rl_wait_queue (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		tokens INTEGER NOT NULL,
+		enqueued_at DATETIME NOT NULL,
+		timeout_at DATETIME NOT NULL
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_rl_events_caller ON rl_events(caller_id);
 	CREATE INDEX IF NOT EXISTS idx_rl_events_policy ON rl_events(policy_name);
 	CREATE INDEX IF NOT EXISTS idx_rl_borrow_from ON rl_borrow_records(from_caller);
 	CREATE INDEX IF NOT EXISTS idx_rl_borrow_to ON rl_borrow_records(to_caller);
+	CREATE INDEX IF NOT EXISTS idx_rl_wait_caller ON rl_wait_queue(caller_id);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -483,8 +494,8 @@ func (s *Storage) ListPolicies() ([]model.RateLimitPolicy, error) {
 
 func (s *Storage) UpsertCallerBinding(b *model.CallerBinding) error {
 	result, err := s.db.Exec(`
-		INSERT INTO rl_caller_bindings (caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO rl_caller_bindings (caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(caller_id) DO UPDATE SET
 			policy_name = excluded.policy_name,
 			quota_limit = excluded.quota_limit,
@@ -493,9 +504,11 @@ func (s *Storage) UpsertCallerBinding(b *model.CallerBinding) error {
 			lent_tokens = excluded.lent_tokens,
 			last_refill_at = excluded.last_refill_at,
 			window_start_at = excluded.window_start_at,
+			prev_window_count = excluded.prev_window_count,
+			curr_window_count = excluded.curr_window_count,
 			updated_at = excluded.updated_at
 	`, b.CallerID, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens,
-		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.CreatedAt, b.UpdatedAt)
+		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.PrevWindowCount, b.CurrWindowCount, b.CreatedAt, b.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -507,14 +520,14 @@ func (s *Storage) UpsertCallerBinding(b *model.CallerBinding) error {
 
 func (s *Storage) GetCallerBinding(callerID string) (*model.CallerBinding, error) {
 	row := s.db.QueryRow(`
-		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, created_at, updated_at
+		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at
 		FROM rl_caller_bindings WHERE caller_id = ?
 	`, callerID)
 
 	var b model.CallerBinding
 	var lastRefillAt, windowStartAt sql.NullTime
 	err := row.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens,
-		&lastRefillAt, &windowStartAt, &b.CreatedAt, &b.UpdatedAt)
+		&lastRefillAt, &windowStartAt, &b.PrevWindowCount, &b.CurrWindowCount, &b.CreatedAt, &b.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -532,7 +545,7 @@ func (s *Storage) GetCallerBinding(callerID string) (*model.CallerBinding, error
 
 func (s *Storage) ListCallerBindings() ([]model.CallerBinding, error) {
 	rows, err := s.db.Query(`
-		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, created_at, updated_at
+		SELECT id, caller_id, policy_name, quota_limit, used_tokens, borrowed_tokens, lent_tokens, last_refill_at, window_start_at, prev_window_count, curr_window_count, created_at, updated_at
 		FROM rl_caller_bindings ORDER BY id
 	`)
 	if err != nil {
@@ -545,7 +558,7 @@ func (s *Storage) ListCallerBindings() ([]model.CallerBinding, error) {
 		var b model.CallerBinding
 		var lastRefillAt, windowStartAt sql.NullTime
 		if err := rows.Scan(&b.ID, &b.CallerID, &b.PolicyName, &b.QuotaLimit, &b.UsedTokens, &b.BorrowedTokens, &b.LentTokens,
-			&lastRefillAt, &windowStartAt, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			&lastRefillAt, &windowStartAt, &b.PrevWindowCount, &b.CurrWindowCount, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if lastRefillAt.Valid {
@@ -569,10 +582,12 @@ func (s *Storage) UpdateCallerBinding(b *model.CallerBinding) error {
 			lent_tokens = ?,
 			last_refill_at = ?,
 			window_start_at = ?,
+			prev_window_count = ?,
+			curr_window_count = ?,
 			updated_at = ?
 		WHERE caller_id = ?
 	`, b.PolicyName, b.QuotaLimit, b.UsedTokens, b.BorrowedTokens, b.LentTokens,
-		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.UpdatedAt, b.CallerID)
+		nullTime(b.LastRefillAt), nullTime(b.WindowStartAt), b.PrevWindowCount, b.CurrWindowCount, b.UpdatedAt, b.CallerID)
 	return err
 }
 
@@ -689,6 +704,79 @@ func (s *Storage) ReturnBorrow(fromCaller, toCaller string, amount int, returned
 		WHERE id = ?
 	`, returnedAt, id)
 	return err
+}
+
+func (s *Storage) AddWaitItem(item *model.RateLimitWaitItem) error {
+	result, err := s.db.Exec(`
+		INSERT INTO rl_wait_queue (caller_id, tokens, enqueued_at, timeout_at)
+		VALUES (?, ?, ?, ?)
+	`, item.CallerID, item.Tokens, item.EnqueuedAt, item.TimeoutAt)
+	if err != nil {
+		return err
+	}
+	item.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListWaitItemsByCaller(callerID string) ([]model.RateLimitWaitItem, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, tokens, enqueued_at, timeout_at
+		FROM rl_wait_queue WHERE caller_id = ? ORDER BY id
+	`, callerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []model.RateLimitWaitItem
+	for rows.Next() {
+		var item model.RateLimitWaitItem
+		if err := rows.Scan(&item.ID, &item.CallerID, &item.Tokens, &item.EnqueuedAt, &item.TimeoutAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (s *Storage) ListAllWaitItems() ([]model.RateLimitWaitItem, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, tokens, enqueued_at, timeout_at
+		FROM rl_wait_queue ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []model.RateLimitWaitItem
+	for rows.Next() {
+		var item model.RateLimitWaitItem
+		if err := rows.Scan(&item.ID, &item.CallerID, &item.Tokens, &item.EnqueuedAt, &item.TimeoutAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (s *Storage) RemoveWaitItem(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM rl_wait_queue WHERE id = ?`, id)
+	return err
+}
+
+func (s *Storage) RemoveExpiredWaitItems(now time.Time) (int64, error) {
+	result, err := s.db.Exec(`DELETE FROM rl_wait_queue WHERE timeout_at <= ?`, now)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *Storage) CountWaitItems(callerID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM rl_wait_queue WHERE caller_id = ?`, callerID).Scan(&count)
+	return count, err
 }
 
 func nullTime(t time.Time) interface{} {

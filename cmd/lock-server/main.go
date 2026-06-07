@@ -139,11 +139,11 @@ func seedDemoData(lockMgr *lock.Manager, rlMgr *ratelimit.Manager) error {
 	}
 	log.Println("[demo] bound service-gamma to fixed-window-policy (quota=30)")
 
-	if result, err := rlMgr.RequestTokens("service-alpha", 5); err == nil && result.Allowed {
+	if result, err := rlMgr.RequestTokens("service-alpha", 5, false, 0); err == nil && result.Allowed {
 		log.Printf("[demo] service-alpha requested 5 tokens, granted, remaining=%d", result.Remaining)
 	}
 
-	if result, err := rlMgr.RequestTokens("service-beta", 3); err == nil && result.Allowed {
+	if result, err := rlMgr.RequestTokens("service-beta", 3, false, 0); err == nil && result.Allowed {
 		log.Printf("[demo] service-beta requested 3 tokens, granted, remaining=%d", result.Remaining)
 	}
 

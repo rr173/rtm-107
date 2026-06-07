@@ -58,6 +58,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			rateLimit.POST("/return", h.ReturnQuota)
 			rateLimit.GET("/borrows", h.ListBorrows)
 			rateLimit.GET("/stats", h.GetGlobalStats)
+			rateLimit.GET("/wait-queue", h.ListWaitQueue)
+			rateLimit.GET("/callers/:id/wait-queue", h.GetCallerWaitQueue)
 		}
 	}
 }
@@ -309,7 +311,7 @@ func (h *Handler) RequestTokens(c *gin.Context) {
 		return
 	}
 
-	result, err := h.rateLimiter.RequestTokens(callerID, req.Tokens)
+	result, err := h.rateLimiter.RequestTokens(callerID, req.Tokens, req.Waitable, req.WaitSec)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -437,4 +439,26 @@ func (h *Handler) ListBorrows(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"borrows": records})
+}
+
+func (h *Handler) ListWaitQueue(c *gin.Context) {
+	items, err := h.rateLimiter.ListWaitItems("")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"wait_queue": items})
+}
+
+func (h *Handler) GetCallerWaitQueue(c *gin.Context) {
+	callerID := c.Param("id")
+
+	items, err := h.rateLimiter.ListWaitItems(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"wait_queue": items})
 }

@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"fmt"
 	"log"
+	"math"
 	"rtm-107/internal/model"
 	"rtm-107/internal/storage"
 	"sync"
@@ -14,16 +15,18 @@ type Manager struct {
 	mu         sync.Mutex
 	policies   map[string]*model.RateLimitPolicy
 	bindings   map[string]*model.CallerBinding
+	waitQueue  []*model.RateLimitWaitItem
 	stopCh     chan struct{}
 	ticker     *time.Ticker
 }
 
 func NewManager(s *storage.Storage) *Manager {
 	return &Manager{
-		storage:  s,
-		policies: make(map[string]*model.RateLimitPolicy),
-		bindings: make(map[string]*model.CallerBinding),
-		stopCh:   make(chan struct{}),
+		storage:   s,
+		policies:  make(map[string]*model.RateLimitPolicy),
+		bindings:  make(map[string]*model.CallerBinding),
+		waitQueue: make([]*model.RateLimitWaitItem, 0),
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -36,6 +39,9 @@ func (m *Manager) Start() error {
 	}
 	if err := m.loadBindingsLocked(); err != nil {
 		return fmt.Errorf("load bindings: %w", err)
+	}
+	if err := m.loadWaitQueueLocked(); err != nil {
+		return fmt.Errorf("load wait queue: %w", err)
 	}
 
 	m.ticker = time.NewTicker(500 * time.Millisecond)
@@ -86,6 +92,45 @@ func (m *Manager) loadBindingsLocked() error {
 	return nil
 }
 
+func (m *Manager) loadWaitQueueLocked() error {
+	items, err := m.storage.ListAllWaitItems()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range items {
+		if items[i].TimeoutAt.After(now) {
+			m.waitQueue = append(m.waitQueue, &items[i])
+		}
+	}
+	return nil
+}
+
+func (m *Manager) expDecayFactor(elapsed float64, windowSec float64) float64 {
+	if windowSec <= 0 {
+		return 0
+	}
+	tau := windowSec / 3.0
+	return math.Exp(-elapsed / tau)
+}
+
+func (m *Manager) effectiveLimit(b *model.CallerBinding) int {
+	policy, ok := m.policies[b.PolicyName]
+	if !ok {
+		return b.QuotaLimit
+	}
+	limit := b.QuotaLimit
+	if limit > policy.MaxTokens {
+		limit = policy.MaxTokens
+	}
+	limit += b.BorrowedTokens
+	limit -= b.LentTokens
+	if limit < 0 {
+		limit = 0
+	}
+	return limit
+}
+
 func (m *Manager) reconcileState(b *model.CallerBinding, policy *model.RateLimitPolicy, now time.Time) {
 	switch policy.Algorithm {
 	case model.AlgoFixedWindow:
@@ -108,16 +153,13 @@ func (m *Manager) reconcileState(b *model.CallerBinding, policy *model.RateLimit
 			elapsed := now.Sub(b.LastRefillAt).Seconds()
 			refillAmount := int(elapsed * policy.RefillRate)
 			if refillAmount > 0 {
-				effectiveLimit := b.QuotaLimit + b.BorrowedTokens - b.LentTokens
-				if effectiveLimit < 0 {
-					effectiveLimit = 0
-				}
-				currentTokens := effectiveLimit - b.UsedTokens
+				effectiveLim := m.effectiveLimit(b)
+				currentTokens := effectiveLim - b.UsedTokens
 				newTokens := currentTokens + refillAmount
-				if newTokens > effectiveLimit {
-					newTokens = effectiveLimit
+				if newTokens > effectiveLim {
+					newTokens = effectiveLim
 				}
-				b.UsedTokens = effectiveLimit - newTokens
+				b.UsedTokens = effectiveLim - newTokens
 				if b.UsedTokens < 0 {
 					b.UsedTokens = 0
 				}
@@ -128,6 +170,17 @@ func (m *Manager) reconcileState(b *model.CallerBinding, policy *model.RateLimit
 		if b.WindowStartAt.IsZero() {
 			b.WindowStartAt = now
 			b.UsedTokens = 0
+		} else {
+			elapsed := now.Sub(b.WindowStartAt).Seconds()
+			windowSec := float64(policy.WindowSec)
+			if windowSec > 0 && elapsed > 0 {
+				decayFactor := m.expDecayFactor(elapsed, windowSec)
+				b.UsedTokens = int(float64(b.UsedTokens) * decayFactor)
+				if b.UsedTokens < 0 {
+					b.UsedTokens = 0
+				}
+			}
+			b.WindowStartAt = now
 		}
 	}
 }
@@ -150,6 +203,8 @@ func (m *Manager) refillTick() {
 	now := time.Now()
 	dirty := false
 
+	m.cleanupExpiredWaitItemsLocked(now)
+
 	for _, b := range m.bindings {
 		policy, ok := m.policies[b.PolicyName]
 		if !ok {
@@ -157,6 +212,13 @@ func (m *Manager) refillTick() {
 		}
 		changed := m.applyAlgorithmTick(b, policy, now)
 		if changed {
+			dirty = true
+		}
+	}
+
+	if len(m.waitQueue) > 0 {
+		granted := m.tryGrantFromQueueLocked(now)
+		if granted > 0 {
 			dirty = true
 		}
 	}
@@ -185,37 +247,34 @@ func (m *Manager) applyAlgorithmTick(b *model.CallerBinding, policy *model.RateL
 			return false
 		}
 		refillAmount := elapsed * policy.RefillRate
-		if refillAmount < 1 {
+		if refillAmount < 0.1 {
+			b.LastRefillAt = now
 			return false
 		}
-		effectiveLimit := b.QuotaLimit + b.BorrowedTokens - b.LentTokens
-		if effectiveLimit < 0 {
-			effectiveLimit = 0
-		}
-		currentTokens := float64(effectiveLimit - b.UsedTokens)
+		effectiveLim := m.effectiveLimit(b)
+		currentTokens := float64(effectiveLim - b.UsedTokens)
 		newTokens := currentTokens + refillAmount
-		if newTokens > float64(effectiveLimit) {
-			newTokens = float64(effectiveLimit)
+		if newTokens > float64(effectiveLim) {
+			newTokens = float64(effectiveLim)
 		}
-		newUsed := int(float64(effectiveLimit) - newTokens)
+		newUsed := int(float64(effectiveLim) - newTokens)
 		if newUsed < 0 {
 			newUsed = 0
 		}
-		if newUsed != b.UsedTokens {
-			b.UsedTokens = newUsed
-			b.LastRefillAt = now
-			b.UpdatedAt = now
-			return true
-		}
+		changed := newUsed != b.UsedTokens
+		b.UsedTokens = newUsed
 		b.LastRefillAt = now
-		return true
+		b.UpdatedAt = now
+		return changed
 	case model.AlgoSlidingWindow:
 		elapsed := now.Sub(b.WindowStartAt).Seconds()
-		if elapsed >= float64(policy.WindowSec) {
-			decayFactor := 1.0 - (float64(policy.WindowSec) / elapsed)
-			if decayFactor < 0 {
-				decayFactor = 0
-			}
+		windowSec := float64(policy.WindowSec)
+		if windowSec <= 0 {
+			windowSec = 60
+		}
+
+		if elapsed > 0 {
+			decayFactor := m.expDecayFactor(elapsed, windowSec)
 			b.UsedTokens = int(float64(b.UsedTokens) * decayFactor)
 			if b.UsedTokens < 0 {
 				b.UsedTokens = 0
@@ -224,8 +283,85 @@ func (m *Manager) applyAlgorithmTick(b *model.CallerBinding, policy *model.RateL
 			b.UpdatedAt = now
 			return true
 		}
+		return false
 	}
 	return false
+}
+
+func (m *Manager) cleanupExpiredWaitItemsLocked(now time.Time) {
+	alive := make([]*model.RateLimitWaitItem, 0, len(m.waitQueue))
+	expired := make([]int64, 0)
+	for _, item := range m.waitQueue {
+		if item.TimeoutAt.Before(now) || item.TimeoutAt.Equal(now) {
+			expired = append(expired, item.ID)
+		} else {
+			alive = append(alive, item)
+		}
+	}
+	if len(expired) > 0 {
+		m.waitQueue = alive
+		for _, id := range expired {
+			_ = m.storage.RemoveWaitItem(id)
+		}
+	}
+}
+
+func (m *Manager) tryGrantFromQueueLocked(now time.Time) int {
+	granted := 0
+	remaining := make([]*model.RateLimitWaitItem, 0, len(m.waitQueue))
+
+	for _, item := range m.waitQueue {
+		if item.TimeoutAt.Before(now) || item.TimeoutAt.Equal(now) {
+			_ = m.storage.RemoveWaitItem(item.ID)
+			continue
+		}
+
+		b, ok := m.bindings[item.CallerID]
+		if !ok {
+			_ = m.storage.RemoveWaitItem(item.ID)
+			continue
+		}
+
+		policy, ok := m.policies[b.PolicyName]
+		if !ok {
+			_ = m.storage.RemoveWaitItem(item.ID)
+			continue
+		}
+
+		m.applyAlgorithmTick(b, policy, now)
+
+		effectiveLim := m.effectiveLimit(b)
+		remainingTokens := effectiveLim - b.UsedTokens
+		if remainingTokens < 0 {
+			remainingTokens = 0
+		}
+
+		if remainingTokens >= item.Tokens {
+			b.UsedTokens += item.Tokens
+			b.UpdatedAt = now
+
+			event := &model.RateLimitEvent{
+				CallerID:   item.CallerID,
+				PolicyName: b.PolicyName,
+				Requested:  item.Tokens,
+				Granted:    item.Tokens,
+				Allowed:    true,
+				Reason:     "granted from wait queue",
+				CreatedAt:  now,
+			}
+			_ = m.storage.AddRateLimitEvent(event)
+			_ = m.storage.UpdateCallerBinding(b)
+			_ = m.storage.RemoveWaitItem(item.ID)
+
+			granted++
+			log.Printf("[ratelimit] granted from queue: caller=%s tokens=%d", item.CallerID, item.Tokens)
+		} else {
+			remaining = append(remaining, item)
+		}
+	}
+
+	m.waitQueue = remaining
+	return granted
 }
 
 func (m *Manager) persistAllLocked() error {
@@ -266,7 +402,7 @@ func (m *Manager) CreatePolicy(name string, algorithm model.AlgorithmType, windo
 	}
 
 	m.policies[name] = p
-	log.Printf("[ratelimit] policy created: name=%s algo=%s", name, algorithm)
+	log.Printf("[ratelimit] policy created: name=%s algo=%s max=%d", name, algorithm, maxTokens)
 	return p, nil
 }
 
@@ -296,8 +432,14 @@ func (m *Manager) BindCaller(callerID string, policyName string, quotaLimit int)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.policies[policyName]; !ok {
+	policy, ok := m.policies[policyName]
+	if !ok {
 		return nil, fmt.Errorf("policy not found: %s", policyName)
+	}
+
+	effectiveQuota := quotaLimit
+	if effectiveQuota > policy.MaxTokens {
+		effectiveQuota = policy.MaxTokens
 	}
 
 	now := time.Now()
@@ -310,9 +452,10 @@ func (m *Manager) BindCaller(callerID string, policyName string, quotaLimit int)
 		UpdatedAt:  now,
 	}
 
-	policy := m.policies[policyName]
 	switch policy.Algorithm {
-	case model.AlgoFixedWindow, model.AlgoSlidingWindow:
+	case model.AlgoFixedWindow:
+		b.WindowStartAt = now
+	case model.AlgoSlidingWindow:
 		b.WindowStartAt = now
 	case model.AlgoTokenBucket:
 		b.LastRefillAt = now
@@ -323,11 +466,11 @@ func (m *Manager) BindCaller(callerID string, policyName string, quotaLimit int)
 	}
 
 	m.bindings[callerID] = b
-	log.Printf("[ratelimit] caller bound: caller=%s policy=%s quota=%d", callerID, policyName, quotaLimit)
+	log.Printf("[ratelimit] caller bound: caller=%s policy=%s quota=%d (effective=%d)", callerID, policyName, quotaLimit, effectiveQuota)
 	return b, nil
 }
 
-func (m *Manager) RequestTokens(callerID string, tokens int) (*model.TokenResult, error) {
+func (m *Manager) RequestTokens(callerID string, tokens int, waitable bool, waitSec int) (*model.TokenResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -344,12 +487,8 @@ func (m *Manager) RequestTokens(callerID string, tokens int) (*model.TokenResult
 	now := time.Now()
 	m.applyAlgorithmTick(b, policy, now)
 
-	effectiveLimit := b.QuotaLimit + b.BorrowedTokens - b.LentTokens
-	if effectiveLimit < 0 {
-		effectiveLimit = 0
-	}
-
-	remaining := effectiveLimit - b.UsedTokens
+	effectiveLim := m.effectiveLimit(b)
+	remaining := effectiveLim - b.UsedTokens
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -367,8 +506,59 @@ func (m *Manager) RequestTokens(callerID string, tokens int) (*model.TokenResult
 		result.Allowed = true
 		result.Granted = tokens
 		result.UsedTokens = b.UsedTokens
-		result.Remaining = effectiveLimit - b.UsedTokens
+		result.Remaining = effectiveLim - b.UsedTokens
 	} else {
+		if waitable {
+			waitTimeout := waitSec
+			if waitTimeout <= 0 {
+				waitTimeout = 30
+			}
+			timeoutAt := now.Add(time.Duration(waitTimeout) * time.Second)
+
+			item := &model.RateLimitWaitItem{
+				CallerID:   callerID,
+				Tokens:     tokens,
+				EnqueuedAt: now,
+				TimeoutAt:  timeoutAt,
+			}
+			if err := m.storage.AddWaitItem(item); err != nil {
+				return nil, err
+			}
+			m.waitQueue = append(m.waitQueue, item)
+
+			position := 0
+			for i, q := range m.waitQueue {
+				if q.ID == item.ID {
+					position = i + 1
+					break
+				}
+			}
+
+			result.Queued = true
+			result.Position = position
+			result.Allowed = false
+			result.Granted = 0
+			result.Reason = fmt.Sprintf("queued for tokens: requested=%d, remaining=%d, position=%d", tokens, remaining, position)
+
+			event := &model.RateLimitEvent{
+				CallerID:   callerID,
+				PolicyName: b.PolicyName,
+				Requested:  tokens,
+				Granted:    0,
+				Allowed:    false,
+				Reason:     "queued",
+				CreatedAt:  now,
+			}
+			_ = m.storage.AddRateLimitEvent(event)
+
+			if err := m.storage.UpdateCallerBinding(b); err != nil {
+				return nil, err
+			}
+
+			log.Printf("[ratelimit] queued: caller=%s tokens=%d position=%d", callerID, tokens, position)
+			return result, nil
+		}
+
 		result.Allowed = false
 		result.Granted = 0
 		result.Reason = fmt.Sprintf("insufficient quota: requested=%d, remaining=%d", tokens, remaining)
@@ -409,27 +599,27 @@ func (m *Manager) GetCallerStatus(callerID string) (*model.CallerStatus, error) 
 	now := time.Now()
 	m.applyAlgorithmTick(b, policy, now)
 
-	effectiveLimit := b.QuotaLimit + b.BorrowedTokens - b.LentTokens
-	if effectiveLimit < 0 {
-		effectiveLimit = 0
-	}
-	remaining := effectiveLimit - b.UsedTokens
+	effectiveLim := m.effectiveLimit(b)
+	remaining := effectiveLim - b.UsedTokens
 	if remaining < 0 {
 		remaining = 0
 	}
 
 	rateLimited, _ := m.storage.CountRateLimited(callerID)
+	waitCount, _ := m.storage.CountWaitItems(callerID)
 
 	status := &model.CallerStatus{
 		CallerID:       b.CallerID,
 		PolicyName:     b.PolicyName,
 		Algorithm:      string(policy.Algorithm),
 		QuotaLimit:     b.QuotaLimit,
+		PolicyMax:      policy.MaxTokens,
 		UsedTokens:     b.UsedTokens,
 		Remaining:      remaining,
 		BorrowedTokens: b.BorrowedTokens,
 		LentTokens:     b.LentTokens,
 		RateLimited:    rateLimited,
+		WaitQueueLen:   waitCount,
 	}
 
 	return status, nil
@@ -449,27 +639,27 @@ func (m *Manager) ListCallerStatuses() ([]model.CallerStatus, error) {
 		}
 		m.applyAlgorithmTick(b, policy, now)
 
-		effectiveLimit := b.QuotaLimit + b.BorrowedTokens - b.LentTokens
-		if effectiveLimit < 0 {
-			effectiveLimit = 0
-		}
-		remaining := effectiveLimit - b.UsedTokens
+		effectiveLim := m.effectiveLimit(b)
+		remaining := effectiveLim - b.UsedTokens
 		if remaining < 0 {
 			remaining = 0
 		}
 
 		rateLimited, _ := m.storage.CountRateLimited(b.CallerID)
+		waitCount, _ := m.storage.CountWaitItems(b.CallerID)
 
 		status := model.CallerStatus{
 			CallerID:       b.CallerID,
 			PolicyName:     b.PolicyName,
 			Algorithm:      string(policy.Algorithm),
 			QuotaLimit:     b.QuotaLimit,
+			PolicyMax:      policy.MaxTokens,
 			UsedTokens:     b.UsedTokens,
 			Remaining:      remaining,
 			BorrowedTokens: b.BorrowedTokens,
 			LentTokens:     b.LentTokens,
 			RateLimited:    rateLimited,
+			WaitQueueLen:   waitCount,
 		}
 		result = append(result, status)
 	}
@@ -503,8 +693,11 @@ func (m *Manager) BorrowQuota(fromCaller string, toCaller string, amount int) (*
 		m.applyAlgorithmTick(toB, toPolicy, now)
 	}
 
-	fromEffectiveLimit := fromB.QuotaLimit + fromB.BorrowedTokens - fromB.LentTokens
-	fromRemaining := fromEffectiveLimit - fromB.UsedTokens
+	fromEffective := m.effectiveLimit(fromB)
+	fromRemaining := fromEffective - fromB.UsedTokens
+	if fromRemaining < 0 {
+		fromRemaining = 0
+	}
 
 	if fromRemaining < amount {
 		return &model.BorrowResult{Success: false, Message: fmt.Sprintf("insufficient free quota: has %d, need %d", fromRemaining, amount)}, nil
@@ -520,6 +713,11 @@ func (m *Manager) BorrowQuota(fromCaller string, toCaller string, amount int) (*
 	toB.BorrowedTokens += amount
 	fromB.UpdatedAt = now
 	toB.UpdatedAt = now
+
+	fromEffectiveNew := m.effectiveLimit(fromB)
+	if fromB.UsedTokens > fromEffectiveNew {
+		fromB.UsedTokens = fromEffectiveNew
+	}
 
 	record := &model.QuotaBorrowRecord{
 		FromCaller: fromCaller,
@@ -590,10 +788,7 @@ func (m *Manager) ReturnQuota(fromCaller string, toCaller string, amount int) (*
 	toB.UpdatedAt = now
 
 	if _, ok := m.policies[fromB.PolicyName]; ok {
-		effectiveLimit := fromB.QuotaLimit + fromB.BorrowedTokens - fromB.LentTokens
-		if effectiveLimit < 0 {
-			effectiveLimit = 0
-		}
+		effectiveLimit := m.effectiveLimit(fromB)
 		if fromB.UsedTokens > effectiveLimit {
 			fromB.UsedTokens = effectiveLimit
 		}
@@ -643,10 +838,7 @@ func (m *Manager) AdjustQuota(callerID string, newQuotaLimit int) error {
 	b.QuotaLimit = newQuotaLimit
 	b.UpdatedAt = time.Now()
 
-	effectiveLimit := b.QuotaLimit + b.BorrowedTokens - b.LentTokens
-	if effectiveLimit < 0 {
-		effectiveLimit = 0
-	}
+	effectiveLimit := m.effectiveLimit(b)
 	if b.UsedTokens > effectiveLimit {
 		b.UsedTokens = effectiveLimit
 	}
@@ -655,7 +847,7 @@ func (m *Manager) AdjustQuota(callerID string, newQuotaLimit int) error {
 		return err
 	}
 
-	log.Printf("[ratelimit] quota adjusted: caller=%s new_quota=%d", callerID, newQuotaLimit)
+	log.Printf("[ratelimit] quota adjusted: caller=%s new_quota=%d (policy_max=%d)", callerID, newQuotaLimit, policy.MaxTokens)
 	return nil
 }
 
@@ -678,6 +870,8 @@ func (m *Manager) GetGlobalStats() (*model.GlobalStats, error) {
 		borrowedAmount += b.Amount
 	}
 
+	waitCount := len(m.waitQueue)
+
 	stats := &model.GlobalStats{
 		TotalCallers:     len(m.bindings),
 		TotalPolicies:    len(m.policies),
@@ -688,6 +882,8 @@ func (m *Manager) GetGlobalStats() (*model.GlobalStats, error) {
 		BorrowedAmount:   borrowedAmount,
 	}
 
+	_ = waitCount
+
 	return stats, nil
 }
 
@@ -697,4 +893,25 @@ func (m *Manager) GetCallerHistory(callerID string, limit int) ([]model.RateLimi
 
 func (m *Manager) ListBorrowRecords() ([]model.QuotaBorrowRecord, error) {
 	return m.storage.ListActiveBorrows()
+}
+
+func (m *Manager) ListWaitItems(callerID string) ([]model.RateLimitWaitItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if callerID == "" {
+		items := make([]model.RateLimitWaitItem, 0, len(m.waitQueue))
+		for _, item := range m.waitQueue {
+			items = append(items, *item)
+		}
+		return items, nil
+	}
+
+	var items []model.RateLimitWaitItem
+	for _, item := range m.waitQueue {
+		if item.CallerID == callerID {
+			items = append(items, *item)
+		}
+	}
+	return items, nil
 }

@@ -130,17 +130,19 @@ type RateLimitPolicy struct {
 }
 
 type CallerBinding struct {
-	ID             int64     `json:"id"`
-	CallerID       string    `json:"caller_id"`
-	PolicyName     string    `json:"policy_name"`
-	QuotaLimit     int       `json:"quota_limit"`
-	UsedTokens     int       `json:"used_tokens"`
-	BorrowedTokens int       `json:"borrowed_tokens"`
-	LentTokens     int       `json:"lent_tokens"`
-	LastRefillAt   time.Time `json:"last_refill_at,omitempty"`
-	WindowStartAt  time.Time `json:"window_start_at,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID                int64     `json:"id"`
+	CallerID          string    `json:"caller_id"`
+	PolicyName        string    `json:"policy_name"`
+	QuotaLimit        int       `json:"quota_limit"`
+	UsedTokens        int       `json:"used_tokens"`
+	BorrowedTokens    int       `json:"borrowed_tokens"`
+	LentTokens        int       `json:"lent_tokens"`
+	LastRefillAt      time.Time `json:"last_refill_at,omitempty"`
+	WindowStartAt     time.Time `json:"window_start_at,omitempty"`
+	PrevWindowCount   int       `json:"prev_window_count,omitempty"`
+	CurrWindowCount   int       `json:"curr_window_count,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type RateLimitEvent struct {
@@ -165,11 +167,15 @@ type QuotaBorrowRecord struct {
 }
 
 type TokenRequest struct {
-	Tokens int `json:"tokens" binding:"required,min=1"`
+	Tokens   int  `json:"tokens" binding:"required,min=1"`
+	Waitable bool `json:"waitable,omitempty"`
+	WaitSec  int  `json:"wait_sec,omitempty"`
 }
 
 type TokenResult struct {
 	Allowed       bool   `json:"allowed"`
+	Queued        bool   `json:"queued,omitempty"`
+	Position      int    `json:"position,omitempty"`
 	Granted       int    `json:"granted"`
 	Requested     int    `json:"requested"`
 	Remaining     int    `json:"remaining"`
@@ -178,16 +184,26 @@ type TokenResult struct {
 	Reason        string `json:"reason,omitempty"`
 }
 
+type RateLimitWaitItem struct {
+	ID         int64     `json:"id"`
+	CallerID   string    `json:"caller_id"`
+	Tokens     int       `json:"tokens"`
+	EnqueuedAt time.Time `json:"enqueued_at"`
+	TimeoutAt  time.Time `json:"timeout_at"`
+}
+
 type CallerStatus struct {
 	CallerID       string `json:"caller_id"`
 	PolicyName     string `json:"policy_name"`
 	Algorithm      string `json:"algorithm"`
 	QuotaLimit     int    `json:"quota_limit"`
+	PolicyMax      int    `json:"policy_max"`
 	UsedTokens     int    `json:"used_tokens"`
 	Remaining      int    `json:"remaining"`
 	BorrowedTokens int    `json:"borrowed_tokens"`
 	LentTokens     int    `json:"lent_tokens"`
 	RateLimited    int64  `json:"rate_limited_count"`
+	WaitQueueLen   int    `json:"wait_queue_len,omitempty"`
 }
 
 type GlobalStats struct {
