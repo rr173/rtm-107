@@ -163,6 +163,17 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 			}, nil
 		}
 
+		queue, err := m.storage.ListWaitQueue(lockName)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range queue {
+			if item.Holder == holder {
+				m.addHistoryLocked(lockName, holder, model.OpAcquire, "rejected: already in queue")
+				return nil, fmt.Errorf("already in wait queue for this lock")
+			}
+		}
+
 		item := &model.WaitQueueItem{
 			LockName:   lockName,
 			Holder:     holder,
@@ -176,11 +187,7 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 		}
 		m.addHistoryLocked(lockName, holder, model.OpAcquire, "queued")
 
-		queue, err := m.storage.ListWaitQueue(lockName)
-		if err != nil {
-			return nil, err
-		}
-		position := len(queue)
+		position := len(queue) + 1
 
 		return &AcquireResult{Queued: true, Position: position, Lock: lock}, nil
 	}
@@ -753,18 +760,11 @@ func (m *Manager) AcquireLocksBatch(lockNames []string, holder string, leaseSec 
 		if err != nil {
 			return nil, err
 		}
-		if lock != nil && lock.Status == model.LockStatusHeld && lock.Holder != holder {
+		if lock != nil && lock.Status == model.LockStatusHeld {
 			return &model.BatchAcquireResult{
 				Acquired:   false,
 				FailedLock: lockName,
 				FailedBy:   lock.Holder,
-			}, nil
-		}
-		if lock != nil && lock.Status == model.LockStatusHeld && lock.Holder == holder && !lock.Reentrant {
-			return &model.BatchAcquireResult{
-				Acquired:   false,
-				FailedLock: lockName,
-				FailedBy:   "already hold this lock (non-reentrant)",
 			}, nil
 		}
 	}
