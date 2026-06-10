@@ -1,13 +1,16 @@
 package api
 
 import (
+	"errors"
 	"net/http"
+	"rtm-107/internal/audit"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -16,10 +19,11 @@ type Handler struct {
 	manager      *lock.Manager
 	rateLimiter  *ratelimit.Manager
 	orchMgr      *orchestration.Manager
+	auditMgr     *audit.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -82,6 +86,34 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			orch.POST("/tx/:id/release", h.ReleaseTx)
 			orch.GET("/tx/:id/history", h.GetTxHistory)
 		}
+
+		auditGroup := api.Group("/audit")
+		{
+			auditGroup.GET("/logs", h.QueryAuditLogs)
+
+			cb := auditGroup.Group("/circuit-breaker")
+			{
+				cb.POST("/rules", h.CreateCircuitBreakerRule)
+				cb.GET("/rules", h.ListCircuitBreakerRules)
+				cb.GET("/rules/:caller", h.GetCircuitBreakerRule)
+				cb.DELETE("/rules/:caller", h.DeleteCircuitBreakerRule)
+
+				cb.GET("/status", h.ListAllCircuitBreakerStatuses)
+				cb.GET("/status/open", h.ListOpenCircuitBreakers)
+				cb.GET("/status/:caller", h.GetCircuitBreakerStatus)
+				cb.POST("/status/:caller/reset", h.ResetCircuitBreaker)
+
+				cb.GET("/history", h.ListAllCircuitBreakerHistory)
+				cb.GET("/history/:caller", h.GetCircuitBreakerHistory)
+			}
+
+			stats := auditGroup.Group("/stats")
+			{
+				stats.GET("", h.GetAuditGlobalStats)
+				stats.GET("/callers", h.GetAllCallerStats)
+				stats.GET("/callers/:id", h.GetCallerStats)
+			}
+		}
 	}
 }
 
@@ -134,8 +166,15 @@ func (h *Handler) AcquireLock(c *gin.Context) {
 		return
 	}
 
-	result, err := h.manager.AcquireLock(name, req.Holder, req.LeaseSec, req.Reentrant)
+	result, err := h.auditMgr.AcquireLock(name, req.Holder, req.LeaseSec, req.Reentrant)
 	if err != nil {
+		if errors.Is(err, audit.ErrCircuitBreakerOpen) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":              err.Error(),
+				"circuit_breaker_open": true,
+			})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -168,7 +207,7 @@ func (h *Handler) ReleaseLock(c *gin.Context) {
 		return
 	}
 
-	result, err := h.manager.ReleaseLock(name, req.Holder)
+	result, err := h.auditMgr.ReleaseLock(name, req.Holder)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -332,8 +371,15 @@ func (h *Handler) RequestTokens(c *gin.Context) {
 		return
 	}
 
-	result, err := h.rateLimiter.RequestTokens(callerID, req.Tokens, req.Waitable, req.WaitSec)
+	result, err := h.auditMgr.RequestTokens(callerID, req.Tokens, req.Waitable, req.WaitSec)
 	if err != nil {
+		if errors.Is(err, audit.ErrCircuitBreakerOpen) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":                err.Error(),
+				"circuit_breaker_open": true,
+			})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -659,4 +705,186 @@ func (h *Handler) GetTxHistory(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
+func (h *Handler) QueryAuditLogs(c *gin.Context) {
+	caller := c.Query("caller")
+	resource := c.Query("resource")
+
+	var successPtr *bool
+	successStr := c.Query("success")
+	if successStr != "" {
+		s := successStr == "true"
+		successPtr = &s
+	}
+
+	var startTime, endTime time.Time
+	startStr := c.Query("start_time")
+	if startStr != "" {
+		if t, err := time.Parse(time.RFC3339, startStr); err == nil {
+			startTime = t
+		}
+	}
+	endStr := c.Query("end_time")
+	if endStr != "" {
+		if t, err := time.Parse(time.RFC3339, endStr); err == nil {
+			endTime = t
+		}
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+
+	result, err := h.auditMgr.QueryAuditLogs(caller, resource, successPtr, startTime, endTime, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) CreateCircuitBreakerRule(c *gin.Context) {
+	var req model.CreateCircuitBreakerRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	rule, err := h.auditMgr.SetCircuitBreakerRule(req.CallerID, req.WindowSec, req.FailureThreshold, req.CooldownSec)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"rule": rule})
+}
+
+func (h *Handler) ListCircuitBreakerRules(c *gin.Context) {
+	rules, err := h.auditMgr.ListCircuitBreakerRules()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rules": rules})
+}
+
+func (h *Handler) GetCircuitBreakerRule(c *gin.Context) {
+	callerID := c.Param("caller")
+	if callerID == "default" {
+		callerID = ""
+	}
+
+	rule, err := h.auditMgr.GetCircuitBreakerRule(callerID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	if rule == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "rule not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rule": rule})
+}
+
+func (h *Handler) DeleteCircuitBreakerRule(c *gin.Context) {
+	callerID := c.Param("caller")
+	if callerID == "default" {
+		callerID = ""
+	}
+
+	if err := h.auditMgr.DeleteCircuitBreakerRule(callerID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) ListAllCircuitBreakerStatuses(c *gin.Context) {
+	statuses, err := h.auditMgr.ListAllCircuitBreakerStatuses()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"statuses": statuses})
+}
+
+func (h *Handler) ListOpenCircuitBreakers(c *gin.Context) {
+	statuses, err := h.auditMgr.ListOpenCircuitBreakers()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"open_breakers": statuses})
+}
+
+func (h *Handler) GetCircuitBreakerStatus(c *gin.Context) {
+	callerID := c.Param("caller")
+	status, err := h.auditMgr.GetCircuitBreakerStatus(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": status})
+}
+
+func (h *Handler) ResetCircuitBreaker(c *gin.Context) {
+	callerID := c.Param("caller")
+	if err := h.auditMgr.ManuallyCloseCircuitBreaker(callerID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "circuit breaker reset"})
+}
+
+func (h *Handler) ListAllCircuitBreakerHistory(c *gin.Context) {
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, _ := strconv.Atoi(limitStr)
+
+	history, err := h.auditMgr.GetCircuitBreakerHistory("", limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
+func (h *Handler) GetCircuitBreakerHistory(c *gin.Context) {
+	callerID := c.Param("caller")
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, _ := strconv.Atoi(limitStr)
+
+	history, err := h.auditMgr.GetCircuitBreakerHistory(callerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
+func (h *Handler) GetAuditGlobalStats(c *gin.Context) {
+	stats, err := h.auditMgr.GetGlobalStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
+func (h *Handler) GetAllCallerStats(c *gin.Context) {
+	stats, err := h.auditMgr.GetAllCallerStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"caller_stats": stats})
+}
+
+func (h *Handler) GetCallerStats(c *gin.Context) {
+	callerID := c.Param("id")
+	stats, err := h.auditMgr.GetCallerStats(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"stats": stats})
 }

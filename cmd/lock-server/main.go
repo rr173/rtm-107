@@ -4,11 +4,13 @@ import (
 	"log"
 	"os"
 	"rtm-107/internal/api"
+	"rtm-107/internal/audit"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
 	"rtm-107/internal/storage"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -47,12 +49,22 @@ func main() {
 	}
 	defer orchMgr.Stop()
 
+	auditMgr := audit.NewManager(s, mgr, rlMgr)
+	if err := auditMgr.Start(); err != nil {
+		log.Fatalf("start audit manager: %v", err)
+	}
+	defer auditMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
 
 	if err := seedOrchDemoData(mgr, rlMgr, orchMgr); err != nil {
 		log.Printf("seed orchestration demo data: %v", err)
+	}
+
+	if err := seedAuditDemoData(auditMgr, s); err != nil {
+		log.Printf("seed audit demo data: %v", err)
 	}
 
 	r := gin.Default()
@@ -68,7 +80,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -200,6 +212,66 @@ func seedOrchDemoData(lockMgr *lock.Manager, rlMgr *ratelimit.Manager, orchMgr *
 		log.Println("[demo-orch] tip: query via GET /api/v1/orchestration/tx/" + tx.ID)
 	} else {
 		log.Printf("[demo-orch] demo tx not committed: status=%s reason=%s", tx.Status, tx.FailReason)
+	}
+
+	return nil
+}
+
+func seedAuditDemoData(auditMgr *audit.Manager, s *storage.Storage) error {
+	existingRules, err := s.ListCircuitBreakerRules()
+	if err != nil {
+		return err
+	}
+
+	hasGammaRule := false
+	for _, r := range existingRules {
+		if r.CallerID == "service-gamma" {
+			hasGammaRule = true
+			break
+		}
+	}
+
+	if !hasGammaRule {
+		log.Println("[demo-audit] seeding audit & circuit breaker demo data...")
+
+		if _, err := auditMgr.SetCircuitBreakerRule("service-gamma", 10, 3, 60); err != nil {
+			return err
+		}
+		log.Println("[demo-audit] created circuit breaker rule for service-gamma: 10s window, 3 failures threshold, 60s cooldown")
+
+		now := time.Now()
+		twoHoursAgo := now.Add(-2 * time.Hour)
+		oneHourAgo := now.Add(-1 * time.Hour)
+
+		history := &model.CircuitBreakerHistory{
+			CallerID:      "service-gamma",
+			State:         "open",
+			TriggeredAt:   twoHoursAgo,
+			RecoveredAt:   oneHourAgo,
+			TriggerReason: "failure count 3 reached threshold 3 in 10 seconds",
+			RecoverReason: "cooldown_expired",
+		}
+		if err := s.AddCircuitBreakerHistory(history); err != nil {
+			return err
+		}
+		log.Println("[demo-audit] added historical circuit breaker record for service-gamma (triggered 2h ago, recovered 1h ago)")
+
+		for i := 0; i < 2; i++ {
+			logEntry := &model.AuditLog{
+				Timestamp:  twoHoursAgo.Add(time.Duration(i) * time.Second),
+				Caller:     "service-gamma",
+				Operation:  model.AuditOpRequestTokens,
+				Resource:   "service-gamma",
+				Success:    false,
+				FailReason: "rate limited",
+			}
+			_ = s.AddAuditLog(logEntry)
+		}
+		log.Println("[demo-audit] added sample audit failure logs for service-gamma")
+		log.Println("[demo-audit] tip: check rules via GET /api/v1/audit/circuit-breaker/rules")
+		log.Println("[demo-audit] tip: check history via GET /api/v1/audit/circuit-breaker/history/service-gamma")
+	} else {
+		log.Println("[demo-audit] audit demo data already exists, skipping seed")
 	}
 
 	return nil

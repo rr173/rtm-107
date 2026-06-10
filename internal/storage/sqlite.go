@@ -212,6 +212,56 @@ func (s *Storage) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_orch_tx_locks_tx ON orch_tx_locks(tx_id);
 	CREATE INDEX IF NOT EXISTS idx_orch_tx_tokens_tx ON orch_tx_tokens(tx_id);
 	CREATE INDEX IF NOT EXISTS idx_orch_tx_state_changes_tx ON orch_tx_state_changes(tx_id);
+
+	CREATE TABLE IF NOT EXISTS audit_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		timestamp DATETIME NOT NULL,
+		caller TEXT NOT NULL,
+		operation TEXT NOT NULL,
+		resource TEXT NOT NULL,
+		success INTEGER NOT NULL DEFAULT 1,
+		fail_reason TEXT DEFAULT ''
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_audit_caller ON audit_logs(caller);
+	CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_logs(resource);
+	CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
+	CREATE INDEX IF NOT EXISTS idx_audit_success ON audit_logs(success);
+
+	CREATE TABLE IF NOT EXISTS cb_rules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		window_sec INTEGER NOT NULL,
+		failure_threshold INTEGER NOT NULL,
+		cooldown_sec INTEGER NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS cb_status (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		state TEXT NOT NULL DEFAULT 'closed',
+		triggered_at DATETIME,
+		expires_at DATETIME,
+		failures_in_window INTEGER NOT NULL DEFAULT 0,
+		trigger_reason TEXT DEFAULT '',
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_cb_status_state ON cb_status(state);
+
+	CREATE TABLE IF NOT EXISTS cb_history (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		state TEXT NOT NULL,
+		triggered_at DATETIME NOT NULL,
+		recovered_at DATETIME,
+		trigger_reason TEXT DEFAULT '',
+		recover_reason TEXT DEFAULT ''
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_cb_history_caller ON cb_history(caller_id);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -1268,4 +1318,434 @@ func (s *Storage) ListTxStateChanges(txID string) ([]model.TxStateChange, error)
 		changes = append(changes, sc)
 	}
 	return changes, nil
+}
+
+func (s *Storage) AddAuditLog(log *model.AuditLog) error {
+	successInt := 0
+	if log.Success {
+		successInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO audit_logs (timestamp, caller, operation, resource, success, fail_reason)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, log.Timestamp, log.Caller, log.Operation, log.Resource, successInt, log.FailReason)
+	if err != nil {
+		return err
+	}
+	log.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) QueryAuditLogs(caller, resource string, success *bool, startTime, endTime time.Time, page, pageSize int) ([]model.AuditLog, int64, error) {
+	where := []string{"1=1"}
+	args := []interface{}{}
+
+	if caller != "" {
+		where = append(where, "caller = ?")
+		args = append(args, caller)
+	}
+	if resource != "" {
+		where = append(where, "resource = ?")
+		args = append(args, resource)
+	}
+	if success != nil {
+		where = append(where, "success = ?")
+		si := 0
+		if *success {
+			si = 1
+		}
+		args = append(args, si)
+	}
+	if !startTime.IsZero() {
+		where = append(where, "timestamp >= ?")
+		args = append(args, startTime)
+	}
+	if !endTime.IsZero() {
+		where = append(where, "timestamp <= ?")
+		args = append(args, endTime)
+	}
+
+	whereClause := ""
+	for _, w := range where {
+		if whereClause != "" {
+			whereClause += " AND "
+		}
+		whereClause += w
+	}
+
+	var total int64
+	countQuery := "SELECT COUNT(*) FROM audit_logs WHERE " + whereClause
+	if err := s.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+
+	query := `SELECT id, timestamp, caller, operation, resource, success, fail_reason
+		FROM audit_logs WHERE ` + whereClause + ` ORDER BY timestamp DESC LIMIT ? OFFSET ?`
+	args = append(args, pageSize, offset)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var logs []model.AuditLog
+	for rows.Next() {
+		var l model.AuditLog
+		var successInt int
+		if err := rows.Scan(&l.ID, &l.Timestamp, &l.Caller, &l.Operation, &l.Resource, &successInt, &l.FailReason); err != nil {
+			return nil, 0, err
+		}
+		l.Success = successInt != 0
+		logs = append(logs, l)
+	}
+	return logs, total, nil
+}
+
+func (s *Storage) CountFailuresInWindow(caller string, windowSec int, now time.Time) (int, error) {
+	startTime := now.Add(-time.Duration(windowSec) * time.Second)
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM audit_logs
+		WHERE caller = ? AND success = 0 AND timestamp >= ?
+	`, caller, startTime).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) CreateCircuitBreakerRule(rule *model.CircuitBreakerRule) error {
+	result, err := s.db.Exec(`
+		INSERT INTO cb_rules (caller_id, window_sec, failure_threshold, cooldown_sec, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			window_sec = excluded.window_sec,
+			failure_threshold = excluded.failure_threshold,
+			cooldown_sec = excluded.cooldown_sec,
+			updated_at = excluded.updated_at
+	`, rule.CallerID, rule.WindowSec, rule.FailureThreshold, rule.CooldownSec, rule.CreatedAt, rule.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if rule.ID == 0 {
+		rule.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetCircuitBreakerRule(callerID string) (*model.CircuitBreakerRule, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, window_sec, failure_threshold, cooldown_sec, created_at, updated_at
+		FROM cb_rules WHERE caller_id = ?
+	`, callerID)
+
+	var r model.CircuitBreakerRule
+	err := row.Scan(&r.ID, &r.CallerID, &r.WindowSec, &r.FailureThreshold, &r.CooldownSec, &r.CreatedAt, &r.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Storage) ListCircuitBreakerRules() ([]model.CircuitBreakerRule, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, window_sec, failure_threshold, cooldown_sec, created_at, updated_at
+		FROM cb_rules ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []model.CircuitBreakerRule
+	for rows.Next() {
+		var r model.CircuitBreakerRule
+		if err := rows.Scan(&r.ID, &r.CallerID, &r.WindowSec, &r.FailureThreshold, &r.CooldownSec, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+	return rules, nil
+}
+
+func (s *Storage) DeleteCircuitBreakerRule(callerID string) error {
+	_, err := s.db.Exec("DELETE FROM cb_rules WHERE caller_id = ?", callerID)
+	return err
+}
+
+func (s *Storage) UpsertCircuitBreakerStatus(status *model.CircuitBreakerStatus) error {
+	result, err := s.db.Exec(`
+		INSERT INTO cb_status (caller_id, state, triggered_at, expires_at, failures_in_window, trigger_reason, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			state = excluded.state,
+			triggered_at = excluded.triggered_at,
+			expires_at = excluded.expires_at,
+			failures_in_window = excluded.failures_in_window,
+			trigger_reason = excluded.trigger_reason,
+			updated_at = excluded.updated_at
+	`, status.CallerID, status.State, nullTime(status.TriggeredAt), nullTime(status.ExpiresAt),
+		status.FailuresInWindow, status.TriggerReason, status.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if status.ID == 0 {
+		status.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetCircuitBreakerStatus(callerID string) (*model.CircuitBreakerStatus, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, state, triggered_at, expires_at, failures_in_window, trigger_reason, updated_at
+		FROM cb_status WHERE caller_id = ?
+	`, callerID)
+
+	var st model.CircuitBreakerStatus
+	var triggeredAt, expiresAt sql.NullTime
+	err := row.Scan(&st.ID, &st.CallerID, &st.State, &triggeredAt, &expiresAt,
+		&st.FailuresInWindow, &st.TriggerReason, &st.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if triggeredAt.Valid {
+		st.TriggeredAt = triggeredAt.Time
+	}
+	if expiresAt.Valid {
+		st.ExpiresAt = expiresAt.Time
+	}
+	return &st, nil
+}
+
+func (s *Storage) ListCircuitBreakerStatuses(state string) ([]model.CircuitBreakerStatus, error) {
+	var rows *sql.Rows
+	var err error
+
+	if state != "" {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, state, triggered_at, expires_at, failures_in_window, trigger_reason, updated_at
+			FROM cb_status WHERE state = ? ORDER BY updated_at DESC
+		`, state)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, state, triggered_at, expires_at, failures_in_window, trigger_reason, updated_at
+			FROM cb_status ORDER BY updated_at DESC
+		`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var statuses []model.CircuitBreakerStatus
+	for rows.Next() {
+		var st model.CircuitBreakerStatus
+		var triggeredAt, expiresAt sql.NullTime
+		if err := rows.Scan(&st.ID, &st.CallerID, &st.State, &triggeredAt, &expiresAt,
+			&st.FailuresInWindow, &st.TriggerReason, &st.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if triggeredAt.Valid {
+			st.TriggeredAt = triggeredAt.Time
+		}
+		if expiresAt.Valid {
+			st.ExpiresAt = expiresAt.Time
+		}
+		statuses = append(statuses, st)
+	}
+	return statuses, nil
+}
+
+func (s *Storage) AddCircuitBreakerHistory(h *model.CircuitBreakerHistory) error {
+	result, err := s.db.Exec(`
+		INSERT INTO cb_history (caller_id, state, triggered_at, recovered_at, trigger_reason, recover_reason)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, h.CallerID, h.State, h.TriggeredAt, nullTime(h.RecoveredAt), h.TriggerReason, h.RecoverReason)
+	if err != nil {
+		return err
+	}
+	h.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) UpdateCircuitBreakerHistoryRecover(id int64, recoveredAt time.Time, recoverReason string) error {
+	_, err := s.db.Exec(`
+		UPDATE cb_history SET recovered_at = ?, recover_reason = ? WHERE id = ?
+	`, recoveredAt, recoverReason, id)
+	return err
+}
+
+func (s *Storage) ListCircuitBreakerHistory(callerID string, limit int) ([]model.CircuitBreakerHistory, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var rows *sql.Rows
+	var err error
+
+	if callerID != "" {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, state, triggered_at, recovered_at, trigger_reason, recover_reason
+			FROM cb_history WHERE caller_id = ? ORDER BY triggered_at DESC LIMIT ?
+		`, callerID, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, state, triggered_at, recovered_at, trigger_reason, recover_reason
+			FROM cb_history ORDER BY triggered_at DESC LIMIT ?
+		`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []model.CircuitBreakerHistory
+	for rows.Next() {
+		var h model.CircuitBreakerHistory
+		var recoveredAt sql.NullTime
+		if err := rows.Scan(&h.ID, &h.CallerID, &h.State, &h.TriggeredAt, &recoveredAt,
+			&h.TriggerReason, &h.RecoverReason); err != nil {
+			return nil, err
+		}
+		if recoveredAt.Valid {
+			h.RecoveredAt = recoveredAt.Time
+		}
+		history = append(history, h)
+	}
+	return history, nil
+}
+
+func (s *Storage) GetLatestOpenHistory(callerID string) (*model.CircuitBreakerHistory, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, state, triggered_at, recovered_at, trigger_reason, recover_reason
+		FROM cb_history WHERE caller_id = ? AND state = 'open' AND recovered_at IS NULL
+		ORDER BY triggered_at DESC LIMIT 1
+	`, callerID)
+
+	var h model.CircuitBreakerHistory
+	var recoveredAt sql.NullTime
+	err := row.Scan(&h.ID, &h.CallerID, &h.State, &h.TriggeredAt, &recoveredAt,
+		&h.TriggerReason, &h.RecoverReason)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if recoveredAt.Valid {
+		h.RecoveredAt = recoveredAt.Time
+	}
+	return &h, nil
+}
+
+func (s *Storage) GetCallerStats(callerID string, now time.Time) (*model.CallerStats, error) {
+	var total, success, failure int64
+	row := s.db.QueryRow(`
+		SELECT COUNT(*), SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END)
+		FROM audit_logs WHERE caller = ?
+	`, callerID)
+	if err := row.Scan(&total, &success, &failure); err != nil {
+		return nil, err
+	}
+
+	req1Min, _ := s.countRequestsSince(callerID, now.Add(-1*time.Minute))
+	req5Min, _ := s.countRequestsSince(callerID, now.Add(-5*time.Minute))
+	req15Min, _ := s.countRequestsSince(callerID, now.Add(-15*time.Minute))
+
+	stats := &model.CallerStats{
+		CallerID:      callerID,
+		TotalRequests: total,
+		SuccessCount:  success,
+		FailureCount:  failure,
+		Requests1Min:  req1Min,
+		Requests5Min:  req5Min,
+		Requests15Min: req15Min,
+	}
+	if total > 0 {
+		stats.SuccessRate = float64(success) / float64(total)
+		stats.FailureRate = float64(failure) / float64(total)
+	}
+	return stats, nil
+}
+
+func (s *Storage) countRequestsSince(callerID string, since time.Time) (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM audit_logs WHERE caller = ? AND timestamp >= ?
+	`, callerID, since).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) GetAllCallerStats(now time.Time) ([]model.CallerStats, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT caller FROM audit_logs ORDER BY caller
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var callers []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		callers = append(callers, c)
+	}
+
+	var stats []model.CallerStats
+	for _, c := range callers {
+		s, err := s.GetCallerStats(c, now)
+		if err != nil {
+			return nil, err
+		}
+		stats = append(stats, *s)
+	}
+	return stats, nil
+}
+
+func (s *Storage) GetGlobalAuditStats(now time.Time) (*model.GlobalAuditStats, error) {
+	var total, success, failure int64
+	row := s.db.QueryRow(`
+		SELECT COUNT(*), SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END)
+		FROM audit_logs
+	`)
+	if err := row.Scan(&total, &success, &failure); err != nil {
+		return nil, err
+	}
+
+	var req1Min, req5Min, req15Min int64
+	s.db.QueryRow(`SELECT COUNT(*) FROM audit_logs WHERE timestamp >= ?`, now.Add(-1*time.Minute)).Scan(&req1Min)
+	s.db.QueryRow(`SELECT COUNT(*) FROM audit_logs WHERE timestamp >= ?`, now.Add(-5*time.Minute)).Scan(&req5Min)
+	s.db.QueryRow(`SELECT COUNT(*) FROM audit_logs WHERE timestamp >= ?`, now.Add(-15*time.Minute)).Scan(&req15Min)
+
+	var activeBreakers int
+	s.db.QueryRow(`SELECT COUNT(*) FROM cb_status WHERE state = 'open'`).Scan(&activeBreakers)
+
+	stats := &model.GlobalAuditStats{
+		TotalRequests:  total,
+		SuccessCount:   success,
+		FailureCount:   failure,
+		Requests1Min:   req1Min,
+		Requests5Min:   req5Min,
+		Requests15Min:  req15Min,
+		ActiveBreakers: activeBreakers,
+	}
+	if total > 0 {
+		stats.SuccessRate = float64(success) / float64(total)
+		stats.FailureRate = float64(failure) / float64(total)
+	}
+	return stats, nil
 }

@@ -376,3 +376,109 @@ type InsufficientQuotaInfo struct {
 type ReleaseTxRequest struct {
 	Holder string `json:"holder" binding:"required"`
 }
+
+type AuditOperationType string
+
+const (
+	AuditOpAcquireLock    AuditOperationType = "acquire_lock"
+	AuditOpReleaseLock    AuditOperationType = "release_lock"
+	AuditOpRequestTokens  AuditOperationType = "request_tokens"
+	AuditOpReturnTokens   AuditOperationType = "return_tokens"
+)
+
+type AuditLog struct {
+	ID         int64              `json:"id"`
+	Timestamp  time.Time          `json:"timestamp"`
+	Caller     string             `json:"caller"`
+	Operation  AuditOperationType `json:"operation"`
+	Resource   string             `json:"resource"`
+	Success    bool               `json:"success"`
+	FailReason string             `json:"fail_reason,omitempty"`
+}
+
+type CircuitBreakerRule struct {
+	ID               int64     `json:"id"`
+	CallerID         string    `json:"caller_id"`
+	WindowSec        int       `json:"window_sec"`
+	FailureThreshold int       `json:"failure_threshold"`
+	CooldownSec      int       `json:"cooldown_sec"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type CircuitBreakerState string
+
+const (
+	CircuitBreakerClosed   CircuitBreakerState = "closed"
+	CircuitBreakerOpen     CircuitBreakerState = "open"
+	CircuitBreakerHalfOpen CircuitBreakerState = "half_open"
+)
+
+type CircuitBreakerStatus struct {
+	ID             int64              `json:"id"`
+	CallerID       string             `json:"caller_id"`
+	State          CircuitBreakerState `json:"state"`
+	TriggeredAt    time.Time          `json:"triggered_at,omitempty"`
+	ExpiresAt      time.Time          `json:"expires_at,omitempty"`
+	FailuresInWindow int              `json:"failures_in_window"`
+	TriggerReason  string             `json:"trigger_reason,omitempty"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+}
+
+type CircuitBreakerHistory struct {
+	ID            int64     `json:"id"`
+	CallerID      string    `json:"caller_id"`
+	State         string    `json:"state"`
+	TriggeredAt   time.Time `json:"triggered_at"`
+	RecoveredAt   time.Time `json:"recovered_at,omitempty"`
+	TriggerReason string    `json:"trigger_reason,omitempty"`
+	RecoverReason string    `json:"recover_reason,omitempty"`
+}
+
+type CreateCircuitBreakerRuleRequest struct {
+	CallerID         string `json:"caller_id"`
+	WindowSec        int    `json:"window_sec" binding:"required,min=1"`
+	FailureThreshold int    `json:"failure_threshold" binding:"required,min=1"`
+	CooldownSec      int    `json:"cooldown_sec" binding:"required,min=1"`
+}
+
+type AuditQueryRequest struct {
+	Caller    string `form:"caller"`
+	Resource  string `form:"resource"`
+	Success   *bool  `form:"success"`
+	StartTime string `form:"start_time"`
+	EndTime   string `form:"end_time"`
+	Page      int    `form:"page,default=1"`
+	PageSize  int    `form:"page_size,default=20"`
+}
+
+type PaginatedAuditLogs struct {
+	Logs     []AuditLog `json:"logs"`
+	Total    int64      `json:"total"`
+	Page     int        `json:"page"`
+	PageSize int        `json:"page_size"`
+}
+
+type CallerStats struct {
+	CallerID        string  `json:"caller_id"`
+	TotalRequests   int64   `json:"total_requests"`
+	SuccessCount    int64   `json:"success_count"`
+	FailureCount    int64   `json:"failure_count"`
+	SuccessRate     float64 `json:"success_rate"`
+	FailureRate     float64 `json:"failure_rate"`
+	Requests1Min    int64   `json:"requests_1min"`
+	Requests5Min    int64   `json:"requests_5min"`
+	Requests15Min   int64   `json:"requests_15min"`
+}
+
+type GlobalAuditStats struct {
+	TotalRequests   int64   `json:"total_requests"`
+	SuccessCount    int64   `json:"success_count"`
+	FailureCount    int64   `json:"failure_count"`
+	SuccessRate     float64 `json:"success_rate"`
+	FailureRate     float64 `json:"failure_rate"`
+	Requests1Min    int64   `json:"requests_1min"`
+	Requests5Min    int64   `json:"requests_5min"`
+	Requests15Min   int64   `json:"requests_15min"`
+	ActiveBreakers int    `json:"active_breakers"`
+}
