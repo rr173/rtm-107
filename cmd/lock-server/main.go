@@ -6,6 +6,7 @@ import (
 	"rtm-107/internal/api"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
+	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
 	"rtm-107/internal/storage"
 
@@ -40,8 +41,18 @@ func main() {
 	}
 	defer rlMgr.Stop()
 
+	orchMgr := orchestration.NewManager(s, mgr, rlMgr)
+	if err := orchMgr.Start(); err != nil {
+		log.Fatalf("start orchestration manager: %v", err)
+	}
+	defer orchMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
+	}
+
+	if err := seedOrchDemoData(mgr, rlMgr, orchMgr); err != nil {
+		log.Printf("seed orchestration demo data: %v", err)
 	}
 
 	r := gin.Default()
@@ -57,7 +68,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -149,5 +160,47 @@ func seedDemoData(lockMgr *lock.Manager, rlMgr *ratelimit.Manager) error {
 
 	log.Println("[demo] rate limit demo data seeded successfully")
 	log.Println("[demo] tip: watch service-alpha's tokens refilling via GET /api/v1/ratelimit/callers/service-alpha")
+	return nil
+}
+
+func seedOrchDemoData(lockMgr *lock.Manager, rlMgr *ratelimit.Manager, orchMgr *orchestration.Manager) error {
+	existingTxs, err := orchMgr.ListTxs("")
+	if err != nil {
+		return err
+	}
+	if len(existingTxs) > 0 {
+		log.Println("[demo-orch] orchestration data already exists, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-orch] seeding orchestration demo data...")
+
+	_, _ = lockMgr.ReleaseLock("resource-a", "alice")
+	_, _ = lockMgr.ReleaseLock("resource-a", "charlie")
+	_, _ = lockMgr.ReleaseLock("resource-a", "bob")
+	log.Println("[demo-orch] ensured resource-a is free for orchestration demo")
+
+	locks := []model.TxLockSpec{
+		{LockName: "resource-a", LeaseSec: 300},
+	}
+	tokens := []model.TxTokenSpec{
+		{CallerID: "service-alpha", Tokens: 10},
+	}
+
+	tx, err := orchMgr.CreateTx("demo-orch-holder", 300, locks, tokens)
+	if err != nil {
+		return err
+	}
+
+	if tx.Status == model.TxStatusCommitted {
+		log.Printf("[demo-orch] created demo transaction: tx=%s status=%s", tx.ID, tx.Status)
+		log.Printf("[demo-orch]   - holds lock: resource-a (lease 300s)")
+		log.Printf("[demo-orch]   - consumed tokens: service-alpha x 10")
+		log.Printf("[demo-orch]   - timeout: 300s")
+		log.Println("[demo-orch] tip: query via GET /api/v1/orchestration/tx/" + tx.ID)
+	} else {
+		log.Printf("[demo-orch] demo tx not committed: status=%s reason=%s", tx.Status, tx.FailReason)
+	}
+
 	return nil
 }

@@ -1278,3 +1278,33 @@ func (m *Manager) ListReservations(policyName string, callerID string, status st
 
 	return result, nil
 }
+
+func (m *Manager) ReturnTokens(callerID string, tokens int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b, ok := m.bindings[callerID]
+	if !ok {
+		return fmt.Errorf("caller not found: %s", callerID)
+	}
+
+	policy, ok := m.policies[b.PolicyName]
+	if ok {
+		now := time.Now()
+		m.applyAlgorithmTick(b, policy, now)
+	}
+
+	if tokens > b.UsedTokens {
+		b.UsedTokens = 0
+	} else {
+		b.UsedTokens -= tokens
+	}
+	b.UpdatedAt = time.Now()
+
+	if err := m.storage.UpdateCallerBinding(b); err != nil {
+		return err
+	}
+
+	log.Printf("[ratelimit] tokens returned: caller=%s tokens=%d remaining=%d", callerID, tokens, m.effectiveLimit(b)-b.UsedTokens)
+	return nil
+}

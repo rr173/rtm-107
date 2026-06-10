@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
+	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
 	"strconv"
 
@@ -13,10 +14,11 @@ import (
 type Handler struct {
 	manager      *lock.Manager
 	rateLimiter  *ratelimit.Manager
+	orchMgr      *orchestration.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -68,6 +70,16 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 				reservations.GET("/:id", h.GetReservation)
 				reservations.POST("/:id/cancel", h.CancelReservation)
 			}
+		}
+
+		orch := api.Group("/orchestration")
+		{
+			orch.POST("/precheck", h.PreCheckTx)
+			orch.POST("/tx", h.CreateTx)
+			orch.GET("/tx", h.ListTxs)
+			orch.GET("/tx/:id", h.GetTx)
+			orch.POST("/tx/:id/release", h.ReleaseTx)
+			orch.GET("/tx/:id/history", h.GetTxHistory)
 		}
 	}
 }
@@ -543,4 +555,96 @@ func (h *Handler) CancelReservation(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) PreCheckTx(c *gin.Context) {
+	var req model.CreateTxRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.orchMgr.PreCheck(req.Locks, req.Tokens)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) CreateTx(c *gin.Context) {
+	var req model.CreateTxRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx, err := h.orchMgr.CreateTx(req.Holder, req.TimeoutSec, req.Locks, req.Tokens)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if tx.Status == model.TxStatusRolledBack {
+		c.JSON(http.StatusConflict, gin.H{
+			"tx":          tx,
+			"committed":   false,
+			"fail_reason": tx.FailReason,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"tx":        tx,
+		"committed": true,
+	})
+}
+
+func (h *Handler) ListTxs(c *gin.Context) {
+	status := c.Query("status")
+
+	txs, err := h.orchMgr.ListTxs(status)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"txs": txs})
+}
+
+func (h *Handler) GetTx(c *gin.Context) {
+	txID := c.Param("id")
+
+	tx, err := h.orchMgr.GetTx(txID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"tx": tx})
+}
+
+func (h *Handler) ReleaseTx(c *gin.Context) {
+	txID := c.Param("id")
+
+	tx, err := h.orchMgr.ReleaseTx(txID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"tx": tx})
+}
+
+func (h *Handler) GetTxHistory(c *gin.Context) {
+	txID := c.Param("id")
+
+	history, err := h.orchMgr.GetTxHistory(txID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"history": history})
 }

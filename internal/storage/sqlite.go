@@ -169,6 +169,49 @@ func (s *Storage) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_rl_reservations_status ON rl_reservations(status);
 	CREATE INDEX IF NOT EXISTS idx_rl_reservations_start ON rl_reservations(start_at);
 	CREATE INDEX IF NOT EXISTS idx_rl_reservations_end ON rl_reservations(end_at);
+
+	CREATE TABLE IF NOT EXISTS orch_txs (
+		id TEXT PRIMARY KEY,
+		holder TEXT NOT NULL,
+		status TEXT NOT NULL,
+		timeout_sec INTEGER NOT NULL,
+		fail_reason TEXT DEFAULT '',
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		expires_at DATETIME NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS orch_tx_locks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		tx_id TEXT NOT NULL,
+		lock_name TEXT NOT NULL,
+		lease_sec INTEGER NOT NULL,
+		holder TEXT NOT NULL,
+		created_at DATETIME NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS orch_tx_tokens (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		tx_id TEXT NOT NULL,
+		caller_id TEXT NOT NULL,
+		tokens INTEGER NOT NULL,
+		created_at DATETIME NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS orch_tx_state_changes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		tx_id TEXT NOT NULL,
+		from_state TEXT NOT NULL,
+		to_state TEXT NOT NULL,
+		reason TEXT DEFAULT '',
+		created_at DATETIME NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_orch_txs_status ON orch_txs(status);
+	CREATE INDEX IF NOT EXISTS idx_orch_txs_expires ON orch_txs(expires_at);
+	CREATE INDEX IF NOT EXISTS idx_orch_tx_locks_tx ON orch_tx_locks(tx_id);
+	CREATE INDEX IF NOT EXISTS idx_orch_tx_tokens_tx ON orch_tx_tokens(tx_id);
+	CREATE INDEX IF NOT EXISTS idx_orch_tx_state_changes_tx ON orch_tx_state_changes(tx_id);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -1039,4 +1082,190 @@ func nullTime(t time.Time) interface{} {
 		return nil
 	}
 	return t
+}
+
+func (s *Storage) CreateOrchTx(tx *model.OrchestrationTx) error {
+	_, err := s.db.Exec(`
+		INSERT INTO orch_txs (id, holder, status, timeout_sec, fail_reason, created_at, updated_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, tx.ID, tx.Holder, tx.Status, tx.TimeoutSec, tx.FailReason, tx.CreatedAt, tx.UpdatedAt, tx.ExpiresAt)
+	return err
+}
+
+func (s *Storage) UpdateOrchTxStatus(txID string, status model.TxStatus, failReason string, updatedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE orch_txs SET status = ?, fail_reason = ?, updated_at = ? WHERE id = ?
+	`, status, failReason, updatedAt, txID)
+	return err
+}
+
+func (s *Storage) GetOrchTx(txID string) (*model.OrchestrationTx, error) {
+	row := s.db.QueryRow(`
+		SELECT id, holder, status, timeout_sec, fail_reason, created_at, updated_at, expires_at
+		FROM orch_txs WHERE id = ?
+	`, txID)
+
+	var tx model.OrchestrationTx
+	err := row.Scan(&tx.ID, &tx.Holder, &tx.Status, &tx.TimeoutSec, &tx.FailReason,
+		&tx.CreatedAt, &tx.UpdatedAt, &tx.ExpiresAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &tx, nil
+}
+
+func (s *Storage) ListOrchTxs(status string) ([]model.OrchestrationTx, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status != "" {
+		rows, err = s.db.Query(`
+			SELECT id, holder, status, timeout_sec, fail_reason, created_at, updated_at, expires_at
+			FROM orch_txs WHERE status = ? ORDER BY created_at DESC
+		`, status)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, holder, status, timeout_sec, fail_reason, created_at, updated_at, expires_at
+			FROM orch_txs ORDER BY created_at DESC
+		`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var txs []model.OrchestrationTx
+	for rows.Next() {
+		var tx model.OrchestrationTx
+		if err := rows.Scan(&tx.ID, &tx.Holder, &tx.Status, &tx.TimeoutSec, &tx.FailReason,
+			&tx.CreatedAt, &tx.UpdatedAt, &tx.ExpiresAt); err != nil {
+			return nil, err
+		}
+		txs = append(txs, tx)
+	}
+	return txs, nil
+}
+
+func (s *Storage) ListActiveOrchTxs(now time.Time) ([]model.OrchestrationTx, error) {
+	rows, err := s.db.Query(`
+		SELECT id, holder, status, timeout_sec, fail_reason, created_at, updated_at, expires_at
+		FROM orch_txs WHERE status = ? ORDER BY created_at DESC
+	`, model.TxStatusCommitted)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var txs []model.OrchestrationTx
+	for rows.Next() {
+		var tx model.OrchestrationTx
+		if err := rows.Scan(&tx.ID, &tx.Holder, &tx.Status, &tx.TimeoutSec, &tx.FailReason,
+			&tx.CreatedAt, &tx.UpdatedAt, &tx.ExpiresAt); err != nil {
+			return nil, err
+		}
+		txs = append(txs, tx)
+	}
+	return txs, nil
+}
+
+func (s *Storage) AddTxLock(txLock *model.TxLock) error {
+	result, err := s.db.Exec(`
+		INSERT INTO orch_tx_locks (tx_id, lock_name, lease_sec, holder, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, txLock.TxID, txLock.LockName, txLock.LeaseSec, txLock.Holder, txLock.CreatedAt)
+	if err != nil {
+		return err
+	}
+	txLock.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListTxLocks(txID string) ([]model.TxLock, error) {
+	rows, err := s.db.Query(`
+		SELECT id, tx_id, lock_name, lease_sec, holder, created_at
+		FROM orch_tx_locks WHERE tx_id = ? ORDER BY id
+	`, txID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var locks []model.TxLock
+	for rows.Next() {
+		var l model.TxLock
+		if err := rows.Scan(&l.ID, &l.TxID, &l.LockName, &l.LeaseSec, &l.Holder, &l.CreatedAt); err != nil {
+			return nil, err
+		}
+		locks = append(locks, l)
+	}
+	return locks, nil
+}
+
+func (s *Storage) AddTxToken(txToken *model.TxToken) error {
+	result, err := s.db.Exec(`
+		INSERT INTO orch_tx_tokens (tx_id, caller_id, tokens, created_at)
+		VALUES (?, ?, ?, ?)
+	`, txToken.TxID, txToken.CallerID, txToken.Tokens, txToken.CreatedAt)
+	if err != nil {
+		return err
+	}
+	txToken.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListTxTokens(txID string) ([]model.TxToken, error) {
+	rows, err := s.db.Query(`
+		SELECT id, tx_id, caller_id, tokens, created_at
+		FROM orch_tx_tokens WHERE tx_id = ? ORDER BY id
+	`, txID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokens []model.TxToken
+	for rows.Next() {
+		var t model.TxToken
+		if err := rows.Scan(&t.ID, &t.TxID, &t.CallerID, &t.Tokens, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, nil
+}
+
+func (s *Storage) AddTxStateChange(sc *model.TxStateChange) error {
+	result, err := s.db.Exec(`
+		INSERT INTO orch_tx_state_changes (tx_id, from_state, to_state, reason, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, sc.TxID, sc.FromState, sc.ToState, sc.Reason, sc.CreatedAt)
+	if err != nil {
+		return err
+	}
+	sc.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListTxStateChanges(txID string) ([]model.TxStateChange, error) {
+	rows, err := s.db.Query(`
+		SELECT id, tx_id, from_state, to_state, reason, created_at
+		FROM orch_tx_state_changes WHERE tx_id = ? ORDER BY id
+	`, txID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var changes []model.TxStateChange
+	for rows.Next() {
+		var sc model.TxStateChange
+		if err := rows.Scan(&sc.ID, &sc.TxID, &sc.FromState, &sc.ToState, &sc.Reason, &sc.CreatedAt); err != nil {
+			return nil, err
+		}
+		changes = append(changes, sc)
+	}
+	return changes, nil
 }

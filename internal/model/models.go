@@ -288,3 +288,87 @@ type ReservationResult struct {
 	Message     string            `json:"message,omitempty"`
 	Reservation *QuotaReservation `json:"reservation,omitempty"`
 }
+
+type TxStatus string
+
+const (
+	TxStatusCreated    TxStatus = "created"
+	TxStatusCommitted  TxStatus = "committed"
+	TxStatusRolledBack TxStatus = "rolled_back"
+	TxStatusReleased   TxStatus = "released"
+	TxStatusTimedOut   TxStatus = "timed_out"
+)
+
+type TxLockSpec struct {
+	LockName string `json:"lock_name" binding:"required"`
+	LeaseSec int    `json:"lease_sec" binding:"required,min=1"`
+}
+
+type TxTokenSpec struct {
+	CallerID string `json:"caller_id" binding:"required"`
+	Tokens   int    `json:"tokens" binding:"required,min=1"`
+}
+
+type TxLock struct {
+	ID        int64     `json:"id"`
+	TxID      string    `json:"tx_id"`
+	LockName  string    `json:"lock_name"`
+	LeaseSec  int       `json:"lease_sec"`
+	Holder    string    `json:"holder"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type TxToken struct {
+	ID        int64     `json:"id"`
+	TxID      string    `json:"tx_id"`
+	CallerID  string    `json:"caller_id"`
+	Tokens    int       `json:"tokens"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type TxStateChange struct {
+	ID        int64     `json:"id"`
+	TxID      string    `json:"tx_id"`
+	FromState TxStatus  `json:"from_state"`
+	ToState   TxStatus  `json:"to_state"`
+	Reason    string    `json:"reason,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type OrchestrationTx struct {
+	ID            string     `json:"id"`
+	Holder        string     `json:"holder"`
+	Status        TxStatus   `json:"status"`
+	TimeoutSec    int        `json:"timeout_sec"`
+	FailReason    string     `json:"fail_reason,omitempty"`
+	Locks         []TxLock   `json:"locks,omitempty"`
+	Tokens        []TxToken  `json:"tokens,omitempty"`
+	StateChanges  []TxStateChange `json:"state_changes,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	ExpiresAt     time.Time  `json:"expires_at"`
+}
+
+type CreateTxRequest struct {
+	Holder     string        `json:"holder" binding:"required"`
+	TimeoutSec int           `json:"timeout_sec" binding:"required,min=1"`
+	Locks      []TxLockSpec  `json:"locks" binding:"required,min=1"`
+	Tokens     []TxTokenSpec `json:"tokens"`
+}
+
+type PreCheckResult struct {
+	ConflictingLocks  []ConflictingLockInfo `json:"conflicting_locks,omitempty"`
+	InsufficientQuota []InsufficientQuotaInfo `json:"insufficient_quota,omitempty"`
+	CanProceed        bool                  `json:"can_proceed"`
+}
+
+type ConflictingLockInfo struct {
+	LockName string `json:"lock_name"`
+	Holder   string `json:"holder"`
+}
+
+type InsufficientQuotaInfo struct {
+	CallerID  string `json:"caller_id"`
+	Requested int    `json:"requested"`
+	Remaining int    `json:"remaining"`
+}
