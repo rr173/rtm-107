@@ -372,3 +372,7 @@ type InsufficientQuotaInfo struct {
 	Requested int    `json:"requested"`
 	Remaining int    `json:"remaining"`
 }
+
+type ReleaseTxRequest struct {
+	Holder string `json:"holder" binding:"required"`
+}

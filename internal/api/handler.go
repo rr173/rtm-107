@@ -7,6 +7,7 @@ import (
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -628,9 +629,20 @@ func (h *Handler) GetTx(c *gin.Context) {
 func (h *Handler) ReleaseTx(c *gin.Context) {
 	txID := c.Param("id")
 
-	tx, err := h.orchMgr.ReleaseTx(txID)
-	if err != nil {
+	var req model.ReleaseTxRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx, err := h.orchMgr.ReleaseTx(txID, req.Holder)
+	if err != nil {
+		errMsg := err.Error()
+		if strings.HasPrefix(errMsg, "permission denied") {
+			c.JSON(http.StatusForbidden, gin.H{"error": errMsg})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return
 	}
 

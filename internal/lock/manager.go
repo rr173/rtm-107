@@ -553,6 +553,28 @@ func (m *Manager) GetLockHistory(lockName string, limit int) ([]model.OperationH
 	return m.storage.ListHistory(lockName, limit)
 }
 
+func (m *Manager) CancelWaitForHolder(holder string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	items, err := m.storage.ListAllWaitQueue()
+	if err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for _, item := range items {
+		if item.Holder == holder {
+			if err := m.storage.RemoveFromQueueByID(item.ID); err != nil {
+				return count, err
+			}
+			m.addHistoryLocked(item.LockName, holder, model.OpRelease, "cancelled from wait queue by orchestration rollback")
+			count++
+		}
+	}
+	return count, nil
+}
+
 func (m *Manager) addHistoryLocked(lockName, holder string, op model.OperationType, detail string) {
 	h := &model.OperationHistory{
 		LockName:  lockName,

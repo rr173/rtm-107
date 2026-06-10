@@ -251,6 +251,7 @@ func (m *Manager) CreateTx(holder string, timeoutSec int, lockSpecs []model.TxLo
 		for i := len(acquiredLocks) - 1; i >= 0; i-- {
 			_, _ = m.lockMgr.ReleaseLock(acquiredLocks[i], holder)
 		}
+		_, _ = m.lockMgr.CancelWaitForHolder(holder)
 
 		tx.Status = model.TxStatusRolledBack
 		tx.FailReason = failReason
@@ -276,7 +277,7 @@ func (m *Manager) CreateTx(holder string, timeoutSec int, lockSpecs []model.TxLo
 	return detailTx, nil
 }
 
-func (m *Manager) ReleaseTx(txID string) (*model.OrchestrationTx, error) {
+func (m *Manager) ReleaseTx(txID string, callerHolder string) (*model.OrchestrationTx, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -289,6 +290,9 @@ func (m *Manager) ReleaseTx(txID string) (*model.OrchestrationTx, error) {
 	}
 	if tx.Status != model.TxStatusCommitted {
 		return nil, fmt.Errorf("transaction not in committed state: current=%s", tx.Status)
+	}
+	if tx.Holder != callerHolder {
+		return nil, fmt.Errorf("permission denied: not the transaction holder: tx_holder=%s, caller=%s", tx.Holder, callerHolder)
 	}
 
 	locks, err := m.storage.ListTxLocks(txID)
@@ -307,7 +311,7 @@ func (m *Manager) ReleaseTx(txID string) (*model.OrchestrationTx, error) {
 	_ = m.storage.UpdateOrchTxStatus(txID, model.TxStatusReleased, "", tx.UpdatedAt)
 	m.addStateChangeLocked(txID, model.TxStatusCommitted, model.TxStatusReleased, "manual release")
 
-	log.Printf("[orchestration-manager] tx released: tx=%s", txID)
+	log.Printf("[orchestration-manager] tx released: tx=%s holder=%s", txID, callerHolder)
 
 	detailTx, _ := m.loadTxDetailLocked(txID)
 	return detailTx, nil
