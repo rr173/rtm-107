@@ -7,6 +7,7 @@ import (
 	"rtm-107/internal/model"
 	"rtm-107/internal/ratelimit"
 	"rtm-107/internal/storage"
+	"strings"
 	"sync"
 	"time"
 )
@@ -224,7 +225,7 @@ func (m *Manager) AcquireLock(lockName, holder string, leaseSec int, reentrant b
 
 	result, err := m.lockMgr.AcquireLock(lockName, holder, leaseSec, reentrant)
 
-	success := err == nil && result != nil && result.Acquired
+	success := err == nil && result != nil && (result.Acquired || result.Queued)
 	failReason := ""
 	if err != nil {
 		failReason = err.Error()
@@ -232,6 +233,54 @@ func (m *Manager) AcquireLock(lockName, holder string, leaseSec int, reentrant b
 		failReason = "not acquired"
 	}
 	m.recordAuditLog(holder, model.AuditOpAcquireLock, lockName, success, failReason)
+
+	if !success {
+		m.checkAndTriggerCircuitBreaker(holder)
+	}
+
+	return result, err
+}
+
+func (m *Manager) RenewLock(lockName, holder string, addSec int) (*model.Lease, error) {
+	if m.IsCircuitBreakerOpen(holder) {
+		m.recordAuditLog(holder, model.AuditOpRenewLock, lockName, false, ErrCircuitBreakerOpen.Error())
+		return nil, ErrCircuitBreakerOpen
+	}
+
+	lease, err := m.lockMgr.RenewLease(lockName, holder, addSec)
+
+	success := err == nil && lease != nil
+	failReason := ""
+	if err != nil {
+		failReason = err.Error()
+	}
+	m.recordAuditLog(holder, model.AuditOpRenewLock, lockName, success, failReason)
+
+	if !success {
+		m.checkAndTriggerCircuitBreaker(holder)
+	}
+
+	return lease, err
+}
+
+func (m *Manager) AcquireLocksBatch(lockNames []string, holder string, leaseSec int, reentrant bool) (*model.BatchAcquireResult, error) {
+	if m.IsCircuitBreakerOpen(holder) {
+		resource := "batch:" + strings.Join(lockNames, ",")
+		m.recordAuditLog(holder, model.AuditOpAcquireLocksBatch, resource, false, ErrCircuitBreakerOpen.Error())
+		return nil, ErrCircuitBreakerOpen
+	}
+
+	result, err := m.lockMgr.AcquireLocksBatch(lockNames, holder, leaseSec, reentrant)
+
+	success := err == nil && result != nil && result.Acquired
+	failReason := ""
+	if err != nil {
+		failReason = err.Error()
+	} else if result != nil && !result.Acquired {
+		failReason = fmt.Sprintf("batch failed on lock: %s (held by %s)", result.FailedLock, result.FailedBy)
+	}
+	resource := "batch:" + strings.Join(lockNames, ",")
+	m.recordAuditLog(holder, model.AuditOpAcquireLocksBatch, resource, success, failReason)
 
 	if !success {
 		m.checkAndTriggerCircuitBreaker(holder)
@@ -289,6 +338,63 @@ func (m *Manager) ReturnTokens(callerID string, tokens int) error {
 		failReason = err.Error()
 	}
 	m.recordAuditLog(callerID, model.AuditOpReturnTokens, callerID, success, failReason)
+
+	return err
+}
+
+func (m *Manager) BorrowQuota(fromCaller, toCaller string, amount int) (*model.BorrowResult, error) {
+	if m.IsCircuitBreakerOpen(toCaller) {
+		m.recordAuditLog(toCaller, model.AuditOpBorrowQuota, fromCaller+"->"+toCaller, false, ErrCircuitBreakerOpen.Error())
+		return nil, ErrCircuitBreakerOpen
+	}
+
+	result, err := m.rateLimitMgr.BorrowQuota(fromCaller, toCaller, amount)
+
+	success := err == nil && result != nil && result.Success
+	failReason := ""
+	if err != nil {
+		failReason = err.Error()
+	} else if result != nil && !result.Success {
+		failReason = result.Message
+	}
+	m.recordAuditLog(toCaller, model.AuditOpBorrowQuota, fromCaller+"->"+toCaller, success, failReason)
+
+	if !success {
+		m.checkAndTriggerCircuitBreaker(toCaller)
+	}
+
+	return result, err
+}
+
+func (m *Manager) ReturnQuota(fromCaller, toCaller string, amount int) (*model.BorrowResult, error) {
+	result, err := m.rateLimitMgr.ReturnQuota(fromCaller, toCaller, amount)
+
+	success := err == nil && result != nil && result.Success
+	failReason := ""
+	if err != nil {
+		failReason = err.Error()
+	} else if result != nil && !result.Success {
+		failReason = result.Message
+	}
+	m.recordAuditLog(fromCaller, model.AuditOpReturnQuota, fromCaller+"->"+toCaller, success, failReason)
+
+	return result, err
+}
+
+func (m *Manager) AdjustQuota(callerID string, newQuotaLimit int) error {
+	if m.IsCircuitBreakerOpen(callerID) {
+		m.recordAuditLog(callerID, model.AuditOpAdjustQuota, callerID, false, ErrCircuitBreakerOpen.Error())
+		return ErrCircuitBreakerOpen
+	}
+
+	err := m.rateLimitMgr.AdjustQuota(callerID, newQuotaLimit)
+
+	success := err == nil
+	failReason := ""
+	if err != nil {
+		failReason = err.Error()
+	}
+	m.recordAuditLog(callerID, model.AuditOpAdjustQuota, callerID, success, failReason)
 
 	return err
 }

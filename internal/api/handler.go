@@ -229,8 +229,15 @@ func (h *Handler) RenewLock(c *gin.Context) {
 		return
 	}
 
-	lease, err := h.manager.RenewLease(name, req.Holder, req.AddSec)
+	lease, err := h.auditMgr.RenewLock(name, req.Holder, req.AddSec)
 	if err != nil {
+		if errors.Is(err, audit.ErrCircuitBreakerOpen) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":                err.Error(),
+				"circuit_breaker_open": true,
+			})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -274,8 +281,15 @@ func (h *Handler) AcquireLocksBatch(c *gin.Context) {
 		return
 	}
 
-	result, err := h.manager.AcquireLocksBatch(req.LockNames, req.Holder, req.LeaseSec, req.Reentrant)
+	result, err := h.auditMgr.AcquireLocksBatch(req.LockNames, req.Holder, req.LeaseSec, req.Reentrant)
 	if err != nil {
+		if errors.Is(err, audit.ErrCircuitBreakerOpen) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":                err.Error(),
+				"circuit_breaker_open": true,
+			})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -418,7 +432,14 @@ func (h *Handler) AdjustQuota(c *gin.Context) {
 		return
 	}
 
-	if err := h.rateLimiter.AdjustQuota(callerID, req.NewQuotaLimit); err != nil {
+	if err := h.auditMgr.AdjustQuota(callerID, req.NewQuotaLimit); err != nil {
+		if errors.Is(err, audit.ErrCircuitBreakerOpen) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":                err.Error(),
+				"circuit_breaker_open": true,
+			})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -439,8 +460,15 @@ func (h *Handler) BorrowQuota(c *gin.Context) {
 		return
 	}
 
-	result, err := h.rateLimiter.BorrowQuota(req.FromCaller, req.ToCaller, req.Amount)
+	result, err := h.auditMgr.BorrowQuota(req.FromCaller, req.ToCaller, req.Amount)
 	if err != nil {
+		if errors.Is(err, audit.ErrCircuitBreakerOpen) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":                err.Error(),
+				"circuit_breaker_open": true,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -460,7 +488,7 @@ func (h *Handler) ReturnQuota(c *gin.Context) {
 		return
 	}
 
-	result, err := h.rateLimiter.ReturnQuota(req.FromCaller, req.ToCaller, req.Amount)
+	result, err := h.auditMgr.ReturnQuota(req.FromCaller, req.ToCaller, req.Amount)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

@@ -380,10 +380,15 @@ type ReleaseTxRequest struct {
 type AuditOperationType string
 
 const (
-	AuditOpAcquireLock    AuditOperationType = "acquire_lock"
-	AuditOpReleaseLock    AuditOperationType = "release_lock"
-	AuditOpRequestTokens  AuditOperationType = "request_tokens"
-	AuditOpReturnTokens   AuditOperationType = "return_tokens"
+	AuditOpAcquireLock      AuditOperationType = "acquire_lock"
+	AuditOpReleaseLock      AuditOperationType = "release_lock"
+	AuditOpRenewLock        AuditOperationType = "renew_lock"
+	AuditOpAcquireLocksBatch AuditOperationType = "acquire_locks_batch"
+	AuditOpRequestTokens    AuditOperationType = "request_tokens"
+	AuditOpReturnTokens     AuditOperationType = "return_tokens"
+	AuditOpBorrowQuota      AuditOperationType = "borrow_quota"
+	AuditOpReturnQuota      AuditOperationType = "return_quota"
+	AuditOpAdjustQuota      AuditOperationType = "adjust_quota"
 )
 
 type AuditLog struct {
