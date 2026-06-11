@@ -487,3 +487,128 @@ type GlobalAuditStats struct {
 	Requests15Min   int64   `json:"requests_15min"`
 	ActiveBreakers int    `json:"active_breakers"`
 }
+
+type TopologyNode struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	LockName    string    `json:"lock_name"`
+	RatePolicy  string    `json:"rate_policy,omitempty"`
+	TokenCost   int       `json:"token_cost"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type TopologyEdge struct {
+	ID          int64     `json:"id"`
+	FromNode    string    `json:"from_node"`
+	ToNode      string    `json:"to_node"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type TopologyGraph struct {
+	Nodes []TopologyNode `json:"nodes"`
+	Edges []TopologyEdge `json:"edges"`
+}
+
+type RegisterNodeRequest struct {
+	Name       string `json:"name" binding:"required"`
+	LockName   string `json:"lock_name"`
+	RatePolicy string `json:"rate_policy,omitempty"`
+	TokenCost  int    `json:"token_cost"`
+}
+
+type DeclareEdgeRequest struct {
+	FromNode string `json:"from_node" binding:"required"`
+	ToNode   string `json:"to_node" binding:"required"`
+}
+
+type CascadeAcquireRequest struct {
+	TargetNode string `json:"target_node" binding:"required"`
+	Holder     string `json:"holder" binding:"required"`
+	LeaseSec   int    `json:"lease_sec" binding:"required,min=1"`
+	Reentrant  bool   `json:"reentrant"`
+}
+
+type CascadeAcquireStep struct {
+	NodeName string `json:"node_name"`
+	LockName string `json:"lock_name"`
+	Action   string `json:"action"`
+	Success  bool   `json:"success"`
+	Message  string `json:"message,omitempty"`
+}
+
+type CascadeAcquireResult struct {
+	Success  bool                  `json:"success"`
+	RolledBack bool                `json:"rolled_back"`
+	Steps    []CascadeAcquireStep  `json:"steps"`
+	Acquired []string              `json:"acquired,omitempty"`
+	Message  string                `json:"message,omitempty"`
+	DurationMs int64               `json:"duration_ms"`
+}
+
+type CascadeReleaseRequest struct {
+	TargetNode string `json:"target_node" binding:"required"`
+	Holder     string `json:"holder" binding:"required"`
+	Force      bool   `json:"force"`
+}
+
+type CascadeReleaseStep struct {
+	NodeName string `json:"node_name"`
+	LockName string `json:"lock_name"`
+	Action   string `json:"action"`
+	Success  bool   `json:"success"`
+	Message  string `json:"message,omitempty"`
+}
+
+type CascadeReleaseResult struct {
+	Success  bool                  `json:"success"`
+	Steps    []CascadeReleaseStep  `json:"steps"`
+	Released []string              `json:"released,omitempty"`
+	Message  string                `json:"message,omitempty"`
+	DurationMs int64               `json:"duration_ms"`
+}
+
+type NodeAncestorsResult struct {
+	NodeName  string   `json:"node_name"`
+	Ancestors []string `json:"ancestors"`
+}
+
+type NodeDescendantsResult struct {
+	NodeName    string   `json:"node_name"`
+	Descendants []string `json:"descendants"`
+}
+
+type HolderResourceTree struct {
+	Holder     string              `json:"holder"`
+	RootNodes  []string            `json:"root_nodes"`
+	HeldNodes  []string            `json:"held_nodes"`
+	Tree       map[string][]string `json:"tree"`
+}
+
+type TopologyOperationType string
+
+const (
+	TopologyOpAcquire TopologyOperationType = "cascade_acquire"
+	TopologyOpRelease TopologyOperationType = "cascade_release"
+)
+
+type TopologyOperationHistory struct {
+	ID           int64                  `json:"id"`
+	Operation    TopologyOperationType  `json:"operation"`
+	TargetNode   string                 `json:"target_node"`
+	Holder       string                 `json:"holder"`
+	Success      bool                   `json:"success"`
+	RolledBack   bool                   `json:"rolled_back"`
+	NodesTouched []string               `json:"nodes_touched"`
+	DurationMs   int64                  `json:"duration_ms"`
+	Message      string                 `json:"message,omitempty"`
+	CreatedAt    time.Time              `json:"created_at"`
+}
+
+type TopologyStats struct {
+	TotalNodes      int `json:"total_nodes"`
+	TotalEdges      int `json:"total_edges"`
+	TotalOperations int `json:"total_operations"`
+	AcquireOps      int `json:"acquire_operations"`
+	ReleaseOps      int `json:"release_operations"`
+}

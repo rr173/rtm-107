@@ -10,6 +10,7 @@ import (
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
 	"rtm-107/internal/storage"
+	"rtm-107/internal/topology"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -55,6 +56,12 @@ func main() {
 	}
 	defer auditMgr.Stop()
 
+	topoMgr := topology.NewManager(s, mgr, rlMgr)
+	if err := topoMgr.Start(); err != nil {
+		log.Fatalf("start topology manager: %v", err)
+	}
+	defer topoMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
@@ -65,6 +72,10 @@ func main() {
 
 	if err := seedAuditDemoData(auditMgr, s); err != nil {
 		log.Printf("seed audit demo data: %v", err)
+	}
+
+	if err := seedTopologyDemoData(topoMgr, rlMgr, mgr); err != nil {
+		log.Printf("seed topology demo data: %v", err)
 	}
 
 	r := gin.Default()
@@ -80,7 +91,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -273,6 +284,85 @@ func seedAuditDemoData(auditMgr *audit.Manager, s *storage.Storage) error {
 	} else {
 		log.Println("[demo-audit] audit demo data already exists, skipping seed")
 	}
+
+	return nil
+}
+
+func seedTopologyDemoData(topoMgr *topology.Manager, rlMgr *ratelimit.Manager, lockMgr *lock.Manager) error {
+	existingNodes, err := topoMgr.ListNodes()
+	if err != nil {
+		return err
+	}
+
+	hasCluster := false
+	for _, n := range existingNodes {
+		if n.Name == "cluster" {
+			hasCluster = true
+			break
+		}
+	}
+
+	if hasCluster {
+		log.Println("[demo-topology] topology data already exists, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-topology] seeding topology demo data...")
+
+	_, err = topoMgr.RegisterNode("cluster", "lock-cluster", "token-bucket-policy", 1)
+	if err != nil {
+		return err
+	}
+	log.Println("[demo-topology] registered node: cluster (lock=lock-cluster, policy=token-bucket-policy, cost=1)")
+
+	_, err = topoMgr.RegisterNode("namespace", "lock-namespace", "", 0)
+	if err != nil {
+		return err
+	}
+	log.Println("[demo-topology] registered node: namespace (lock=lock-namespace, no policy)")
+
+	_, err = topoMgr.RegisterNode("pod", "lock-pod", "", 0)
+	if err != nil {
+		return err
+	}
+	log.Println("[demo-topology] registered node: pod (lock=lock-pod, no policy)")
+
+	_, err = topoMgr.DeclareEdge("namespace", "pod")
+	if err != nil {
+		return err
+	}
+	log.Println("[demo-topology] declared edge: namespace -> pod")
+
+	_, err = topoMgr.DeclareEdge("cluster", "namespace")
+	if err != nil {
+		return err
+	}
+	log.Println("[demo-topology] declared edge: cluster -> namespace")
+
+	log.Println("[demo-topology] dependency chain: cluster -> namespace -> pod")
+	log.Println("[demo-topology] acquiring pod to demonstrate cascade acquire...")
+
+	result, err := topoMgr.CascadeAcquire("pod", "demo-holder", 300, false)
+	if err != nil {
+		log.Printf("[demo-topology] cascade acquire error: %v", err)
+	} else if result.Success {
+		log.Printf("[demo-topology] cascade acquire success! acquired nodes: %v", result.Acquired)
+		log.Printf("[demo-topology]  - automatically acquired cluster (with 1 token consumed)")
+		log.Printf("[demo-topology]  - automatically acquired namespace")
+		log.Printf("[demo-topology]  - acquired target: pod")
+		log.Printf("[demo-topology]  - total steps: %d, duration: %dms", len(result.Steps), result.DurationMs)
+
+		_, _ = topoMgr.CascadeRelease("cluster", "demo-holder", true)
+		log.Println("[demo-topology] force released all nodes via cluster (demo cleanup)")
+	} else {
+		log.Printf("[demo-topology] cascade acquire failed: %s (rolled_back=%v)", result.Message, result.RolledBack)
+	}
+
+	log.Println("[demo-topology] tip: view graph via GET /api/v1/topology/graph")
+	log.Println("[demo-topology] tip: acquire pod via POST /api/v1/topology/acquire")
+	log.Println("[demo-topology]   body: {\"target_node\":\"pod\",\"holder\":\"user1\",\"lease_sec\":60,\"reentrant\":false}")
+	log.Println("[demo-topology] tip: check ancestors via GET /api/v1/topology/nodes/pod/ancestors")
+	log.Println("[demo-topology] tip: view holder tree via GET /api/v1/topology/holders/user1/tree")
 
 	return nil
 }

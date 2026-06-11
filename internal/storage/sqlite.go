@@ -262,6 +262,43 @@ func (s *Storage) initSchema() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_cb_history_caller ON cb_history(caller_id);
+
+	CREATE TABLE IF NOT EXISTS topo_nodes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		lock_name TEXT NOT NULL,
+		rate_policy TEXT DEFAULT '',
+		token_cost INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS topo_edges (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_node TEXT NOT NULL,
+		to_node TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(from_node, to_node)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_topo_edges_from ON topo_edges(from_node);
+	CREATE INDEX IF NOT EXISTS idx_topo_edges_to ON topo_edges(to_node);
+
+	CREATE TABLE IF NOT EXISTS topo_op_history (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		operation TEXT NOT NULL,
+		target_node TEXT NOT NULL,
+		holder TEXT NOT NULL,
+		success INTEGER NOT NULL DEFAULT 1,
+		rolled_back INTEGER NOT NULL DEFAULT 0,
+		nodes_touched TEXT DEFAULT '',
+		duration_ms INTEGER NOT NULL DEFAULT 0,
+		message TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_topo_op_holder ON topo_op_history(holder);
+	CREATE INDEX IF NOT EXISTS idx_topo_op_created ON topo_op_history(created_at);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -1748,4 +1785,207 @@ func (s *Storage) GetGlobalAuditStats(now time.Time) (*model.GlobalAuditStats, e
 		stats.FailureRate = float64(failure) / float64(total)
 	}
 	return stats, nil
+}
+
+func (s *Storage) CreateTopoNode(node *model.TopologyNode) error {
+	result, err := s.db.Exec(`
+		INSERT INTO topo_nodes (name, lock_name, rate_policy, token_cost, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, node.Name, node.LockName, node.RatePolicy, node.TokenCost, node.CreatedAt, node.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	node.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) GetTopoNode(name string) (*model.TopologyNode, error) {
+	row := s.db.QueryRow(`
+		SELECT id, name, lock_name, rate_policy, token_cost, created_at, updated_at
+		FROM topo_nodes WHERE name = ?
+	`, name)
+
+	var node model.TopologyNode
+	err := row.Scan(&node.ID, &node.Name, &node.LockName, &node.RatePolicy, &node.TokenCost, &node.CreatedAt, &node.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+func (s *Storage) ListTopoNodes() ([]model.TopologyNode, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, lock_name, rate_policy, token_cost, created_at, updated_at
+		FROM topo_nodes ORDER BY name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var nodes []model.TopologyNode
+	for rows.Next() {
+		var node model.TopologyNode
+		if err := rows.Scan(&node.ID, &node.Name, &node.LockName, &node.RatePolicy, &node.TokenCost, &node.CreatedAt, &node.UpdatedAt); err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+func (s *Storage) UpdateTopoNode(node *model.TopologyNode) error {
+	_, err := s.db.Exec(`
+		UPDATE topo_nodes SET
+			lock_name = ?,
+			rate_policy = ?,
+			token_cost = ?,
+			updated_at = ?
+		WHERE name = ?
+	`, node.LockName, node.RatePolicy, node.TokenCost, node.UpdatedAt, node.Name)
+	return err
+}
+
+func (s *Storage) DeleteTopoNode(name string) error {
+	_, err := s.db.Exec(`DELETE FROM topo_nodes WHERE name = ?`, name)
+	return err
+}
+
+func (s *Storage) CreateTopoEdge(edge *model.TopologyEdge) error {
+	result, err := s.db.Exec(`
+		INSERT INTO topo_edges (from_node, to_node, created_at)
+		VALUES (?, ?, ?)
+	`, edge.FromNode, edge.ToNode, edge.CreatedAt)
+	if err != nil {
+		return err
+	}
+	edge.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListTopoEdges() ([]model.TopologyEdge, error) {
+	rows, err := s.db.Query(`
+		SELECT id, from_node, to_node, created_at
+		FROM topo_edges ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var edges []model.TopologyEdge
+	for rows.Next() {
+		var edge model.TopologyEdge
+		if err := rows.Scan(&edge.ID, &edge.FromNode, &edge.ToNode, &edge.CreatedAt); err != nil {
+			return nil, err
+		}
+		edges = append(edges, edge)
+	}
+	return edges, nil
+}
+
+func (s *Storage) DeleteTopoEdge(fromNode, toNode string) error {
+	_, err := s.db.Exec(`
+		DELETE FROM topo_edges WHERE from_node = ? AND to_node = ?
+	`, fromNode, toNode)
+	return err
+}
+
+func (s *Storage) AddTopoOpHistory(h *model.TopologyOperationHistory) error {
+	successInt := 0
+	if h.Success {
+		successInt = 1
+	}
+	rolledBackInt := 0
+	if h.RolledBack {
+		rolledBackInt = 1
+	}
+	nodesStr := ""
+	for i, n := range h.NodesTouched {
+		if i > 0 {
+			nodesStr += ","
+		}
+		nodesStr += n
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO topo_op_history (operation, target_node, holder, success, rolled_back, nodes_touched, duration_ms, message, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, string(h.Operation), h.TargetNode, h.Holder, successInt, rolledBackInt, nodesStr, h.DurationMs, h.Message, h.CreatedAt)
+	if err != nil {
+		return err
+	}
+	h.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListTopoOpHistory(holder string, limit int) ([]model.TopologyOperationHistory, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var rows *sql.Rows
+	var err error
+	if holder != "" {
+		rows, err = s.db.Query(`
+			SELECT id, operation, target_node, holder, success, rolled_back, nodes_touched, duration_ms, message, created_at
+			FROM topo_op_history WHERE holder = ? ORDER BY id DESC LIMIT ?
+		`, holder, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, operation, target_node, holder, success, rolled_back, nodes_touched, duration_ms, message, created_at
+			FROM topo_op_history ORDER BY id DESC LIMIT ?
+		`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []model.TopologyOperationHistory
+	for rows.Next() {
+		var h model.TopologyOperationHistory
+		var successInt, rolledBackInt int
+		var nodesStr string
+		if err := rows.Scan(&h.ID, &h.Operation, &h.TargetNode, &h.Holder, &successInt, &rolledBackInt, &nodesStr, &h.DurationMs, &h.Message, &h.CreatedAt); err != nil {
+			return nil, err
+		}
+		h.Success = successInt != 0
+		h.RolledBack = rolledBackInt != 0
+		if nodesStr != "" {
+			h.NodesTouched = splitAndTrim(nodesStr, ",")
+		}
+		history = append(history, h)
+	}
+	return history, nil
+}
+
+func (s *Storage) CountTopoOps() (int, int, int, error) {
+	var total, acquire, release int
+	row := s.db.QueryRow(`
+		SELECT 
+			COUNT(*),
+			SUM(CASE WHEN operation = ? THEN 1 ELSE 0 END),
+			SUM(CASE WHEN operation = ? THEN 1 ELSE 0 END)
+		FROM topo_op_history
+	`, string(model.TopologyOpAcquire), string(model.TopologyOpRelease))
+	err := row.Scan(&total, &acquire, &release)
+	return total, acquire, release, err
+}
+
+func splitAndTrim(s, sep string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := make([]string, 0)
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == sep[0] {
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
 }

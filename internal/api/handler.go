@@ -8,6 +8,7 @@ import (
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
+	"rtm-107/internal/topology"
 	"strconv"
 	"strings"
 	"time"
@@ -20,10 +21,11 @@ type Handler struct {
 	rateLimiter  *ratelimit.Manager
 	orchMgr      *orchestration.Manager
 	auditMgr     *audit.Manager
+	topoMgr      *topology.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -113,6 +115,34 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 				stats.GET("/callers", h.GetAllCallerStats)
 				stats.GET("/callers/:id", h.GetCallerStats)
 			}
+		}
+
+		topo := api.Group("/topology")
+		{
+			nodes := topo.Group("/nodes")
+			{
+				nodes.GET("", h.ListTopoNodes)
+				nodes.GET("/:name", h.GetTopoNode)
+				nodes.POST("", h.RegisterTopoNode)
+			}
+
+			edges := topo.Group("/edges")
+			{
+				edges.GET("", h.ListTopoEdges)
+				edges.POST("", h.DeclareTopoEdge)
+				edges.DELETE("/:from/:to", h.RemoveTopoEdge)
+			}
+
+			topo.GET("/graph", h.GetTopoGraph)
+			topo.GET("/nodes/:name/ancestors", h.GetNodeAncestors)
+			topo.GET("/nodes/:name/descendants", h.GetNodeDescendants)
+			topo.GET("/holders/:holder/tree", h.GetHolderResourceTree)
+
+			topo.POST("/acquire", h.CascadeAcquire)
+			topo.POST("/release", h.CascadeRelease)
+
+			topo.GET("/history", h.ListTopoHistory)
+			topo.GET("/stats", h.GetTopoStats)
 		}
 	}
 }
@@ -910,6 +940,175 @@ func (h *Handler) GetAllCallerStats(c *gin.Context) {
 func (h *Handler) GetCallerStats(c *gin.Context) {
 	callerID := c.Param("id")
 	stats, err := h.auditMgr.GetCallerStats(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
+func (h *Handler) RegisterTopoNode(c *gin.Context) {
+	var req model.RegisterNodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	node, err := h.topoMgr.RegisterNode(req.Name, req.LockName, req.RatePolicy, req.TokenCost)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"node": node})
+}
+
+func (h *Handler) ListTopoNodes(c *gin.Context) {
+	nodes, err := h.topoMgr.ListNodes()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"nodes": nodes})
+}
+
+func (h *Handler) GetTopoNode(c *gin.Context) {
+	name := c.Param("name")
+	node, err := h.topoMgr.GetNode(name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"node": node})
+}
+
+func (h *Handler) DeclareTopoEdge(c *gin.Context) {
+	var req model.DeclareEdgeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	edge, err := h.topoMgr.DeclareEdge(req.FromNode, req.ToNode)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"edge": edge})
+}
+
+func (h *Handler) ListTopoEdges(c *gin.Context) {
+	graph, err := h.topoMgr.GetGraph()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"edges": graph.Edges})
+}
+
+func (h *Handler) RemoveTopoEdge(c *gin.Context) {
+	fromNode := c.Param("from")
+	toNode := c.Param("to")
+	if err := h.topoMgr.RemoveEdge(fromNode, toNode); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) GetTopoGraph(c *gin.Context) {
+	graph, err := h.topoMgr.GetGraph()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"graph": graph})
+}
+
+func (h *Handler) GetNodeAncestors(c *gin.Context) {
+	name := c.Param("name")
+	result, err := h.topoMgr.GetAncestors(name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": result})
+}
+
+func (h *Handler) GetNodeDescendants(c *gin.Context) {
+	name := c.Param("name")
+	result, err := h.topoMgr.GetDescendants(name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": result})
+}
+
+func (h *Handler) GetHolderResourceTree(c *gin.Context) {
+	holder := c.Param("holder")
+	result, err := h.topoMgr.GetHolderResourceTree(holder)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"tree": result})
+}
+
+func (h *Handler) CascadeAcquire(c *gin.Context) {
+	var req model.CascadeAcquireRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.topoMgr.CascadeAcquire(req.TargetNode, req.Holder, req.LeaseSec, req.Reentrant)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusConflict, gin.H{"result": result})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": result})
+}
+
+func (h *Handler) CascadeRelease(c *gin.Context) {
+	var req model.CascadeReleaseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.topoMgr.CascadeRelease(req.TargetNode, req.Holder, req.Force)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !result.Success {
+		c.JSON(http.StatusConflict, gin.H{"result": result})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": result})
+}
+
+func (h *Handler) ListTopoHistory(c *gin.Context) {
+	holder := c.Query("holder")
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+
+	history, err := h.topoMgr.ListHistory(holder, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
+func (h *Handler) GetTopoStats(c *gin.Context) {
+	stats, err := h.topoMgr.GetStats()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
