@@ -8,6 +8,7 @@ import (
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
+	"rtm-107/internal/shadow"
 	"rtm-107/internal/topology"
 	"strconv"
 	"strings"
@@ -22,10 +23,11 @@ type Handler struct {
 	orchMgr      *orchestration.Manager
 	auditMgr     *audit.Manager
 	topoMgr      *topology.Manager
+	shadowMgr    *shadow.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -143,6 +145,23 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 			topo.GET("/history", h.ListTopoHistory)
 			topo.GET("/stats", h.GetTopoStats)
+		}
+
+		shadowGroup := api.Group("/shadow")
+		{
+			shadowGroup.POST("/plans", h.CreateShadowPlan)
+			shadowGroup.GET("/plans", h.ListShadowPlans)
+			shadowGroup.GET("/plans/:id", h.GetShadowPlan)
+			shadowGroup.POST("/plans/:id/start", h.StartShadowPlan)
+			shadowGroup.POST("/plans/:id/cancel", h.CancelShadowPlan)
+			shadowGroup.POST("/plans/:id/apply", h.ApplyShadowPlan)
+
+			shadowGroup.POST("/plans/:id/overrides", h.AddShadowOverride)
+			shadowGroup.GET("/plans/:id/overrides", h.ListShadowOverrides)
+			shadowGroup.DELETE("/overrides/:ovId", h.RemoveShadowOverride)
+
+			shadowGroup.GET("/plans/:id/diffs", h.GetShadowDiffs)
+			shadowGroup.GET("/plans/:id/stats", h.GetShadowDiffStats)
 		}
 	}
 }
@@ -1109,6 +1128,169 @@ func (h *Handler) ListTopoHistory(c *gin.Context) {
 
 func (h *Handler) GetTopoStats(c *gin.Context) {
 	stats, err := h.topoMgr.GetStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
+func (h *Handler) CreateShadowPlan(c *gin.Context) {
+	var req model.CreateShadowPlanRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	plan, err := h.shadowMgr.CreatePlan(req.Name, req.Description, req.Mode, req.MirrorSec)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"plan": plan})
+}
+
+func (h *Handler) ListShadowPlans(c *gin.Context) {
+	plans, err := h.shadowMgr.ListPlans()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"plans": plans})
+}
+
+func (h *Handler) GetShadowPlan(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+	plan, err := h.shadowMgr.GetPlan(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if plan == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "plan not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"plan": plan})
+}
+
+func (h *Handler) StartShadowPlan(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+	if err := h.shadowMgr.StartPlan(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "shadow plan started"})
+}
+
+func (h *Handler) CancelShadowPlan(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+	if err := h.shadowMgr.CancelPlan(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "shadow plan cancelled"})
+}
+
+func (h *Handler) ApplyShadowPlan(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+	if err := h.shadowMgr.ApplyPlan(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "shadow plan applied to production atomically"})
+}
+
+func (h *Handler) AddShadowOverride(c *gin.Context) {
+	planID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+
+	var req model.UpdateShadowOverrideRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ov, err := h.shadowMgr.AddOverride(planID, req.Category, req.TargetKey, req.Field, req.NewValue)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"override": ov})
+}
+
+func (h *Handler) ListShadowOverrides(c *gin.Context) {
+	planID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+
+	overrides, err := h.shadowMgr.ListOverrides(planID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"overrides": overrides})
+}
+
+func (h *Handler) RemoveShadowOverride(c *gin.Context) {
+	ovID, err := strconv.ParseInt(c.Param("ovId"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid override id"})
+		return
+	}
+	if err := h.shadowMgr.RemoveOverride(ovID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) GetShadowDiffs(c *gin.Context) {
+	planID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+
+	records, err := h.shadowMgr.GetDiffRecords(planID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"diffs": records})
+}
+
+func (h *Handler) GetShadowDiffStats(c *gin.Context) {
+	planID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plan id"})
+		return
+	}
+
+	stats, err := h.shadowMgr.GetDiffStats(planID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

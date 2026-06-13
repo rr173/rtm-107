@@ -612,3 +612,113 @@ type TopologyStats struct {
 	AcquireOps      int `json:"acquire_operations"`
 	ReleaseOps      int `json:"release_operations"`
 }
+
+type ShadowPlanStatus string
+
+const (
+	ShadowPlanStatusDraft     ShadowPlanStatus = "draft"
+	ShadowPlanStatusRunning   ShadowPlanStatus = "running"
+	ShadowPlanStatusCompleted ShadowPlanStatus = "completed"
+	ShadowPlanStatusApplied   ShadowPlanStatus = "applied"
+	ShadowPlanStatusCancelled ShadowPlanStatus = "cancelled"
+)
+
+type ShadowDecision string
+
+const (
+	ShadowDecisionAdmit        ShadowDecision = "admit"
+	ShadowDecisionWait         ShadowDecision = "wait"
+	ShadowDecisionDeadlockReject ShadowDecision = "deadlock_reject"
+	ShadowDecisionCircuitBreak   ShadowDecision = "circuit_break"
+	ShadowDecisionRateLimit      ShadowDecision = "rate_limit"
+	ShadowDecisionTxRollback     ShadowDecision = "tx_rollback"
+	ShadowDecisionReject         ShadowDecision = "reject"
+)
+
+type ShadowRuleCategory string
+
+const (
+	ShadowRuleLockDependency ShadowRuleCategory = "lock_dependency"
+	ShadowRuleRateLimit      ShadowRuleCategory = "rate_limit"
+	ShadowRuleReservation    ShadowRuleCategory = "reservation"
+	ShadowRuleCircuitBreaker ShadowRuleCategory = "circuit_breaker"
+)
+
+type ShadowPlan struct {
+	ID          int64            `json:"id"`
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Status      ShadowPlanStatus `json:"status"`
+	Mode        string           `json:"mode"`
+	AuditLogStartID int64        `json:"audit_log_start_id,omitempty"`
+	AuditLogEndID   int64        `json:"audit_log_end_id,omitempty"`
+	MirrorUntil    time.Time     `json:"mirror_until,omitempty"`
+	AppliedAt      time.Time     `json:"applied_at,omitempty"`
+	CreatedAt   time.Time        `json:"created_at"`
+	UpdatedAt   time.Time        `json:"updated_at"`
+}
+
+type ShadowConfigOverride struct {
+	ID         int64            `json:"id"`
+	PlanID     int64            `json:"plan_id"`
+	Category   ShadowRuleCategory `json:"category"`
+	TargetKey  string           `json:"target_key"`
+	Field      string           `json:"field"`
+	OrigValue  string           `json:"orig_value"`
+	NewValue   string           `json:"new_value"`
+	CreatedAt  time.Time        `json:"created_at"`
+}
+
+type ShadowDiffRecord struct {
+	ID             int64          `json:"id"`
+	PlanID         int64          `json:"plan_id"`
+	AuditLogID     int64          `json:"audit_log_id,omitempty"`
+	RequestCaller  string         `json:"request_caller"`
+	RequestOp      string         `json:"request_op"`
+	RequestResource string        `json:"request_resource"`
+	LiveDecision   ShadowDecision `json:"live_decision"`
+	ShadowDecision ShadowDecision `json:"shadow_decision"`
+	RuleCategory   ShadowRuleCategory `json:"rule_category"`
+	Detail         string         `json:"detail,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+}
+
+type CreateShadowPlanRequest struct {
+	Name        string `json:"name" binding:"required"`
+	Description string `json:"description"`
+	Mode        string `json:"mode" binding:"required"`
+	MirrorSec   int    `json:"mirror_sec"`
+}
+
+type UpdateShadowOverrideRequest struct {
+	Category  ShadowRuleCategory `json:"category" binding:"required"`
+	TargetKey string             `json:"target_key" binding:"required"`
+	Field     string             `json:"field" binding:"required"`
+	NewValue  string             `json:"new_value" binding:"required"`
+}
+
+type ShadowDiffStats struct {
+	PlanID            int64                       `json:"plan_id"`
+	TotalDiffs        int64                       `json:"total_diffs"`
+	ByCategory        map[ShadowRuleCategory]int64 `json:"by_category"`
+	ByDecisionPair    map[string]int64             `json:"by_decision_pair"`
+	TopCallers        []ShadowCallerImpact         `json:"top_callers"`
+	TopResources      []ShadowResourceImpact       `json:"top_resources"`
+	TopConflictReasons []ShadowConflictReason      `json:"top_conflict_reasons"`
+}
+
+type ShadowCallerImpact struct {
+	CallerID  string `json:"caller_id"`
+	DiffCount int64  `json:"diff_count"`
+}
+
+type ShadowResourceImpact struct {
+	Resource  string `json:"resource"`
+	DiffCount int64  `json:"diff_count"`
+}
+
+type ShadowConflictReason struct {
+	Reason    string `json:"reason"`
+	Category  ShadowRuleCategory `json:"category"`
+	Count     int64  `json:"count"`
+}

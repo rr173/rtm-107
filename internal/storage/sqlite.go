@@ -299,6 +299,54 @@ func (s *Storage) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_topo_op_holder ON topo_op_history(holder);
 	CREATE INDEX IF NOT EXISTS idx_topo_op_created ON topo_op_history(created_at);
+
+	CREATE TABLE IF NOT EXISTS shadow_plans (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		description TEXT DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'draft',
+		mode TEXT NOT NULL DEFAULT 'replay',
+		audit_log_start_id INTEGER DEFAULT 0,
+		audit_log_end_id INTEGER DEFAULT 0,
+		mirror_until DATETIME,
+		applied_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS shadow_config_overrides (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		plan_id INTEGER NOT NULL,
+		category TEXT NOT NULL,
+		target_key TEXT NOT NULL,
+		field TEXT NOT NULL,
+		orig_value TEXT NOT NULL DEFAULT '',
+		new_value TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(plan_id) REFERENCES shadow_plans(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_shadow_overrides_plan ON shadow_config_overrides(plan_id);
+
+	CREATE TABLE IF NOT EXISTS shadow_diff_records (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		plan_id INTEGER NOT NULL,
+		audit_log_id INTEGER DEFAULT 0,
+		request_caller TEXT NOT NULL,
+		request_op TEXT NOT NULL,
+		request_resource TEXT NOT NULL,
+		live_decision TEXT NOT NULL,
+		shadow_decision TEXT NOT NULL,
+		rule_category TEXT NOT NULL,
+		detail TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(plan_id) REFERENCES shadow_plans(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_shadow_diff_plan ON shadow_diff_records(plan_id);
+	CREATE INDEX IF NOT EXISTS idx_shadow_diff_caller ON shadow_diff_records(request_caller);
+	CREATE INDEX IF NOT EXISTS idx_shadow_diff_resource ON shadow_diff_records(request_resource);
+	CREATE INDEX IF NOT EXISTS idx_shadow_diff_category ON shadow_diff_records(rule_category);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -1988,4 +2036,313 @@ func splitAndTrim(s, sep string) []string {
 	}
 	parts = append(parts, s[start:])
 	return parts
+}
+
+func (s *Storage) CreateShadowPlan(plan *model.ShadowPlan) error {
+	result, err := s.db.Exec(`
+		INSERT INTO shadow_plans (name, description, status, mode, audit_log_start_id, audit_log_end_id, mirror_until, applied_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, plan.Name, plan.Description, plan.Status, plan.Mode, plan.AuditLogStartID, plan.AuditLogEndID,
+		nullTime(plan.MirrorUntil), nullTime(plan.AppliedAt), plan.CreatedAt, plan.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	plan.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) GetShadowPlan(id int64) (*model.ShadowPlan, error) {
+	row := s.db.QueryRow(`
+		SELECT id, name, description, status, mode, audit_log_start_id, audit_log_end_id, mirror_until, applied_at, created_at, updated_at
+		FROM shadow_plans WHERE id = ?
+	`, id)
+	var p model.ShadowPlan
+	var mirrorUntil, appliedAt sql.NullTime
+	err := row.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Mode,
+		&p.AuditLogStartID, &p.AuditLogEndID, &mirrorUntil, &appliedAt,
+		&p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if mirrorUntil.Valid {
+		p.MirrorUntil = mirrorUntil.Time
+	}
+	if appliedAt.Valid {
+		p.AppliedAt = appliedAt.Time
+	}
+	return &p, nil
+}
+
+func (s *Storage) GetShadowPlanByName(name string) (*model.ShadowPlan, error) {
+	row := s.db.QueryRow(`
+		SELECT id, name, description, status, mode, audit_log_start_id, audit_log_end_id, mirror_until, applied_at, created_at, updated_at
+		FROM shadow_plans WHERE name = ?
+	`, name)
+	var p model.ShadowPlan
+	var mirrorUntil, appliedAt sql.NullTime
+	err := row.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Mode,
+		&p.AuditLogStartID, &p.AuditLogEndID, &mirrorUntil, &appliedAt,
+		&p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if mirrorUntil.Valid {
+		p.MirrorUntil = mirrorUntil.Time
+	}
+	if appliedAt.Valid {
+		p.AppliedAt = appliedAt.Time
+	}
+	return &p, nil
+}
+
+func (s *Storage) ListShadowPlans() ([]model.ShadowPlan, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, description, status, mode, audit_log_start_id, audit_log_end_id, mirror_until, applied_at, created_at, updated_at
+		FROM shadow_plans ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var plans []model.ShadowPlan
+	for rows.Next() {
+		var p model.ShadowPlan
+		var mirrorUntil, appliedAt sql.NullTime
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Mode,
+			&p.AuditLogStartID, &p.AuditLogEndID, &mirrorUntil, &appliedAt,
+			&p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if mirrorUntil.Valid {
+			p.MirrorUntil = mirrorUntil.Time
+		}
+		if appliedAt.Valid {
+			p.AppliedAt = appliedAt.Time
+		}
+		plans = append(plans, p)
+	}
+	return plans, nil
+}
+
+func (s *Storage) UpdateShadowPlanStatus(id int64, status model.ShadowPlanStatus, updatedAt time.Time) error {
+	_, err := s.db.Exec(`UPDATE shadow_plans SET status = ?, updated_at = ? WHERE id = ?`, status, updatedAt, id)
+	return err
+}
+
+func (s *Storage) UpdateShadowPlanMirror(id int64, mirrorUntil time.Time, updatedAt time.Time) error {
+	_, err := s.db.Exec(`UPDATE shadow_plans SET mirror_until = ?, updated_at = ? WHERE id = ?`, mirrorUntil, updatedAt, id)
+	return err
+}
+
+func (s *Storage) UpdateShadowPlanApplied(id int64, appliedAt time.Time, updatedAt time.Time) error {
+	_, err := s.db.Exec(`UPDATE shadow_plans SET status = ?, applied_at = ?, updated_at = ? WHERE id = ?`,
+		model.ShadowPlanStatusApplied, appliedAt, updatedAt, id)
+	return err
+}
+
+func (s *Storage) CreateShadowConfigOverride(ov *model.ShadowConfigOverride) error {
+	result, err := s.db.Exec(`
+		INSERT INTO shadow_config_overrides (plan_id, category, target_key, field, orig_value, new_value, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, ov.PlanID, ov.Category, ov.TargetKey, ov.Field, ov.OrigValue, ov.NewValue, ov.CreatedAt)
+	if err != nil {
+		return err
+	}
+	ov.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListShadowConfigOverrides(planID int64) ([]model.ShadowConfigOverride, error) {
+	rows, err := s.db.Query(`
+		SELECT id, plan_id, category, target_key, field, orig_value, new_value, created_at
+		FROM shadow_config_overrides WHERE plan_id = ? ORDER BY id
+	`, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var overrides []model.ShadowConfigOverride
+	for rows.Next() {
+		var ov model.ShadowConfigOverride
+		if err := rows.Scan(&ov.ID, &ov.PlanID, &ov.Category, &ov.TargetKey, &ov.Field, &ov.OrigValue, &ov.NewValue, &ov.CreatedAt); err != nil {
+			return nil, err
+		}
+		overrides = append(overrides, ov)
+	}
+	return overrides, nil
+}
+
+func (s *Storage) DeleteShadowConfigOverride(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM shadow_config_overrides WHERE id = ?`, id)
+	return err
+}
+
+func (s *Storage) CreateShadowDiffRecord(r *model.ShadowDiffRecord) error {
+	result, err := s.db.Exec(`
+		INSERT INTO shadow_diff_records (plan_id, audit_log_id, request_caller, request_op, request_resource, live_decision, shadow_decision, rule_category, detail, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, r.PlanID, r.AuditLogID, r.RequestCaller, r.RequestOp, r.RequestResource,
+		r.LiveDecision, r.ShadowDecision, r.RuleCategory, r.Detail, r.CreatedAt)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListShadowDiffRecords(planID int64, limit int) ([]model.ShadowDiffRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`
+		SELECT id, plan_id, audit_log_id, request_caller, request_op, request_resource, live_decision, shadow_decision, rule_category, detail, created_at
+		FROM shadow_diff_records WHERE plan_id = ? ORDER BY id LIMIT ?
+	`, planID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []model.ShadowDiffRecord
+	for rows.Next() {
+		var r model.ShadowDiffRecord
+		if err := rows.Scan(&r.ID, &r.PlanID, &r.AuditLogID, &r.RequestCaller, &r.RequestOp, &r.RequestResource,
+			&r.LiveDecision, &r.ShadowDecision, &r.RuleCategory, &r.Detail, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+func (s *Storage) CountShadowDiffs(planID int64) (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM shadow_diff_records WHERE plan_id = ?`, planID).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) GetShadowDiffStats(planID int64) (*model.ShadowDiffStats, error) {
+	stats := &model.ShadowDiffStats{
+		PlanID:         planID,
+		ByCategory:     make(map[model.ShadowRuleCategory]int64),
+		ByDecisionPair: make(map[string]int64),
+	}
+	var total int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM shadow_diff_records WHERE plan_id = ?`, planID).Scan(&total)
+	if err != nil {
+		return nil, err
+	}
+	stats.TotalDiffs = total
+
+	rows, err := s.db.Query(`
+		SELECT rule_category, COUNT(*) FROM shadow_diff_records WHERE plan_id = ? GROUP BY rule_category
+	`, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cat string
+		var cnt int64
+		if err := rows.Scan(&cat, &cnt); err != nil {
+			return nil, err
+		}
+		stats.ByCategory[model.ShadowRuleCategory(cat)] = cnt
+	}
+
+	rows2, err := s.db.Query(`
+		SELECT live_decision || '|' || shadow_decision AS pair, COUNT(*) FROM shadow_diff_records WHERE plan_id = ? GROUP BY pair
+	`, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows2.Close()
+	for rows2.Next() {
+		var pair string
+		var cnt int64
+		if err := rows2.Scan(&pair, &cnt); err != nil {
+			return nil, err
+		}
+		stats.ByDecisionPair[pair] = cnt
+	}
+
+	rows3, err := s.db.Query(`
+		SELECT request_caller, COUNT(*) AS cnt FROM shadow_diff_records WHERE plan_id = ? GROUP BY request_caller ORDER BY cnt DESC LIMIT 5
+	`, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows3.Close()
+	for rows3.Next() {
+		var ci model.ShadowCallerImpact
+		if err := rows3.Scan(&ci.CallerID, &ci.DiffCount); err != nil {
+			return nil, err
+		}
+		stats.TopCallers = append(stats.TopCallers, ci)
+	}
+
+	rows4, err := s.db.Query(`
+		SELECT request_resource, COUNT(*) AS cnt FROM shadow_diff_records WHERE plan_id = ? GROUP BY request_resource ORDER BY cnt DESC LIMIT 5
+	`, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows4.Close()
+	for rows4.Next() {
+		var ri model.ShadowResourceImpact
+		if err := rows4.Scan(&ri.Resource, &ri.DiffCount); err != nil {
+			return nil, err
+		}
+		stats.TopResources = append(stats.TopResources, ri)
+	}
+
+	rows5, err := s.db.Query(`
+		SELECT detail, rule_category, COUNT(*) AS cnt FROM shadow_diff_records WHERE plan_id = ? AND detail != '' GROUP BY detail, rule_category ORDER BY cnt DESC LIMIT 5
+	`, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows5.Close()
+	for rows5.Next() {
+		var cr model.ShadowConflictReason
+		if err := rows5.Scan(&cr.Reason, &cr.Category, &cr.Count); err != nil {
+			return nil, err
+		}
+		stats.TopConflictReasons = append(stats.TopConflictReasons, cr)
+	}
+
+	return stats, nil
+}
+
+func (s *Storage) ListAuditLogsInRange(startID, endID int64) ([]model.AuditLog, error) {
+	rows, err := s.db.Query(`
+		SELECT id, timestamp, caller, operation, resource, success, fail_reason
+		FROM audit_logs WHERE id >= ? AND id <= ? ORDER BY id ASC
+	`, startID, endID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var logs []model.AuditLog
+	for rows.Next() {
+		var l model.AuditLog
+		var successInt int
+		if err := rows.Scan(&l.ID, &l.Timestamp, &l.Caller, &l.Operation, &l.Resource, &successInt, &l.FailReason); err != nil {
+			return nil, err
+		}
+		l.Success = successInt != 0
+		logs = append(logs, l)
+	}
+	return logs, nil
+}
+
+func (s *Storage) GetAuditLogRange() (int64, int64, error) {
+	var minID, maxID int64
+	err := s.db.QueryRow(`SELECT COALESCE(MIN(id),0), COALESCE(MAX(id),0) FROM audit_logs`).Scan(&minID, &maxID)
+	return minID, maxID, err
 }

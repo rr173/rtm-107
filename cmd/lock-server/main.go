@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"rtm-107/internal/api"
@@ -9,6 +10,7 @@ import (
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
+	"rtm-107/internal/shadow"
 	"rtm-107/internal/storage"
 	"rtm-107/internal/topology"
 	"time"
@@ -62,6 +64,12 @@ func main() {
 	}
 	defer topoMgr.Stop()
 
+	shadowMgr := shadow.NewManager(s, mgr, rlMgr, auditMgr)
+	if err := shadowMgr.Start(); err != nil {
+		log.Fatalf("start shadow manager: %v", err)
+	}
+	defer shadowMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
@@ -78,6 +86,10 @@ func main() {
 		log.Printf("seed topology demo data: %v", err)
 	}
 
+	if err := seedShadowDemoData(shadowMgr, s); err != nil {
+		log.Printf("seed shadow demo data: %v", err)
+	}
+
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -91,7 +103,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -363,6 +375,99 @@ func seedTopologyDemoData(topoMgr *topology.Manager, rlMgr *ratelimit.Manager, l
 	log.Println("[demo-topology]   body: {\"target_node\":\"pod\",\"holder\":\"user1\",\"lease_sec\":60,\"reentrant\":false}")
 	log.Println("[demo-topology] tip: check ancestors via GET /api/v1/topology/nodes/pod/ancestors")
 	log.Println("[demo-topology] tip: view holder tree via GET /api/v1/topology/holders/user1/tree")
+
+	return nil
+}
+
+func seedShadowDemoData(shadowMgr *shadow.Manager, s *storage.Storage) error {
+	existingPlans, err := shadowMgr.ListPlans()
+	if err != nil {
+		return err
+	}
+	if len(existingPlans) > 0 {
+		log.Println("[demo-shadow] shadow data already exists, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-shadow] seeding shadow evaluation demo data...")
+
+	plan, err := shadowMgr.CreatePlan(
+		"demo-stricter-gamma",
+		"Stricter circuit breaker for service-gamma and lower quota for resource-a related callers",
+		"replay",
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("create shadow plan: %w", err)
+	}
+	log.Printf("[demo-shadow] created shadow plan: id=%d name=%s", plan.ID, plan.Name)
+
+	_, err = shadowMgr.AddOverride(plan.ID, model.ShadowRuleCircuitBreaker, "service-gamma", "failure_threshold", "2")
+	if err != nil {
+		return fmt.Errorf("add cb override: %w", err)
+	}
+	log.Println("[demo-shadow] override: service-gamma circuit breaker failure_threshold 3->2")
+
+	_, err = shadowMgr.AddOverride(plan.ID, model.ShadowRuleCircuitBreaker, "service-gamma", "window_sec", "5")
+	if err != nil {
+		return fmt.Errorf("add cb window override: %w", err)
+	}
+	log.Println("[demo-shadow] override: service-gamma circuit breaker window_sec 10->5")
+
+	_, err = shadowMgr.AddOverride(plan.ID, model.ShadowRuleRateLimit, "service-gamma", "quota_limit", "15")
+	if err != nil {
+		return fmt.Errorf("add rl override: %w", err)
+	}
+	log.Println("[demo-shadow] override: service-gamma rate limit quota_limit 30->15")
+
+	now := time.Now()
+	for i := 0; i < 4; i++ {
+		logEntry := &model.AuditLog{
+			Timestamp:  now.Add(-time.Duration(10-i) * time.Second),
+			Caller:     "service-gamma",
+			Operation:  model.AuditOpRequestTokens,
+			Resource:   "service-gamma",
+			Success:    false,
+			FailReason: "rate limited",
+		}
+		if err := s.AddAuditLog(logEntry); err != nil {
+			return err
+		}
+	}
+
+	logEntry := &model.AuditLog{
+		Timestamp:  now.Add(-3 * time.Second),
+		Caller:     "service-gamma",
+		Operation:  model.AuditOpRequestTokens,
+		Resource:   "service-gamma",
+		Success:    true,
+		FailReason: "",
+	}
+	if err := s.AddAuditLog(logEntry); err != nil {
+		return err
+	}
+
+	logEntry2 := &model.AuditLog{
+		Timestamp:  now.Add(-2 * time.Second),
+		Caller:     "service-alpha",
+		Operation:  model.AuditOpRequestTokens,
+		Resource:   "service-alpha",
+		Success:    true,
+		FailReason: "",
+	}
+	if err := s.AddAuditLog(logEntry2); err != nil {
+		return err
+	}
+
+	if err := shadowMgr.StartPlan(plan.ID); err != nil {
+		return fmt.Errorf("start shadow plan: %w", err)
+	}
+	log.Printf("[demo-shadow] started shadow plan: id=%d - replay running", plan.ID)
+
+	log.Println("[demo-shadow] tip: view plans via GET /api/v1/shadow/plans")
+	log.Println("[demo-shadow] tip: view diffs via GET /api/v1/shadow/plans/1/diffs")
+	log.Println("[demo-shadow] tip: view stats via GET /api/v1/shadow/plans/1/stats")
+	log.Println("[demo-shadow] tip: apply to production via POST /api/v1/shadow/plans/1/apply")
 
 	return nil
 }
