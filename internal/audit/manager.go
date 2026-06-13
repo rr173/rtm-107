@@ -25,6 +25,8 @@ type Manager struct {
 	statuses     map[string]*model.CircuitBreakerStatus
 	stopCh       chan struct{}
 	ticker       *time.Ticker
+
+	shadowShadowEvaluateFn func(caller, op, resource string, success bool, failReason string)
 }
 
 func NewManager(s *storage.Storage, lm *lock.Manager, rlm *ratelimit.Manager) *Manager {
@@ -126,6 +128,10 @@ func (m *Manager) IsCircuitBreakerOpen(caller string) bool {
 	return false
 }
 
+func (m *Manager) SetShadowEvaluator(fn func(caller, op, resource string, success bool, failReason string)) {
+	m.shadowShadowEvaluateFn = fn
+}
+
 func (m *Manager) recordAuditLog(caller string, op model.AuditOperationType, resource string, success bool, failReason string) {
 	logEntry := &model.AuditLog{
 		Timestamp:  time.Now(),
@@ -137,6 +143,10 @@ func (m *Manager) recordAuditLog(caller string, op model.AuditOperationType, res
 	}
 	if err := m.storage.AddAuditLog(logEntry); err != nil {
 		log.Printf("[audit] failed to add audit log: %v", err)
+	}
+
+	if m.shadowShadowEvaluateFn != nil {
+		m.shadowShadowEvaluateFn(caller, string(op), resource, success, failReason)
 	}
 }
 

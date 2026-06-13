@@ -70,6 +70,8 @@ func main() {
 	}
 	defer shadowMgr.Stop()
 
+	auditMgr.SetShadowEvaluator(shadowMgr.EvaluateShadow)
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
