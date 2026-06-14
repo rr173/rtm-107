@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"rtm-107/internal/audit"
+	"rtm-107/internal/debt"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -24,10 +25,11 @@ type Handler struct {
 	auditMgr     *audit.Manager
 	topoMgr      *topology.Manager
 	shadowMgr    *shadow.Manager
+	debtMgr      *debt.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -162,6 +164,34 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 			shadowGroup.GET("/plans/:id/diffs", h.GetShadowDiffs)
 			shadowGroup.GET("/plans/:id/stats", h.GetShadowDiffStats)
+		}
+
+		debtGroup := api.Group("/debt")
+		{
+			debtGroup.POST("/borrow", h.RecordDebtBorrow)
+			debtGroup.POST("/return", h.RecordDebtReturn)
+			debtGroup.POST("/rollback-fail", h.RecordDebtRollbackFail)
+			debtGroup.POST("/reservation-expire", h.RecordDebtReservationExpire)
+			debtGroup.POST("/force-reclaim", h.RecordDebtForceReclaim)
+			debtGroup.GET("/records", h.ListDebtRecords)
+			debtGroup.GET("/records/:id", h.GetDebtRecord)
+			debtGroup.GET("/records/:id/timeline", h.GetDebtTimeline)
+			debtGroup.POST("/records/:id/collect", h.ManualCollectDebt)
+			debtGroup.GET("/callers/:id/summary", h.GetCallerDebtSummary)
+			debtGroup.GET("/callers/:id/check", h.CheckDebtRestriction)
+			debtGroup.GET("/ledger-events", h.ListDebtLedgerEvents)
+			debtGroup.GET("/restrictions", h.ListDebtRestrictions)
+			debtGroup.POST("/restrictions/:id/lift", h.LiftDebtRestriction)
+
+			liqRules := debtGroup.Group("/liquidation-rules")
+			{
+				liqRules.POST("", h.CreateLiquidationRule)
+				liqRules.GET("", h.ListLiquidationRules)
+				liqRules.GET("/:caller", h.GetLiquidationRule)
+				liqRules.DELETE("/:caller", h.DeleteLiquidationRule)
+			}
+
+			debtGroup.GET("/audit", h.ListLiquidationAudit)
 		}
 	}
 }
@@ -1296,4 +1326,285 @@ func (h *Handler) GetShadowDiffStats(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
+type DebtBorrowRequest struct {
+	Debtor          string `json:"debtor" binding:"required"`
+	Creditor        string `json:"creditor" binding:"required"`
+	Amount          int    `json:"amount" binding:"required,min=1"`
+	ResourceType    string `json:"resource_type" binding:"required"`
+	ResourceKey     string `json:"resource_key"`
+	GracePeriodSec  int    `json:"grace_period_sec"`
+}
+
+type DebtReturnRequest struct {
+	Debtor       string `json:"debtor" binding:"required"`
+	Creditor     string `json:"creditor" binding:"required"`
+	Amount       int    `json:"amount" binding:"required,min=1"`
+	ResourceType string `json:"resource_type" binding:"required"`
+	ResourceKey  string `json:"resource_key"`
+}
+
+type DebtRollbackFailRequest struct {
+	Debtor       string `json:"debtor" binding:"required"`
+	Amount       int    `json:"amount" binding:"required,min=1"`
+	ResourceType string `json:"resource_type" binding:"required"`
+	ResourceKey  string `json:"resource_key"`
+	Reason       string `json:"reason"`
+}
+
+type DebtReservationExpireRequest struct {
+	CallerID    string `json:"caller_id" binding:"required"`
+	Tokens      int    `json:"tokens" binding:"required,min=1"`
+	PolicyName  string `json:"policy_name" binding:"required"`
+}
+
+type DebtForceReclaimRequest struct {
+	Debtor       string `json:"debtor" binding:"required"`
+	ResourceType string `json:"resource_type" binding:"required"`
+	ResourceKey  string `json:"resource_key" binding:"required"`
+	Amount       int    `json:"amount" binding:"required,min=1"`
+}
+
+func (h *Handler) RecordDebtBorrow(c *gin.Context) {
+	var req DebtBorrowRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	grace := req.GracePeriodSec
+	if grace <= 0 {
+		grace = h.debtMgr.GetDefaultGracePeriod()
+	}
+	record, err := h.debtMgr.RecordBorrow(req.Debtor, req.Creditor, req.Amount, req.ResourceType, req.ResourceKey, grace)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"debt": record})
+}
+
+func (h *Handler) RecordDebtReturn(c *gin.Context) {
+	var req DebtReturnRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.debtMgr.RecordReturn(req.Debtor, req.Creditor, req.Amount, req.ResourceType, req.ResourceKey); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) RecordDebtRollbackFail(c *gin.Context) {
+	var req DebtRollbackFailRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	record, err := h.debtMgr.RecordRollbackFail(req.Debtor, req.Amount, req.ResourceType, req.ResourceKey, req.Reason)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"debt": record})
+}
+
+func (h *Handler) RecordDebtReservationExpire(c *gin.Context) {
+	var req DebtReservationExpireRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	record, err := h.debtMgr.RecordReservationExpire(req.CallerID, req.Tokens, req.PolicyName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"debt": record})
+}
+
+func (h *Handler) RecordDebtForceReclaim(c *gin.Context) {
+	var req DebtForceReclaimRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	record, err := h.debtMgr.RecordForceReclaim(req.Debtor, req.ResourceType, req.ResourceKey, req.Amount)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"debt": record})
+}
+
+func (h *Handler) ListDebtRecords(c *gin.Context) {
+	debtor := c.Query("debtor")
+	status := c.Query("status")
+	records, err := h.debtMgr.ListDebtRecords(debtor, status)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"records": records})
+}
+
+func (h *Handler) GetDebtRecord(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid debt id"})
+		return
+	}
+	record, err := h.debtMgr.GetDebtRecord(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	if record == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "debt record not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"debt": record})
+}
+
+func (h *Handler) GetDebtTimeline(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid debt id"})
+		return
+	}
+	timeline, err := h.debtMgr.GetDebtTimeline(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"timeline": timeline})
+}
+
+func (h *Handler) ManualCollectDebt(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid debt id"})
+		return
+	}
+	record, err := h.debtMgr.ManualCollect(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"debt": record})
+}
+
+func (h *Handler) GetCallerDebtSummary(c *gin.Context) {
+	callerID := c.Param("id")
+	summary, err := h.debtMgr.GetCallerDebtSummary(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"summary": summary})
+}
+
+func (h *Handler) CheckDebtRestriction(c *gin.Context) {
+	callerID := c.Param("id")
+	scope := c.Query("scope")
+	if scope == "" {
+		scope = string(model.RestrictionScopeAll)
+	}
+	result := h.debtMgr.CheckRestriction(callerID, model.RestrictionScope(scope))
+	c.JSON(http.StatusOK, gin.H{"result": result})
+}
+
+func (h *Handler) ListDebtLedgerEvents(c *gin.Context) {
+	debtor := c.Query("debtor")
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+	events, err := h.debtMgr.ListLedgerEvents(debtor, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+func (h *Handler) ListDebtRestrictions(c *gin.Context) {
+	callerID := c.Query("caller")
+	restrictions, err := h.debtMgr.ListRestrictions(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"restrictions": restrictions})
+}
+
+func (h *Handler) LiftDebtRestriction(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid restriction id"})
+		return
+	}
+	if err := h.debtMgr.LiftRestriction(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) CreateLiquidationRule(c *gin.Context) {
+	var req model.CreateLiquidationRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	rule, err := h.debtMgr.SetLiquidationRule(
+		req.CallerID, req.GracePeriodSec, req.OverdueThreshold,
+		req.RestrictionType, req.RestrictionScope,
+		req.MaxCollectRetries, req.ProtectionAfter,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rule": rule})
+}
+
+func (h *Handler) ListLiquidationRules(c *gin.Context) {
+	rules, err := h.debtMgr.ListLiquidationRules()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rules": rules})
+}
+
+func (h *Handler) GetLiquidationRule(c *gin.Context) {
+	callerID := c.Param("caller")
+	rule, err := h.debtMgr.GetLiquidationRule(callerID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rule": rule})
+}
+
+func (h *Handler) DeleteLiquidationRule(c *gin.Context) {
+	callerID := c.Param("caller")
+	if err := h.debtMgr.DeleteLiquidationRule(callerID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) ListLiquidationAudit(c *gin.Context) {
+	debtor := c.Query("debtor")
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, _ := strconv.Atoi(limitStr)
+	entries, err := h.debtMgr.ListLiquidationAudit(debtor, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"audit": entries})
 }

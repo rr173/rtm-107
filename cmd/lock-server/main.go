@@ -6,6 +6,7 @@ import (
 	"os"
 	"rtm-107/internal/api"
 	"rtm-107/internal/audit"
+	"rtm-107/internal/debt"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -72,6 +73,12 @@ func main() {
 
 	auditMgr.SetShadowEvaluator(shadowMgr.EvaluateShadow)
 
+	debtMgr := debt.NewManager(s, rlMgr)
+	if err := debtMgr.Start(); err != nil {
+		log.Fatalf("start debt manager: %v", err)
+	}
+	defer debtMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
@@ -92,6 +99,10 @@ func main() {
 		log.Printf("seed shadow demo data: %v", err)
 	}
 
+	if err := seedDebtDemoData(debtMgr, s); err != nil {
+		log.Printf("seed debt demo data: %v", err)
+	}
+
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -105,7 +116,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -470,6 +481,175 @@ func seedShadowDemoData(shadowMgr *shadow.Manager, s *storage.Storage) error {
 	log.Println("[demo-shadow] tip: view diffs via GET /api/v1/shadow/plans/1/diffs")
 	log.Println("[demo-shadow] tip: view stats via GET /api/v1/shadow/plans/1/stats")
 	log.Println("[demo-shadow] tip: apply to production via POST /api/v1/shadow/plans/1/apply")
+
+	return nil
+}
+
+func seedDebtDemoData(debtMgr *debt.Manager, s *storage.Storage) error {
+	existingRules, err := s.ListLiquidationRules()
+	if err != nil {
+		return err
+	}
+	if len(existingRules) > 0 {
+		log.Println("[demo-debt] debt data already exists, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-debt] seeding debt ledger & liquidation demo data...")
+
+	_, err = debtMgr.SetLiquidationRule("service-alpha", 5, 2, "reject", "all", 3, 5)
+	if err != nil {
+		return err
+	}
+	log.Println("[demo-debt] created liquidation rule for service-alpha: grace=5s, threshold=2, reject/all")
+
+	_, err = debtMgr.SetLiquidationRule("service-beta", 10, 3, "degrade", "token", 3, 5)
+	if err != nil {
+		return err
+	}
+	log.Println("[demo-debt] created liquidation rule for service-beta: grace=10s, threshold=3, degrade/token")
+
+	now := time.Now()
+
+	r1, err := debtMgr.RecordBorrow("service-alpha", "service-beta", 20, "quota", "token-bucket-policy", 5)
+	if err != nil {
+		return err
+	}
+	log.Printf("[demo-debt] borrow: service-alpha borrowed 20 from service-beta (grace=5s, debt_id=%d)", r1.ID)
+
+	r2, err := debtMgr.RecordBorrow("service-beta", "service-alpha", 10, "quota", "sliding-window-policy", 10)
+	if err != nil {
+		return err
+	}
+	log.Printf("[demo-debt] borrow: service-beta borrowed 10 from service-alpha (grace=10s, debt_id=%d)", r2.ID)
+
+	r3, err := debtMgr.RecordBorrow("service-alpha", "system", 5, "lock", "resource-a", 5)
+	if err != nil {
+		return err
+	}
+	log.Printf("[demo-debt] borrow: service-alpha borrowed 5 lock tokens from system (grace=5s, debt_id=%d)", r3.ID)
+
+	pastDue := now.Add(-10 * time.Second)
+	r4 := &model.DebtRecord{
+		Debtor:          "service-alpha",
+		Creditor:        "service-beta",
+		Amount:          15,
+		ResourceType:    "quota",
+		ResourceKey:     "token-bucket-policy",
+		Status:          model.DebtStatusActive,
+		DueAt:           pastDue,
+		CollectAttempts: 1,
+		LastCollectAt:   now.Add(-2 * time.Second),
+		CreatedAt:       now.Add(-20 * time.Second),
+		UpdatedAt:       now,
+	}
+	if err := s.CreateDebtRecord(r4); err != nil {
+		return err
+	}
+	evt1 := &model.DebtLedgerEvent{
+		DebtID:       r4.ID,
+		Debtor:       "service-alpha",
+		Creditor:     "service-beta",
+		EventType:    model.DebtEventBorrow,
+		Amount:       15,
+		ResourceType: "quota",
+		ResourceKey:  "token-bucket-policy",
+		Detail:       fmt.Sprintf("borrowed 15 from service-beta, due at %s (seeded overdue)", pastDue.Format(time.RFC3339)),
+		CreatedAt:    now.Add(-20 * time.Second),
+	}
+	_ = s.CreateDebtLedgerEvent(evt1)
+	log.Printf("[demo-debt] seeded overdue debt: service-alpha owes service-beta 15, debt_id=%d (due in past)", r4.ID)
+
+	r5 := &model.DebtRecord{
+		Debtor:          "service-alpha",
+		Creditor:        "system",
+		Amount:          8,
+		ResourceType:    "reservation",
+		ResourceKey:     "token-bucket-policy",
+		Status:          model.DebtStatusActive,
+		DueAt:           now.Add(-5 * time.Second),
+		CollectAttempts: 1,
+		LastCollectAt:   now.Add(-1 * time.Second),
+		CreatedAt:       now.Add(-15 * time.Second),
+		UpdatedAt:       now,
+	}
+	if err := s.CreateDebtRecord(r5); err != nil {
+		return err
+	}
+	evt2 := &model.DebtLedgerEvent{
+		DebtID:       r5.ID,
+		Debtor:       "service-alpha",
+		Creditor:     "system",
+		EventType:    model.DebtEventReservExpir,
+		Amount:       8,
+		ResourceType: "reservation",
+		ResourceKey:  "token-bucket-policy",
+		Detail:       "reservation expired: policy=token-bucket-policy tokens=8 (seeded overdue)",
+		CreatedAt:    now.Add(-15 * time.Second),
+	}
+	_ = s.CreateDebtLedgerEvent(evt2)
+	log.Printf("[demo-debt] seeded overdue reservation debt: service-alpha owes system 8, debt_id=%d", r5.ID)
+
+	r6 := &model.DebtRecord{
+		Debtor:       "service-beta",
+		Creditor:     "service-alpha",
+		Amount:       10,
+		ResourceType: "quota",
+		ResourceKey:  "sliding-window-policy",
+		Status:       model.DebtStatusCollected,
+		DueAt:        now.Add(-30 * time.Second),
+		CollectedAt:  now.Add(-25 * time.Second),
+		CreatedAt:    now.Add(-40 * time.Second),
+		UpdatedAt:    now.Add(-25 * time.Second),
+	}
+	if err := s.CreateDebtRecord(r6); err != nil {
+		return err
+	}
+	evt3 := &model.DebtLedgerEvent{
+		DebtID:       r6.ID,
+		Debtor:       "service-beta",
+		Creditor:     "service-alpha",
+		EventType:    model.DebtEventBorrow,
+		Amount:       10,
+		ResourceType: "quota",
+		ResourceKey:  "sliding-window-policy",
+		Detail:       "borrowed 10 from service-alpha (seeded collected)",
+		CreatedAt:    now.Add(-40 * time.Second),
+	}
+	_ = s.CreateDebtLedgerEvent(evt3)
+	evt4 := &model.DebtLedgerEvent{
+		DebtID:       r6.ID,
+		Debtor:       "service-beta",
+		Creditor:     "service-alpha",
+		EventType:    model.DebtEventCollect,
+		Amount:       10,
+		ResourceType: "quota",
+		ResourceKey:  "sliding-window-policy",
+		Detail:       "auto-collect success on attempt 1 (seeded)",
+		CreatedAt:    now.Add(-25 * time.Second),
+	}
+	_ = s.CreateDebtLedgerEvent(evt4)
+	audit1 := &model.LiquidationAuditEntry{
+		DebtID:   r6.ID,
+		Debtor:   "service-beta",
+		Creditor: "service-alpha",
+		Action:   "collect",
+		Amount:   10,
+		Success:  true,
+		Detail:   "auto-collect success on attempt 1 (seeded)",
+		CreatedAt: now.Add(-25 * time.Second),
+	}
+	_ = s.AddLiquidationAudit(audit1)
+	log.Printf("[demo-debt] seeded collected debt: service-beta paid back service-alpha 10 (auto-liquidation success), debt_id=%d", r6.ID)
+
+	log.Println("[demo-debt] demo data seeded successfully")
+	log.Println("[demo-debt] tip: view all debt records via GET /api/v1/debt/records")
+	log.Println("[demo-debt] tip: view service-alpha debt summary via GET /api/v1/debt/callers/service-alpha/summary")
+	log.Println("[demo-debt] tip: check restriction via GET /api/v1/debt/callers/service-alpha/check")
+	log.Println("[demo-debt] tip: view liquidation rules via GET /api/v1/debt/liquidation-rules")
+	log.Println("[demo-debt] tip: view ledger events via GET /api/v1/debt/ledger-events")
+	log.Println("[demo-debt] tip: view audit log via GET /api/v1/debt/audit")
+	log.Println("[demo-debt] note: overdue debts will be auto-processed within seconds by the liquidation loop")
 
 	return nil
 }

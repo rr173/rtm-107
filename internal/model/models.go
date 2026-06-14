@@ -635,6 +635,156 @@ const (
 	ShadowDecisionReject         ShadowDecision = "reject"
 )
 
+type DebtStatus string
+
+const (
+	DebtStatusActive      DebtStatus = "active"
+	DebtStatusCollected   DebtStatus = "collected"
+	DebtStatusOverdue     DebtStatus = "overdue"
+	DebtStatusWrittenOff  DebtStatus = "written_off"
+)
+
+type DebtEventType string
+
+const (
+	DebtEventBorrow          DebtEventType = "borrow"
+	DebtEventReturn          DebtEventType = "return"
+	DebtEventRollbackFail    DebtEventType = "rollback_fail"
+	DebtEventReservExpir     DebtEventType = "reservation_expire"
+	DebtEventForceReclaim    DebtEventType = "force_reclaim"
+	DebtEventCollect         DebtEventType = "collect"
+	DebtEventCollectFail     DebtEventType = "collect_fail"
+	DebtEventOverdueMark     DebtEventType = "overdue_mark"
+	DebtEventRestrict        DebtEventType = "restrict"
+	DebtEventRestrictLift    DebtEventType = "restrict_lift"
+	DebtEventWriteOff        DebtEventType = "write_off"
+)
+
+type DebtRecord struct {
+	ID              int64      `json:"id"`
+	Debtor          string     `json:"debtor"`
+	Creditor        string     `json:"creditor"`
+	Amount          int        `json:"amount"`
+	ResourceType    string     `json:"resource_type"`
+	ResourceKey     string     `json:"resource_key"`
+	Status          DebtStatus `json:"status"`
+	DueAt           time.Time  `json:"due_at"`
+	CollectedAt     time.Time  `json:"collected_at,omitempty"`
+	OverdueAt       time.Time  `json:"overdue_at,omitempty"`
+	WriteOffAt      time.Time  `json:"write_off_at,omitempty"`
+	SourceEventID   int64      `json:"source_event_id,omitempty"`
+	CollectAttempts int        `json:"collect_attempts"`
+	LastCollectAt   time.Time  `json:"last_collect_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+type DebtLedgerEvent struct {
+	ID          int64         `json:"id"`
+	DebtID      int64         `json:"debt_id,omitempty"`
+	Debtor      string        `json:"debtor"`
+	Creditor    string        `json:"creditor"`
+	EventType   DebtEventType `json:"event_type"`
+	Amount      int           `json:"amount"`
+	ResourceType string       `json:"resource_type"`
+	ResourceKey  string       `json:"resource_key"`
+	Detail      string        `json:"detail,omitempty"`
+	CreatedAt   time.Time     `json:"created_at"`
+}
+
+type RestrictionType string
+
+const (
+	RestrictionTypeReject     RestrictionType = "reject"
+	RestrictionTypeDegrade    RestrictionType = "degrade"
+	RestrictionTypeThrottle   RestrictionType = "throttle"
+)
+
+type RestrictionScope string
+
+const (
+	RestrictionScopeLock          RestrictionScope = "lock"
+	RestrictionScopeToken         RestrictionScope = "token"
+	RestrictionScopeOrchestration RestrictionScope = "orchestration"
+	RestrictionScopeAll           RestrictionScope = "all"
+)
+
+type DebtRestriction struct {
+	ID               int64            `json:"id"`
+	CallerID         string           `json:"caller_id"`
+	RestrictionType  RestrictionType  `json:"restriction_type"`
+	Scope            RestrictionScope `json:"scope"`
+	OverdueThreshold int              `json:"overdue_threshold"`
+	Reason           string           `json:"reason"`
+	Active           bool             `json:"active"`
+	LiftedAt         time.Time        `json:"lifted_at,omitempty"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+}
+
+type LiquidationRule struct {
+	ID                int64  `json:"id"`
+	CallerID          string `json:"caller_id"`
+	GracePeriodSec    int    `json:"grace_period_sec"`
+	OverdueThreshold  int    `json:"overdue_threshold"`
+	RestrictionType   string `json:"restriction_type"`
+	RestrictionScope  string `json:"restriction_scope"`
+	MaxCollectRetries int    `json:"max_collect_retries"`
+	ProtectionAfter   int    `json:"protection_after"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+type CreateLiquidationRuleRequest struct {
+	CallerID          string `json:"caller_id"`
+	GracePeriodSec    int    `json:"grace_period_sec" binding:"required,min=1"`
+	OverdueThreshold  int    `json:"overdue_threshold" binding:"required,min=1"`
+	RestrictionType   string `json:"restriction_type" binding:"required"`
+	RestrictionScope  string `json:"restriction_scope" binding:"required"`
+	MaxCollectRetries int    `json:"max_collect_retries" binding:"required,min=1"`
+	ProtectionAfter   int    `json:"protection_after" binding:"required,min=1"`
+}
+
+type CallerDebtSummary struct {
+	CallerID        string `json:"caller_id"`
+	TotalDebt       int    `json:"total_debt"`
+	TotalCredit     int    `json:"total_credit"`
+	ActiveDebts     int    `json:"active_debts"`
+	OverdueDebts    int    `json:"overdue_debts"`
+	CollectedDebts  int    `json:"collected_debts"`
+	Restricted      bool   `json:"restricted"`
+	Restrictions    []DebtRestriction `json:"restrictions,omitempty"`
+	LastCollectResult string `json:"last_collect_result,omitempty"`
+	AffectedResources []string `json:"affected_resources,omitempty"`
+}
+
+type DebtTimelineEntry struct {
+	ID        int64         `json:"id"`
+	EventType DebtEventType `json:"event_type"`
+	Amount    int           `json:"amount"`
+	Detail    string        `json:"detail"`
+	CreatedAt time.Time     `json:"created_at"`
+}
+
+type CheckRestrictionResult struct {
+	Restricted      bool             `json:"restricted"`
+	RestrictionType RestrictionType  `json:"restriction_type,omitempty"`
+	Scope           RestrictionScope `json:"scope,omitempty"`
+	Reason          string           `json:"reason,omitempty"`
+}
+
+type LiquidationAuditEntry struct {
+	ID          int64     `json:"id"`
+	DebtID      int64     `json:"debt_id"`
+	Debtor      string    `json:"debtor"`
+	Creditor    string    `json:"creditor"`
+	Action      string    `json:"action"`
+	Amount      int       `json:"amount"`
+	Success     bool      `json:"success"`
+	Detail      string    `json:"detail"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type ShadowRuleCategory string
 
 const (
@@ -642,6 +792,7 @@ const (
 	ShadowRuleRateLimit      ShadowRuleCategory = "rate_limit"
 	ShadowRuleReservation    ShadowRuleCategory = "reservation"
 	ShadowRuleCircuitBreaker ShadowRuleCategory = "circuit_breaker"
+	ShadowRuleDebt           ShadowRuleCategory = "debt"
 )
 
 type ShadowPlan struct {

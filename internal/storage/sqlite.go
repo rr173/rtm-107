@@ -347,6 +347,92 @@ func (s *Storage) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_shadow_diff_caller ON shadow_diff_records(request_caller);
 	CREATE INDEX IF NOT EXISTS idx_shadow_diff_resource ON shadow_diff_records(request_resource);
 	CREATE INDEX IF NOT EXISTS idx_shadow_diff_category ON shadow_diff_records(rule_category);
+
+	CREATE TABLE IF NOT EXISTS debt_records (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		debtor TEXT NOT NULL,
+		creditor TEXT NOT NULL,
+		amount INTEGER NOT NULL,
+		resource_type TEXT NOT NULL,
+		resource_key TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'active',
+		due_at DATETIME NOT NULL,
+		collected_at DATETIME,
+		overdue_at DATETIME,
+		write_off_at DATETIME,
+		source_event_id INTEGER DEFAULT 0,
+		collect_attempts INTEGER NOT NULL DEFAULT 0,
+		last_collect_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_debt_records_debtor ON debt_records(debtor);
+	CREATE INDEX IF NOT EXISTS idx_debt_records_creditor ON debt_records(creditor);
+	CREATE INDEX IF NOT EXISTS idx_debt_records_status ON debt_records(status);
+	CREATE INDEX IF NOT EXISTS idx_debt_records_due ON debt_records(due_at);
+
+	CREATE TABLE IF NOT EXISTS debt_ledger_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		debt_id INTEGER DEFAULT 0,
+		debtor TEXT NOT NULL,
+		creditor TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		amount INTEGER NOT NULL,
+		resource_type TEXT NOT NULL DEFAULT '',
+		resource_key TEXT NOT NULL DEFAULT '',
+		detail TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_debt_events_debtor ON debt_ledger_events(debtor);
+	CREATE INDEX IF NOT EXISTS idx_debt_events_creditor ON debt_ledger_events(creditor);
+	CREATE INDEX IF NOT EXISTS idx_debt_events_type ON debt_ledger_events(event_type);
+	CREATE INDEX IF NOT EXISTS idx_debt_events_debt ON debt_ledger_events(debt_id);
+
+	CREATE TABLE IF NOT EXISTS debt_restrictions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		restriction_type TEXT NOT NULL,
+		scope TEXT NOT NULL,
+		overdue_threshold INTEGER NOT NULL DEFAULT 1,
+		reason TEXT DEFAULT '',
+		active INTEGER NOT NULL DEFAULT 1,
+		lifted_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_debt_restrictions_caller ON debt_restrictions(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_debt_restrictions_active ON debt_restrictions(active);
+
+	CREATE TABLE IF NOT EXISTS liquidation_rules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		grace_period_sec INTEGER NOT NULL DEFAULT 60,
+		overdue_threshold INTEGER NOT NULL DEFAULT 2,
+		restriction_type TEXT NOT NULL DEFAULT 'reject',
+		restriction_scope TEXT NOT NULL DEFAULT 'all',
+		max_collect_retries INTEGER NOT NULL DEFAULT 3,
+		protection_after INTEGER NOT NULL DEFAULT 5,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS liquidation_audit (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		debt_id INTEGER NOT NULL,
+		debtor TEXT NOT NULL,
+		creditor TEXT NOT NULL,
+		action TEXT NOT NULL,
+		amount INTEGER NOT NULL,
+		success INTEGER NOT NULL DEFAULT 1,
+		detail TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_liquidation_audit_debtor ON liquidation_audit(debtor);
+	CREATE INDEX IF NOT EXISTS idx_liquidation_audit_debt ON liquidation_audit(debt_id);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -2345,4 +2431,425 @@ func (s *Storage) GetAuditLogRange() (int64, int64, error) {
 	var minID, maxID int64
 	err := s.db.QueryRow(`SELECT COALESCE(MIN(id),0), COALESCE(MAX(id),0) FROM audit_logs`).Scan(&minID, &maxID)
 	return minID, maxID, err
+}
+
+func (s *Storage) CreateDebtRecord(r *model.DebtRecord) error {
+	result, err := s.db.Exec(`
+		INSERT INTO debt_records (debtor, creditor, amount, resource_type, resource_key, status, due_at, source_event_id, collect_attempts, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, r.Debtor, r.Creditor, r.Amount, r.ResourceType, r.ResourceKey, r.Status, r.DueAt, r.SourceEventID, r.CollectAttempts, r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) UpdateDebtRecord(r *model.DebtRecord) error {
+	_, err := s.db.Exec(`
+		UPDATE debt_records SET status = ?, collected_at = ?, overdue_at = ?, write_off_at = ?,
+			collect_attempts = ?, last_collect_at = ?, updated_at = ?
+		WHERE id = ?
+	`, r.Status, nullTime(r.CollectedAt), nullTime(r.OverdueAt), nullTime(r.WriteOffAt),
+		r.CollectAttempts, nullTime(r.LastCollectAt), r.UpdatedAt, r.ID)
+	return err
+}
+
+func (s *Storage) GetDebtRecord(id int64) (*model.DebtRecord, error) {
+	row := s.db.QueryRow(`
+		SELECT id, debtor, creditor, amount, resource_type, resource_key, status, due_at,
+			collected_at, overdue_at, write_off_at, source_event_id, collect_attempts, last_collect_at, created_at, updated_at
+		FROM debt_records WHERE id = ?
+	`, id)
+	var r model.DebtRecord
+	var collectedAt, overdueAt, writeOffAt, lastCollectAt sql.NullTime
+	err := row.Scan(&r.ID, &r.Debtor, &r.Creditor, &r.Amount, &r.ResourceType, &r.ResourceKey,
+		&r.Status, &r.DueAt, &collectedAt, &overdueAt, &writeOffAt,
+		&r.SourceEventID, &r.CollectAttempts, &lastCollectAt, &r.CreatedAt, &r.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if collectedAt.Valid {
+		r.CollectedAt = collectedAt.Time
+	}
+	if overdueAt.Valid {
+		r.OverdueAt = overdueAt.Time
+	}
+	if writeOffAt.Valid {
+		r.WriteOffAt = writeOffAt.Time
+	}
+	if lastCollectAt.Valid {
+		r.LastCollectAt = lastCollectAt.Time
+	}
+	return &r, nil
+}
+
+func (s *Storage) ListDebtRecords(debtor, status string) ([]model.DebtRecord, error) {
+	var rows *sql.Rows
+	var err error
+	if debtor != "" && status != "" {
+		rows, err = s.db.Query(`
+			SELECT id, debtor, creditor, amount, resource_type, resource_key, status, due_at,
+				collected_at, overdue_at, write_off_at, source_event_id, collect_attempts, last_collect_at, created_at, updated_at
+			FROM debt_records WHERE debtor = ? AND status = ? ORDER BY id DESC
+		`, debtor, status)
+	} else if debtor != "" {
+		rows, err = s.db.Query(`
+			SELECT id, debtor, creditor, amount, resource_type, resource_key, status, due_at,
+				collected_at, overdue_at, write_off_at, source_event_id, collect_attempts, last_collect_at, created_at, updated_at
+			FROM debt_records WHERE debtor = ? ORDER BY id DESC
+		`, debtor)
+	} else if status != "" {
+		rows, err = s.db.Query(`
+			SELECT id, debtor, creditor, amount, resource_type, resource_key, status, due_at,
+				collected_at, overdue_at, write_off_at, source_event_id, collect_attempts, last_collect_at, created_at, updated_at
+			FROM debt_records WHERE status = ? ORDER BY id DESC
+		`, status)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, debtor, creditor, amount, resource_type, resource_key, status, due_at,
+				collected_at, overdue_at, write_off_at, source_event_id, collect_attempts, last_collect_at, created_at, updated_at
+			FROM debt_records ORDER BY id DESC
+		`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []model.DebtRecord
+	for rows.Next() {
+		var r model.DebtRecord
+		var collectedAt, overdueAt, writeOffAt, lastCollectAt sql.NullTime
+		if err := rows.Scan(&r.ID, &r.Debtor, &r.Creditor, &r.Amount, &r.ResourceType, &r.ResourceKey,
+			&r.Status, &r.DueAt, &collectedAt, &overdueAt, &writeOffAt,
+			&r.SourceEventID, &r.CollectAttempts, &lastCollectAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if collectedAt.Valid {
+			r.CollectedAt = collectedAt.Time
+		}
+		if overdueAt.Valid {
+			r.OverdueAt = overdueAt.Time
+		}
+		if writeOffAt.Valid {
+			r.WriteOffAt = writeOffAt.Time
+		}
+		if lastCollectAt.Valid {
+			r.LastCollectAt = lastCollectAt.Time
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+func (s *Storage) ListOverdueDebts(now time.Time) ([]model.DebtRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT id, debtor, creditor, amount, resource_type, resource_key, status, due_at,
+			collected_at, overdue_at, write_off_at, source_event_id, collect_attempts, last_collect_at, created_at, updated_at
+		FROM debt_records WHERE status IN ('active', 'overdue') AND due_at <= ? ORDER BY due_at
+	`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []model.DebtRecord
+	for rows.Next() {
+		var r model.DebtRecord
+		var collectedAt, overdueAt, writeOffAt, lastCollectAt sql.NullTime
+		if err := rows.Scan(&r.ID, &r.Debtor, &r.Creditor, &r.Amount, &r.ResourceType, &r.ResourceKey,
+			&r.Status, &r.DueAt, &collectedAt, &overdueAt, &writeOffAt,
+			&r.SourceEventID, &r.CollectAttempts, &lastCollectAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if collectedAt.Valid {
+			r.CollectedAt = collectedAt.Time
+		}
+		if overdueAt.Valid {
+			r.OverdueAt = overdueAt.Time
+		}
+		if writeOffAt.Valid {
+			r.WriteOffAt = writeOffAt.Time
+		}
+		if lastCollectAt.Valid {
+			r.LastCollectAt = lastCollectAt.Time
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+func (s *Storage) CountOverdueDebts(debtor string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM debt_records WHERE debtor = ? AND status = 'overdue'`, debtor).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) SumActiveDebt(debtor string) (int, error) {
+	var total int
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM debt_records WHERE debtor = ? AND status IN ('active','overdue')`, debtor).Scan(&total)
+	return total, err
+}
+
+func (s *Storage) SumActiveCredit(creditor string) (int, error) {
+	var total int
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM debt_records WHERE creditor = ? AND status IN ('active','overdue')`, creditor).Scan(&total)
+	return total, err
+}
+
+func (s *Storage) CreateDebtLedgerEvent(e *model.DebtLedgerEvent) error {
+	result, err := s.db.Exec(`
+		INSERT INTO debt_ledger_events (debt_id, debtor, creditor, event_type, amount, resource_type, resource_key, detail, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, e.DebtID, e.Debtor, e.Creditor, e.EventType, e.Amount, e.ResourceType, e.ResourceKey, e.Detail, e.CreatedAt)
+	if err != nil {
+		return err
+	}
+	e.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListDebtLedgerEvents(debtor string, debtID int64, limit int) ([]model.DebtLedgerEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var rows *sql.Rows
+	var err error
+	if debtID > 0 {
+		rows, err = s.db.Query(`
+			SELECT id, debt_id, debtor, creditor, event_type, amount, resource_type, resource_key, detail, created_at
+			FROM debt_ledger_events WHERE debt_id = ? ORDER BY id DESC LIMIT ?
+		`, debtID, limit)
+	} else if debtor != "" {
+		rows, err = s.db.Query(`
+			SELECT id, debt_id, debtor, creditor, event_type, amount, resource_type, resource_key, detail, created_at
+			FROM debt_ledger_events WHERE debtor = ? ORDER BY id DESC LIMIT ?
+		`, debtor, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, debt_id, debtor, creditor, event_type, amount, resource_type, resource_key, detail, created_at
+			FROM debt_ledger_events ORDER BY id DESC LIMIT ?
+		`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []model.DebtLedgerEvent
+	for rows.Next() {
+		var e model.DebtLedgerEvent
+		if err := rows.Scan(&e.ID, &e.DebtID, &e.Debtor, &e.Creditor, &e.EventType, &e.Amount, &e.ResourceType, &e.ResourceKey, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+func (s *Storage) CreateDebtRestriction(r *model.DebtRestriction) error {
+	result, err := s.db.Exec(`
+		INSERT INTO debt_restrictions (caller_id, restriction_type, scope, overdue_threshold, reason, active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, r.CallerID, r.RestrictionType, r.Scope, r.OverdueThreshold, r.Reason, boolToInt(r.Active), r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListActiveDebtRestrictions(callerID string) ([]model.DebtRestriction, error) {
+	var rows *sql.Rows
+	var err error
+	if callerID != "" {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, restriction_type, scope, overdue_threshold, reason, active, lifted_at, created_at, updated_at
+			FROM debt_restrictions WHERE caller_id = ? AND active = 1 ORDER BY id DESC
+		`, callerID)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, restriction_type, scope, overdue_threshold, reason, active, lifted_at, created_at, updated_at
+			FROM debt_restrictions WHERE active = 1 ORDER BY id DESC
+		`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var restrictions []model.DebtRestriction
+	for rows.Next() {
+		var r model.DebtRestriction
+		var activeInt int
+		var liftedAt sql.NullTime
+		if err := rows.Scan(&r.ID, &r.CallerID, &r.RestrictionType, &r.Scope, &r.OverdueThreshold, &r.Reason, &activeInt, &liftedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		r.Active = activeInt != 0
+		if liftedAt.Valid {
+			r.LiftedAt = liftedAt.Time
+		}
+		restrictions = append(restrictions, r)
+	}
+	return restrictions, nil
+}
+
+func (s *Storage) LiftDebtRestriction(id int64, liftedAt time.Time) error {
+	_, err := s.db.Exec(`UPDATE debt_restrictions SET active = 0, lifted_at = ?, updated_at = ? WHERE id = ?`, liftedAt, liftedAt, id)
+	return err
+}
+
+func (s *Storage) CreateLiquidationRule(r *model.LiquidationRule) error {
+	result, err := s.db.Exec(`
+		INSERT INTO liquidation_rules (caller_id, grace_period_sec, overdue_threshold, restriction_type, restriction_scope, max_collect_retries, protection_after, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			grace_period_sec = excluded.grace_period_sec,
+			overdue_threshold = excluded.overdue_threshold,
+			restriction_type = excluded.restriction_type,
+			restriction_scope = excluded.restriction_scope,
+			max_collect_retries = excluded.max_collect_retries,
+			protection_after = excluded.protection_after,
+			updated_at = excluded.updated_at
+	`, r.CallerID, r.GracePeriodSec, r.OverdueThreshold, r.RestrictionType, r.RestrictionScope, r.MaxCollectRetries, r.ProtectionAfter, r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if r.ID == 0 {
+		r.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetLiquidationRule(callerID string) (*model.LiquidationRule, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, grace_period_sec, overdue_threshold, restriction_type, restriction_scope, max_collect_retries, protection_after, created_at, updated_at
+		FROM liquidation_rules WHERE caller_id = ?
+	`, callerID)
+	var r model.LiquidationRule
+	err := row.Scan(&r.ID, &r.CallerID, &r.GracePeriodSec, &r.OverdueThreshold, &r.RestrictionType, &r.RestrictionScope, &r.MaxCollectRetries, &r.ProtectionAfter, &r.CreatedAt, &r.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Storage) ListLiquidationRules() ([]model.LiquidationRule, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, grace_period_sec, overdue_threshold, restriction_type, restriction_scope, max_collect_retries, protection_after, created_at, updated_at
+		FROM liquidation_rules ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var rules []model.LiquidationRule
+	for rows.Next() {
+		var r model.LiquidationRule
+		if err := rows.Scan(&r.ID, &r.CallerID, &r.GracePeriodSec, &r.OverdueThreshold, &r.RestrictionType, &r.RestrictionScope, &r.MaxCollectRetries, &r.ProtectionAfter, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+	return rules, nil
+}
+
+func (s *Storage) DeleteLiquidationRule(callerID string) error {
+	_, err := s.db.Exec(`DELETE FROM liquidation_rules WHERE caller_id = ?`, callerID)
+	return err
+}
+
+func (s *Storage) AddLiquidationAudit(a *model.LiquidationAuditEntry) error {
+	result, err := s.db.Exec(`
+		INSERT INTO liquidation_audit (debt_id, debtor, creditor, action, amount, success, detail, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, a.DebtID, a.Debtor, a.Creditor, a.Action, a.Amount, boolToInt(a.Success), a.Detail, a.CreatedAt)
+	if err != nil {
+		return err
+	}
+	a.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListLiquidationAudit(debtor string, limit int) ([]model.LiquidationAuditEntry, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var rows *sql.Rows
+	var err error
+	if debtor != "" {
+		rows, err = s.db.Query(`
+			SELECT id, debt_id, debtor, creditor, action, amount, success, detail, created_at
+			FROM liquidation_audit WHERE debtor = ? ORDER BY id DESC LIMIT ?
+		`, debtor, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, debt_id, debtor, creditor, action, amount, success, detail, created_at
+			FROM liquidation_audit ORDER BY id DESC LIMIT ?
+		`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []model.LiquidationAuditEntry
+	for rows.Next() {
+		var e model.LiquidationAuditEntry
+		var successInt int
+		if err := rows.Scan(&e.ID, &e.DebtID, &e.Debtor, &e.Creditor, &e.Action, &e.Amount, &successInt, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.Success = successInt != 0
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+func (s *Storage) GetLastCollectResult(debtor string) (string, error) {
+	var detail string
+	err := s.db.QueryRow(`
+		SELECT detail FROM liquidation_audit WHERE debtor = ? AND action = 'collect' ORDER BY id DESC LIMIT 1
+	`, debtor).Scan(&detail)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return detail, err
+}
+
+func (s *Storage) GetAffectedResources(debtor string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT resource_key FROM debt_records WHERE debtor = ? AND status IN ('active','overdue') AND resource_key != ''
+	`, debtor)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var resources []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, err
+		}
+		resources = append(resources, r)
+	}
+	return resources, nil
+}
+
+func (s *Storage) CountDebtsByStatus(debtor string, status string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM debt_records WHERE debtor = ? AND status = ?`, debtor, status).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) CountCollectFailures(debtor string, windowSec int, now time.Time) (int, error) {
+	startTime := now.Add(-time.Duration(windowSec) * time.Second)
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM liquidation_audit WHERE debtor = ? AND action = 'collect' AND success = 0 AND created_at >= ?
+	`, debtor, startTime).Scan(&count)
+	return count, err
 }
