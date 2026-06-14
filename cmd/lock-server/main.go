@@ -7,6 +7,7 @@ import (
 	"rtm-107/internal/api"
 	"rtm-107/internal/audit"
 	"rtm-107/internal/debt"
+	"rtm-107/internal/handover"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -79,6 +80,12 @@ func main() {
 	}
 	defer debtMgr.Stop()
 
+	handoverMgr := handover.NewManager(s, mgr, rlMgr, orchMgr, topoMgr, debtMgr)
+	if err := handoverMgr.Start(); err != nil {
+		log.Fatalf("start handover manager: %v", err)
+	}
+	defer handoverMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
@@ -103,6 +110,10 @@ func main() {
 		log.Printf("seed debt demo data: %v", err)
 	}
 
+	if err := seedHandoverDemoData(handoverMgr, mgr, rlMgr, orchMgr); err != nil {
+		log.Printf("seed handover demo data: %v", err)
+	}
+
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -116,7 +127,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -650,6 +661,139 @@ func seedDebtDemoData(debtMgr *debt.Manager, s *storage.Storage) error {
 	log.Println("[demo-debt] tip: view ledger events via GET /api/v1/debt/ledger-events")
 	log.Println("[demo-debt] tip: view audit log via GET /api/v1/debt/audit")
 	log.Println("[demo-debt] note: overdue debts will be auto-processed within seconds by the liquidation loop")
+
+	return nil
+}
+
+func seedHandoverDemoData(hm *handover.Manager, lockMgr *lock.Manager, rlMgr *ratelimit.Manager, orchMgr *orchestration.Manager) error {
+	existing, err := hm.ListHandovers("", "", "")
+	if err != nil {
+		return err
+	}
+	if len(existing) > 0 {
+		log.Println("[demo-handover] handover data already exists, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-handover] seeding handover demo data...")
+
+	fromCaller := "alice"
+	toCaller := "bob"
+	altCaller := "charlie"
+
+	if _, err := lockMgr.AcquireLock("handover-lock-demo-1", fromCaller, 3600, false); err != nil {
+		return fmt.Errorf("acquire demo lock 1: %w", err)
+	}
+	log.Println("[demo-handover] alice acquired lock: handover-lock-demo-1")
+
+	if _, err := lockMgr.AcquireLock("handover-lock-demo-2", fromCaller, 3600, true); err != nil {
+		return fmt.Errorf("acquire demo lock 2: %w", err)
+	}
+	log.Println("[demo-handover] alice acquired lock: handover-lock-demo-2 (reentrant)")
+
+	if _, err := lockMgr.AcquireLock("handover-lock-demo-3", toCaller, 3600, false); err != nil {
+		return fmt.Errorf("acquire demo lock 3: %w", err)
+	}
+	log.Println("[demo-handover] bob acquired lock: handover-lock-demo-3")
+
+	if _, err := lockMgr.AcquireLock("handover-lock-demo-4", altCaller, 3600, false); err != nil {
+		return fmt.Errorf("acquire demo lock 4: %w", err)
+	}
+	log.Println("[demo-handover] charlie acquired lock: handover-lock-demo-4 (simulated completed transfer target)")
+
+	if _, err := lockMgr.AcquireLock("handover-lock-demo-5", toCaller, 3600, false); err != nil {
+		return fmt.Errorf("acquire demo lock 5: %w", err)
+	}
+	log.Println("[demo-handover] bob acquired lock: handover-lock-demo-5 (for timeout cancel demo)")
+
+	{
+		req := &model.CreateHandoverRequest{
+			FromCaller:        fromCaller,
+			ToCaller:          toCaller,
+			Initiator:         "ops-admin",
+			Description:       "机房切流交接：alice -> bob（待接收）",
+			NeedConfirm:       true,
+			ConfirmTimeoutSec: 3600,
+			LockNames:         []string{"handover-lock-demo-1", "handover-lock-demo-2"},
+		}
+		created, err := hm.CreateHandover(req)
+		if err != nil {
+			return fmt.Errorf("create demo handover 1: %w", err)
+		}
+		log.Printf("[demo-handover] created demo handover #%d: %s -> %s, %d resources", created.ID, fromCaller, toCaller, len(created.Resources))
+
+		if _, err := hm.PreCheck(created.ID); err != nil {
+			log.Printf("[demo-handover] precheck warning: %v", err)
+		}
+		log.Printf("[demo-handover] handover #%d prechecked", created.ID)
+
+		if _, err := hm.Initiate(created.ID, "ops-admin"); err != nil {
+			log.Printf("[demo-handover] initiate warning: %v", err)
+		}
+		log.Printf("[demo-handover] handover #%d initiated (pending_receive, timeout 3600s)", created.ID)
+	}
+
+	{
+		req := &model.CreateHandoverRequest{
+			FromCaller:        fromCaller,
+			ToCaller:          altCaller,
+			Initiator:         "ops-admin",
+			Description:       "已完成的成功交接演示：alice -> charlie",
+			NeedConfirm:       false,
+			ConfirmTimeoutSec: 3600,
+			LockNames:         []string{},
+		}
+		created, err := hm.CreateHandover(req)
+		if err != nil {
+			return fmt.Errorf("create demo handover 2: %w", err)
+		}
+		log.Printf("[demo-handover] created demo handover #%d (completed): %s -> %s", created.ID, fromCaller, altCaller)
+
+		if _, err := hm.PreCheck(created.ID); err != nil {
+			log.Printf("[demo-handover] precheck warning for #%d: %v", created.ID, err)
+		}
+
+		if _, err := hm.Initiate(created.ID, "ops-admin"); err != nil {
+			log.Printf("[demo-handover] initiate warning for #%d: %v", created.ID, err)
+		}
+		log.Printf("[demo-handover] demo handover #%d completed successfully (no resources transferred)", created.ID)
+	}
+
+	{
+		req := &model.CreateHandoverRequest{
+			FromCaller:        toCaller,
+			ToCaller:          altCaller,
+			Initiator:         "ops-admin",
+			Description:       "超时撤销演示（deadline已过期，会被定时任务自动撤销）",
+			NeedConfirm:       true,
+			ConfirmTimeoutSec: 1,
+			LockNames:         []string{"handover-lock-demo-5"},
+		}
+		created, err := hm.CreateHandover(req)
+		if err != nil {
+			return fmt.Errorf("create demo handover 3: %w", err)
+		}
+		log.Printf("[demo-handover] created demo handover #%d (for timeout cancel): %s -> %s, timeout=1s", created.ID, toCaller, altCaller)
+
+		if _, err := hm.PreCheck(created.ID); err != nil {
+			log.Printf("[demo-handover] precheck warning for #%d: %v", created.ID, err)
+		}
+
+		if _, err := hm.Initiate(created.ID, "ops-admin"); err != nil {
+			log.Printf("[demo-handover] initiate warning for #%d: %v", created.ID, err)
+		}
+
+		time.Sleep(1200 * time.Millisecond)
+		log.Printf("[demo-handover] slept 1.2s past deadline for handover #%d - will be auto-cancelled by timeout loop soon", created.ID)
+	}
+
+	log.Println("[demo-handover] demo data seeded successfully")
+	log.Println("[demo-handover] tip: view all via GET /api/v1/handovers")
+	log.Println("[demo-handover] tip: view pending (pending_receive) handover via GET /api/v1/handovers?status=pending_receive")
+	log.Println("[demo-handover] tip: view completed handover via GET /api/v1/handovers?status=completed")
+	log.Println("[demo-handover] tip: view cancelled handover via GET /api/v1/handovers?status=cancelled")
+	log.Println("[demo-handover] tip: view alice's outgoing/incoming via GET /api/v1/handovers/callers/alice/summary")
+	log.Println("[demo-handover] tip: view handover timeline via GET /api/v1/handovers/<id>/timeline")
 
 	return nil
 }

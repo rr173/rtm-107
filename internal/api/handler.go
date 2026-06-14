@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"rtm-107/internal/audit"
 	"rtm-107/internal/debt"
+	"rtm-107/internal/handover"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -26,10 +27,11 @@ type Handler struct {
 	topoMgr      *topology.Manager
 	shadowMgr    *shadow.Manager
 	debtMgr      *debt.Manager
+	handoverMgr  *handover.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -192,6 +194,20 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			}
 
 			debtGroup.GET("/audit", h.ListLiquidationAudit)
+		}
+
+		handoverGroup := api.Group("/handovers")
+		{
+			handoverGroup.POST("", h.CreateHandover)
+			handoverGroup.GET("", h.ListHandovers)
+			handoverGroup.GET("/:id", h.GetHandover)
+			handoverGroup.POST("/:id/precheck", h.PreCheckHandover)
+			handoverGroup.POST("/:id/initiate", h.InitiateHandover)
+			handoverGroup.POST("/:id/confirm", h.ConfirmHandover)
+			handoverGroup.POST("/:id/cancel", h.CancelHandover)
+			handoverGroup.GET("/callers/:caller", h.ListCallerHandovers)
+			handoverGroup.GET("/callers/:caller/summary", h.GetCallerHandoverSummary)
+			handoverGroup.GET("/:id/timeline", h.GetHandoverTimeline)
 		}
 	}
 }
@@ -1607,4 +1623,167 @@ func (h *Handler) ListLiquidationAudit(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"audit": entries})
+}
+
+func (h *Handler) CreateHandover(c *gin.Context) {
+	var req model.CreateHandoverRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	result, err := h.handoverMgr.CreateHandover(&req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"handover": result})
+}
+
+func (h *Handler) ListHandovers(c *gin.Context) {
+	from := c.Query("from")
+	to := c.Query("to")
+	status := c.Query("status")
+	list, err := h.handoverMgr.ListHandovers(from, to, status)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"handovers": list})
+}
+
+func (h *Handler) GetHandover(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid handover id"})
+		return
+	}
+	hando, err := h.handoverMgr.GetHandover(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if hando == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "handover not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"handover": hando})
+}
+
+type InitiateHandoverRequest struct {
+	Operator string `json:"operator" binding:"required"`
+}
+
+func (h *Handler) PreCheckHandover(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid handover id"})
+		return
+	}
+	result, err := h.handoverMgr.PreCheck(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) InitiateHandover(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid handover id"})
+		return
+	}
+	var req InitiateHandoverRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	result, err := h.handoverMgr.Initiate(id, req.Operator)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"handover": result})
+}
+
+func (h *Handler) ConfirmHandover(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid handover id"})
+		return
+	}
+	var req model.ConfirmHandoverRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	result, err := h.handoverMgr.Confirm(id, &req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"handover": result})
+}
+
+func (h *Handler) CancelHandover(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid handover id"})
+		return
+	}
+	var req model.CancelHandoverRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	result, err := h.handoverMgr.Cancel(id, &req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"handover": result})
+}
+
+func (h *Handler) ListCallerHandovers(c *gin.Context) {
+	callerID := c.Param("caller")
+	list, err := h.handoverMgr.ListHandoversForCaller(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"handovers": list})
+}
+
+func (h *Handler) GetCallerHandoverSummary(c *gin.Context) {
+	callerID := c.Param("caller")
+	summary, err := h.handoverMgr.GetCallerSummary(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"summary": summary})
+}
+
+func (h *Handler) GetHandoverTimeline(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid handover id"})
+		return
+	}
+	hando, err := h.handoverMgr.GetHandover(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if hando == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "handover not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"timeline": hando.Timeline, "handover_id": id})
 }

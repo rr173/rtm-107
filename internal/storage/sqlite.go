@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"rtm-107/internal/model"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -433,6 +434,61 @@ func (s *Storage) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_liquidation_audit_debtor ON liquidation_audit(debtor);
 	CREATE INDEX IF NOT EXISTS idx_liquidation_audit_debt ON liquidation_audit(debt_id);
+
+	CREATE TABLE IF NOT EXISTS handovers (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_caller TEXT NOT NULL,
+		to_caller TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'created',
+		initiator TEXT NOT NULL,
+		description TEXT DEFAULT '',
+		need_confirm INTEGER NOT NULL DEFAULT 1,
+		confirm_timeout_sec INTEGER NOT NULL DEFAULT 3600,
+		confirm_deadline DATETIME,
+		confirmed_at DATETIME,
+		cancelled_at DATETIME,
+		completed_at DATETIME,
+		cancel_reason TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_handovers_from ON handovers(from_caller);
+	CREATE INDEX IF NOT EXISTS idx_handovers_to ON handovers(to_caller);
+	CREATE INDEX IF NOT EXISTS idx_handovers_status ON handovers(status);
+	CREATE INDEX IF NOT EXISTS idx_handovers_deadline ON handovers(confirm_deadline);
+
+	CREATE TABLE IF NOT EXISTS handover_resources (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		handover_id INTEGER NOT NULL,
+		resource_type TEXT NOT NULL,
+		resource_key TEXT NOT NULL,
+		resource_name TEXT DEFAULT '',
+		precheck_status TEXT NOT NULL DEFAULT 'ok',
+		precheck_detail TEXT DEFAULT '',
+		current_holder TEXT DEFAULT '',
+		snapshot TEXT DEFAULT '',
+		executed INTEGER NOT NULL DEFAULT 0,
+		rolled_back INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(handover_id) REFERENCES handovers(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_hr_handover ON handover_resources(handover_id);
+	CREATE INDEX IF NOT EXISTS idx_hr_type_key ON handover_resources(resource_type, resource_key);
+
+	CREATE TABLE IF NOT EXISTS handover_timeline (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		handover_id INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		operator TEXT NOT NULL,
+		detail TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(handover_id) REFERENCES handovers(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_ht_handover ON handover_timeline(handover_id);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -2852,4 +2908,356 @@ func (s *Storage) CountCollectFailures(debtor string, windowSec int, now time.Ti
 		SELECT COUNT(*) FROM liquidation_audit WHERE debtor = ? AND action = 'collect' AND success = 0 AND created_at >= ?
 	`, debtor, startTime).Scan(&count)
 	return count, err
+}
+
+func (s *Storage) CreateHandover(h *model.Handover) error {
+	result, err := s.db.Exec(`
+		INSERT INTO handovers (from_caller, to_caller, status, initiator, description,
+			need_confirm, confirm_timeout_sec, confirm_deadline, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, h.FromCaller, h.ToCaller, h.Status, h.Initiator, h.Description,
+		boolToInt(h.NeedConfirm), h.ConfirmTimeoutSec, nullTimePtr(h.ConfirmDeadline), h.CreatedAt, h.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	h.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) UpdateHandoverStatus(id int64, status model.HandoverStatus, updatedAt time.Time, extraFields ...interface{}) error {
+	query := `UPDATE handovers SET status = ?, updated_at = ?`
+	args := []interface{}{status, updatedAt}
+
+	for i := 0; i < len(extraFields); i += 2 {
+		fieldName := extraFields[i].(string)
+		fieldValue := extraFields[i+1]
+		query += fmt.Sprintf(`, %s = ?`, fieldName)
+		args = append(args, fieldValue)
+	}
+	query += ` WHERE id = ?`
+	args = append(args, id)
+
+	_, err := s.db.Exec(query, args...)
+	return err
+}
+
+func (s *Storage) GetHandover(id int64) (*model.Handover, error) {
+	row := s.db.QueryRow(`
+		SELECT id, from_caller, to_caller, status, initiator, description,
+			need_confirm, confirm_timeout_sec, confirm_deadline, confirmed_at,
+			cancelled_at, completed_at, cancel_reason, created_at, updated_at
+		FROM handovers WHERE id = ?
+	`, id)
+
+	var h model.Handover
+	var needConfirmInt int
+	var confirmDeadline, confirmedAt, cancelledAt, completedAt sql.NullTime
+	err := row.Scan(&h.ID, &h.FromCaller, &h.ToCaller, &h.Status, &h.Initiator, &h.Description,
+		&needConfirmInt, &h.ConfirmTimeoutSec, &confirmDeadline, &confirmedAt,
+		&cancelledAt, &completedAt, &h.CancelReason, &h.CreatedAt, &h.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	h.NeedConfirm = needConfirmInt != 0
+	if confirmDeadline.Valid {
+		t := confirmDeadline.Time
+		h.ConfirmDeadline = &t
+	}
+	if confirmedAt.Valid {
+		t := confirmedAt.Time
+		h.ConfirmedAt = &t
+	}
+	if cancelledAt.Valid {
+		t := cancelledAt.Time
+		h.CancelledAt = &t
+	}
+	if completedAt.Valid {
+		t := completedAt.Time
+		h.CompletedAt = &t
+	}
+	return &h, nil
+}
+
+func (s *Storage) ListHandovers(fromCaller, toCaller, status string) ([]model.Handover, error) {
+	where := []string{"1=1"}
+	args := []interface{}{}
+	if fromCaller != "" {
+		where = append(where, "from_caller = ?")
+		args = append(args, fromCaller)
+	}
+	if toCaller != "" {
+		where = append(where, "to_caller = ?")
+		args = append(args, toCaller)
+	}
+	if status != "" {
+		where = append(where, "status = ?")
+		args = append(args, status)
+	}
+	whereClause := strings.Join(where, " AND ")
+	query := `SELECT id, from_caller, to_caller, status, initiator, description,
+		need_confirm, confirm_timeout_sec, confirm_deadline, confirmed_at,
+		cancelled_at, completed_at, cancel_reason, created_at, updated_at
+		FROM handovers WHERE ` + whereClause + ` ORDER BY created_at DESC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []model.Handover
+	for rows.Next() {
+		var h model.Handover
+		var needConfirmInt int
+		var confirmDeadline, confirmedAt, cancelledAt, completedAt sql.NullTime
+		err := rows.Scan(&h.ID, &h.FromCaller, &h.ToCaller, &h.Status, &h.Initiator, &h.Description,
+			&needConfirmInt, &h.ConfirmTimeoutSec, &confirmDeadline, &confirmedAt,
+			&cancelledAt, &completedAt, &h.CancelReason, &h.CreatedAt, &h.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		h.NeedConfirm = needConfirmInt != 0
+		if confirmDeadline.Valid {
+			t := confirmDeadline.Time
+			h.ConfirmDeadline = &t
+		}
+		if confirmedAt.Valid {
+			t := confirmedAt.Time
+			h.ConfirmedAt = &t
+		}
+		if cancelledAt.Valid {
+			t := cancelledAt.Time
+			h.CancelledAt = &t
+		}
+		if completedAt.Valid {
+			t := completedAt.Time
+			h.CompletedAt = &t
+		}
+		result = append(result, h)
+	}
+	return result, nil
+}
+
+func (s *Storage) ListExpiredPendingHandovers(now time.Time) ([]model.Handover, error) {
+	rows, err := s.db.Query(`
+		SELECT id, from_caller, to_caller, status, initiator, description,
+			need_confirm, confirm_timeout_sec, confirm_deadline, confirmed_at,
+			cancelled_at, completed_at, cancel_reason, created_at, updated_at
+		FROM handovers WHERE status = ? AND confirm_deadline IS NOT NULL AND confirm_deadline <= ?
+	`, model.HandoverStatusPending, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []model.Handover
+	for rows.Next() {
+		var h model.Handover
+		var needConfirmInt int
+		var confirmDeadline, confirmedAt, cancelledAt, completedAt sql.NullTime
+		err := rows.Scan(&h.ID, &h.FromCaller, &h.ToCaller, &h.Status, &h.Initiator, &h.Description,
+			&needConfirmInt, &h.ConfirmTimeoutSec, &confirmDeadline, &confirmedAt,
+			&cancelledAt, &completedAt, &h.CancelReason, &h.CreatedAt, &h.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		h.NeedConfirm = needConfirmInt != 0
+		if confirmDeadline.Valid {
+			t := confirmDeadline.Time
+			h.ConfirmDeadline = &t
+		}
+		if confirmedAt.Valid {
+			t := confirmedAt.Time
+			h.ConfirmedAt = &t
+		}
+		if cancelledAt.Valid {
+			t := cancelledAt.Time
+			h.CancelledAt = &t
+		}
+		if completedAt.Valid {
+			t := completedAt.Time
+			h.CompletedAt = &t
+		}
+		result = append(result, h)
+	}
+	return result, nil
+}
+
+func (s *Storage) AddHandoverResource(item *model.HandoverResourceItem) error {
+	executedInt := 0
+	if item.Executed {
+		executedInt = 1
+	}
+	rolledBackInt := 0
+	if item.RolledBack {
+		rolledBackInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO handover_resources (handover_id, resource_type, resource_key, resource_name,
+			precheck_status, precheck_detail, current_holder, snapshot, executed, rolled_back, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, item.HandoverID, item.ResourceType, item.ResourceKey, item.ResourceName,
+		item.PreCheckStatus, item.PreCheckDetail, item.CurrentHolder, item.Snapshot,
+		executedInt, rolledBackInt, item.CreatedAt, item.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	item.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) UpdateHandoverResource(item *model.HandoverResourceItem) error {
+	executedInt := 0
+	if item.Executed {
+		executedInt = 1
+	}
+	rolledBackInt := 0
+	if item.RolledBack {
+		rolledBackInt = 1
+	}
+	_, err := s.db.Exec(`
+		UPDATE handover_resources SET resource_name=?, precheck_status=?, precheck_detail=?,
+			current_holder=?, snapshot=?, executed=?, rolled_back=?, updated_at=?
+		WHERE id = ?
+	`, item.ResourceName, item.PreCheckStatus, item.PreCheckDetail,
+		item.CurrentHolder, item.Snapshot, executedInt, rolledBackInt, item.UpdatedAt, item.ID)
+	return err
+}
+
+func (s *Storage) ListHandoverResources(handoverID int64) ([]model.HandoverResourceItem, error) {
+	rows, err := s.db.Query(`
+		SELECT id, handover_id, resource_type, resource_key, resource_name,
+			precheck_status, precheck_detail, current_holder, snapshot, executed, rolled_back, created_at, updated_at
+		FROM handover_resources WHERE handover_id = ? ORDER BY id
+	`, handoverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []model.HandoverResourceItem
+	for rows.Next() {
+		var it model.HandoverResourceItem
+		var execInt, rbInt int
+		err := rows.Scan(&it.ID, &it.HandoverID, &it.ResourceType, &it.ResourceKey, &it.ResourceName,
+			&it.PreCheckStatus, &it.PreCheckDetail, &it.CurrentHolder, &it.Snapshot, &execInt, &rbInt,
+			&it.CreatedAt, &it.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		it.Executed = execInt != 0
+		it.RolledBack = rbInt != 0
+		items = append(items, it)
+	}
+	return items, nil
+}
+
+func (s *Storage) AddHandoverTimeline(entry *model.HandoverTimelineEntry) error {
+	result, err := s.db.Exec(`
+		INSERT INTO handover_timeline (handover_id, status, operator, detail, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, entry.HandoverID, entry.Status, entry.Operator, entry.Detail, entry.CreatedAt)
+	if err != nil {
+		return err
+	}
+	entry.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListHandoverTimeline(handoverID int64) ([]model.HandoverTimelineEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT id, handover_id, status, operator, detail, created_at
+		FROM handover_timeline WHERE handover_id = ? ORDER BY id
+	`, handoverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []model.HandoverTimelineEntry
+	for rows.Next() {
+		var e model.HandoverTimelineEntry
+		err := rows.Scan(&e.ID, &e.HandoverID, &e.Status, &e.Operator, &e.Detail, &e.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+func (s *Storage) CountHandoversByCallerAndStatus(callerID string, isFrom bool, status model.HandoverStatus) (int, error) {
+	var field string
+	if isFrom {
+		field = "from_caller"
+	} else {
+		field = "to_caller"
+	}
+	var count int
+	err := s.db.QueryRow(fmt.Sprintf(
+		`SELECT COUNT(*) FROM handovers WHERE %s = ? AND status = ?`, field),
+		callerID, status).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) UpsertLeaseForTransfer(l *model.Lease) error {
+	activeInt := 0
+	if l.Active {
+		activeInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO leases (lock_name, holder, lease_sec, acquired_at, expires_at, active)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, l.LockName, l.Holder, l.LeaseSec, l.AcquiredAt, l.ExpiresAt, activeInt)
+	if err != nil {
+		return err
+	}
+	l.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) TransferLockHolder(lockName string, newHolder string, updatedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE locks SET holder = ?, updated_at = ? WHERE name = ?
+	`, newHolder, updatedAt, lockName)
+	return err
+}
+
+func (s *Storage) TransferLeaseHolder(lockName string, newHolder string, newExpiresAt time.Time, updatedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE leases SET holder = ?, expires_at = ?, active = 1
+		WHERE lock_name = ? AND active = 1
+	`, newHolder, newExpiresAt, lockName)
+	return err
+}
+
+func (s *Storage) TransferOrchTxHolder(txID string, newHolder string, updatedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE orch_txs SET holder = ?, updated_at = ? WHERE id = ?
+	`, newHolder, updatedAt, txID)
+	return err
+}
+
+func (s *Storage) TransferOrchTxLockHolder(txID string, newHolder string) error {
+	_, err := s.db.Exec(`
+		UPDATE orch_tx_locks SET holder = ? WHERE tx_id = ?
+	`, newHolder, txID)
+	return err
+}
+
+func (s *Storage) TransferReservationCaller(reservationID int64, newCallerID string, updatedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE rl_reservations SET caller_id = ?, updated_at = ? WHERE id = ?
+	`, newCallerID, updatedAt, reservationID)
+	return err
+}
+
+func nullTimePtr(t *time.Time) interface{} {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return *t
 }

@@ -873,3 +873,122 @@ type ShadowConflictReason struct {
 	Category  ShadowRuleCategory `json:"category"`
 	Count     int64  `json:"count"`
 }
+
+type HandoverStatus string
+
+const (
+	HandoverStatusCreated    HandoverStatus = "created"
+	HandoverStatusPreChecked HandoverStatus = "prechecked"
+	HandoverStatusPending    HandoverStatus = "pending_receive"
+	HandoverStatusCompleted  HandoverStatus = "completed"
+	HandoverStatusCancelled  HandoverStatus = "cancelled"
+	HandoverStatusRejected   HandoverStatus = "rejected"
+)
+
+type HandoverResourceType string
+
+const (
+	HandoverResourceLock        HandoverResourceType = "lock"
+	HandoverResourceQuota       HandoverResourceType = "quota"
+	HandoverResourceOrchTx      HandoverResourceType = "orch_tx"
+	HandoverResourceTopology    HandoverResourceType = "topology_subtree"
+	HandoverResourceReservation HandoverResourceType = "reservation"
+)
+
+type HandoverPreCheckStatus string
+
+const (
+	PreCheckOK      HandoverPreCheckStatus = "ok"
+	PreCheckConflict HandoverPreCheckStatus = "conflict"
+	PreCheckBlocked HandoverPreCheckStatus = "blocked"
+	PreCheckNotFound HandoverPreCheckStatus = "not_found"
+)
+
+type HandoverResourceItem struct {
+	ID            int64                  `json:"id"`
+	HandoverID    int64                  `json:"handover_id,omitempty"`
+	ResourceType  HandoverResourceType   `json:"resource_type"`
+	ResourceKey   string                 `json:"resource_key"`
+	ResourceName  string                 `json:"resource_name,omitempty"`
+	PreCheckStatus HandoverPreCheckStatus `json:"precheck_status"`
+	PreCheckDetail string                `json:"precheck_detail,omitempty"`
+	CurrentHolder string                 `json:"current_holder,omitempty"`
+	Snapshot      string                 `json:"snapshot,omitempty"`
+	Executed      bool                   `json:"executed"`
+	RolledBack    bool                   `json:"rolled_back"`
+	CreatedAt     time.Time              `json:"created_at"`
+	UpdatedAt     time.Time              `json:"updated_at"`
+}
+
+type HandoverTimelineEntry struct {
+	ID          int64          `json:"id"`
+	HandoverID  int64          `json:"handover_id,omitempty"`
+	Status      HandoverStatus `json:"status"`
+	Operator    string         `json:"operator"`
+	Detail      string         `json:"detail,omitempty"`
+	CreatedAt   time.Time      `json:"created_at"`
+}
+
+type Handover struct {
+	ID              int64                 `json:"id"`
+	FromCaller      string                `json:"from_caller"`
+	ToCaller        string                `json:"to_caller"`
+	Status          HandoverStatus        `json:"status"`
+	Initiator       string                `json:"initiator"`
+	Description     string                `json:"description,omitempty"`
+	NeedConfirm     bool                  `json:"need_confirm"`
+	ConfirmTimeoutSec int                 `json:"confirm_timeout_sec"`
+	ConfirmDeadline *time.Time            `json:"confirm_deadline,omitempty"`
+	ConfirmedAt     *time.Time            `json:"confirmed_at,omitempty"`
+	CancelledAt     *time.Time            `json:"cancelled_at,omitempty"`
+	CompletedAt     *time.Time            `json:"completed_at,omitempty"`
+	CancelReason    string                `json:"cancel_reason,omitempty"`
+	Resources       []HandoverResourceItem `json:"resources,omitempty"`
+	Timeline        []HandoverTimelineEntry `json:"timeline,omitempty"`
+	CreatedAt       time.Time             `json:"created_at"`
+	UpdatedAt       time.Time             `json:"updated_at"`
+}
+
+type CreateHandoverRequest struct {
+	FromCaller       string                `json:"from_caller" binding:"required"`
+	ToCaller         string                `json:"to_caller" binding:"required"`
+	Initiator        string                `json:"initiator" binding:"required"`
+	Description      string                `json:"description"`
+	NeedConfirm      bool                  `json:"need_confirm"`
+	ConfirmTimeoutSec int                  `json:"confirm_timeout_sec"`
+	LockNames        []string              `json:"lock_names,omitempty"`
+	QuotaCallers     []string              `json:"quota_callers,omitempty"`
+	OrchTxIDs        []string              `json:"orch_tx_ids,omitempty"`
+	TopologyRoots    []string              `json:"topology_roots,omitempty"`
+	ReservationIDs   []int64               `json:"reservation_ids,omitempty"`
+}
+
+type PreCheckHandoverResult struct {
+	HandoverID    int64                  `json:"handover_id"`
+	CanProceed    bool                   `json:"can_proceed"`
+	TotalCount    int                    `json:"total_count"`
+	OKCount       int                    `json:"ok_count"`
+	ConflictCount int                    `json:"conflict_count"`
+	BlockedCount  int                    `json:"blocked_count"`
+	NotFoundCount int                    `json:"not_found_count"`
+	Resources     []HandoverResourceItem `json:"resources"`
+}
+
+type ConfirmHandoverRequest struct {
+	Operator string `json:"operator" binding:"required"`
+	Accept   bool   `json:"accept"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+type CancelHandoverRequest struct {
+	Operator string `json:"operator" binding:"required"`
+	Reason   string `json:"reason"`
+}
+
+type CallerHandoverSummary struct {
+	CallerID        string     `json:"caller_id"`
+	TransferringOut int        `json:"transferring_out"`
+	TransferringIn  int        `json:"transferring_in"`
+	Completed       int        `json:"completed"`
+	Cancelled       int        `json:"cancelled"`
+}
