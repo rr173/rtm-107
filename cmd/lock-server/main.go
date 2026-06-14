@@ -110,7 +110,7 @@ func main() {
 		log.Printf("seed debt demo data: %v", err)
 	}
 
-	if err := seedHandoverDemoData(handoverMgr, mgr, rlMgr, orchMgr); err != nil {
+	if err := seedHandoverDemoData(handoverMgr, mgr, rlMgr, orchMgr, s); err != nil {
 		log.Printf("seed handover demo data: %v", err)
 	}
 
@@ -665,7 +665,7 @@ func seedDebtDemoData(debtMgr *debt.Manager, s *storage.Storage) error {
 	return nil
 }
 
-func seedHandoverDemoData(hm *handover.Manager, lockMgr *lock.Manager, rlMgr *ratelimit.Manager, orchMgr *orchestration.Manager) error {
+func seedHandoverDemoData(hm *handover.Manager, lockMgr *lock.Manager, rlMgr *ratelimit.Manager, orchMgr *orchestration.Manager, s *storage.Storage) error {
 	existing, err := hm.ListHandovers("", "", "")
 	if err != nil {
 		return err
@@ -696,10 +696,10 @@ func seedHandoverDemoData(hm *handover.Manager, lockMgr *lock.Manager, rlMgr *ra
 	}
 	log.Println("[demo-handover] bob acquired lock: handover-lock-demo-3")
 
-	if _, err := lockMgr.AcquireLock("handover-lock-demo-4", altCaller, 3600, false); err != nil {
+	if _, err := lockMgr.AcquireLock("handover-lock-demo-4", fromCaller, 3600, false); err != nil {
 		return fmt.Errorf("acquire demo lock 4: %w", err)
 	}
-	log.Println("[demo-handover] charlie acquired lock: handover-lock-demo-4 (simulated completed transfer target)")
+	log.Println("[demo-handover] alice acquired lock: handover-lock-demo-4 (to be transferred to charlie)")
 
 	if _, err := lockMgr.AcquireLock("handover-lock-demo-5", toCaller, 3600, false); err != nil {
 		return fmt.Errorf("acquire demo lock 5: %w", err)
@@ -741,7 +741,7 @@ func seedHandoverDemoData(hm *handover.Manager, lockMgr *lock.Manager, rlMgr *ra
 			Description:       "已完成的成功交接演示：alice -> charlie",
 			NeedConfirm:       false,
 			ConfirmTimeoutSec: 3600,
-			LockNames:         []string{},
+			LockNames:         []string{"handover-lock-demo-4"},
 		}
 		created, err := hm.CreateHandover(req)
 		if err != nil {
@@ -750,13 +750,31 @@ func seedHandoverDemoData(hm *handover.Manager, lockMgr *lock.Manager, rlMgr *ra
 		log.Printf("[demo-handover] created demo handover #%d (completed): %s -> %s", created.ID, fromCaller, altCaller)
 
 		if _, err := hm.PreCheck(created.ID); err != nil {
-			log.Printf("[demo-handover] precheck warning for #%d: %v", created.ID, err)
+			return fmt.Errorf("precheck handover 2: %w", err)
 		}
+		log.Printf("[demo-handover] handover #%d prechecked", created.ID)
 
 		if _, err := hm.Initiate(created.ID, "ops-admin"); err != nil {
-			log.Printf("[demo-handover] initiate warning for #%d: %v", created.ID, err)
+			return fmt.Errorf("initiate handover 2: %w", err)
 		}
-		log.Printf("[demo-handover] demo handover #%d completed successfully (no resources transferred)", created.ID)
+
+		afterLock, err := s.GetLock("handover-lock-demo-4")
+		if err != nil {
+			return fmt.Errorf("get lock after handover: %w", err)
+		}
+		if afterLock != nil && afterLock.Holder == altCaller && afterLock.Status == model.LockStatusHeld {
+			log.Printf("[demo-handover] handover #%d completed successfully! lock handover-lock-demo-4 holder changed from %s to %s",
+				created.ID, fromCaller, altCaller)
+		} else {
+			holder := "nil"
+			status := "nil"
+			if afterLock != nil {
+				holder = afterLock.Holder
+				status = string(afterLock.Status)
+			}
+			log.Printf("[demo-handover] WARNING: handover #%d completed but lock holder mismatch (holder=%s status=%s)",
+				created.ID, holder, status)
+		}
 	}
 
 	{

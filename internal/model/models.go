@@ -389,6 +389,7 @@ const (
 	AuditOpBorrowQuota      AuditOperationType = "borrow_quota"
 	AuditOpReturnQuota      AuditOperationType = "return_quota"
 	AuditOpAdjustQuota      AuditOperationType = "adjust_quota"
+	AuditOpHandover         AuditOperationType = "handover"
 )
 
 type AuditLog struct {

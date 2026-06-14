@@ -81,6 +81,8 @@ func (m *Manager) checkAndCancelExpired() {
 		log.Printf("[handover-manager] auto-cancelling expired handover: id=%d", h.ID)
 		if err := m.cancelHandoverInternal(&h, "system", "confirm_timeout"); err != nil {
 			log.Printf("[handover-manager] cancel expired error id=%d: %v", h.ID, err)
+		} else {
+			m.writeAudit(&h, "system", "timeout_cancel", true, "confirm_timeout")
 		}
 	}
 }
@@ -225,6 +227,9 @@ func (m *Manager) CreateHandover(req *model.CreateHandoverRequest) (*model.Hando
 	m.addTimelineLocked(h.ID, model.HandoverStatusCreated, req.Initiator,
 		fmt.Sprintf("handover created with %d locks, %d quotas, %d txs, %d topo roots, %d reservations",
 			len(allLockNames), len(req.QuotaCallers), len(req.OrchTxIDs), len(req.TopologyRoots), len(req.ReservationIDs)))
+	m.writeAudit(h, req.Initiator, "create", true,
+		fmt.Sprintf("%s -> %s, resources: %d locks, %d quotas, %d txs",
+			h.FromCaller, h.ToCaller, len(allLockNames), len(req.QuotaCallers), len(req.OrchTxIDs)))
 
 	return m.loadHandoverFull(h.ID)
 }
@@ -311,6 +316,9 @@ func (m *Manager) PreCheck(handoverID int64) (*model.PreCheckHandoverResult, err
 	m.addTimelineLocked(handoverID, model.HandoverStatusPreChecked, "system",
 		fmt.Sprintf("precheck done: ok=%d conflict=%d blocked=%d not_found=%d",
 			result.OKCount, result.ConflictCount, result.BlockedCount, result.NotFoundCount))
+	m.writeAudit(h, "system", "precheck", true,
+		fmt.Sprintf("ok=%d conflict=%d blocked=%d not_found=%d can_proceed=%v",
+			result.OKCount, result.ConflictCount, result.BlockedCount, result.NotFoundCount, result.CanProceed))
 
 	return result, nil
 }
@@ -572,35 +580,44 @@ func (m *Manager) Initiate(handoverID int64, operator string) (*model.Handover, 
 	if err != nil {
 		return nil, err
 	}
+
+	hasOK := false
 	for _, r := range resources {
 		if r.PreCheckStatus == model.PreCheckConflict || r.PreCheckStatus == model.PreCheckBlocked {
 			return nil, fmt.Errorf("resource %s:%s has precheck status %s: %s",
 				r.ResourceType, r.ResourceKey, r.PreCheckStatus, r.PreCheckDetail)
 		}
+		if r.PreCheckStatus == model.PreCheckNotFound {
+			return nil, fmt.Errorf("resource %s:%s not found, cannot proceed with handover",
+				r.ResourceType, r.ResourceKey)
+		}
+		if r.PreCheckStatus == model.PreCheckOK {
+			hasOK = true
+		}
+	}
+
+	if len(resources) > 0 && !hasOK {
+		return nil, fmt.Errorf("no resources with ok precheck status, nothing to transfer")
 	}
 
 	now := time.Now()
-	newStatus := model.HandoverStatusCompleted
 	if h.NeedConfirm {
-		newStatus = model.HandoverStatusPending
+		if err := m.storage.UpdateHandoverStatus(handoverID, model.HandoverStatusPending, now); err != nil {
+			return nil, err
+		}
+		m.addTimelineLocked(handoverID, model.HandoverStatusPending, operator,
+			fmt.Sprintf("initiated, waiting for receiver confirmation, deadline=%s", h.ConfirmDeadline.Format(time.RFC3339)))
+		m.writeAudit(h, operator, "initiate", true, "")
+		return m.loadHandoverFull(handoverID)
 	}
 
-	if err := m.storage.UpdateHandoverStatus(handoverID, newStatus, now); err != nil {
+	h2, err := m.executeInternalLocked(h, operator)
+	if err != nil {
+		m.writeAudit(h, operator, "initiate_execute", false, err.Error())
 		return nil, err
 	}
-
-	if newStatus == model.HandoverStatusPending {
-		m.addTimelineLocked(handoverID, newStatus, operator,
-			fmt.Sprintf("initiated, waiting for receiver confirmation, deadline=%s", h.ConfirmDeadline.Format(time.RFC3339)))
-
-		if !h.NeedConfirm {
-			return m.executeInternalLocked(h, operator)
-		}
-	} else {
-		return m.executeInternalLocked(h, operator)
-	}
-
-	return m.loadHandoverFull(handoverID)
+	m.writeAudit(h, operator, "initiate_execute", true, "")
+	return h2, nil
 }
 
 func (m *Manager) Confirm(handoverID int64, req *model.ConfirmHandoverRequest) (*model.Handover, error) {
@@ -629,18 +646,24 @@ func (m *Manager) Confirm(handoverID int64, req *model.ConfirmHandoverRequest) (
 			return nil, err
 		}
 		m.addTimelineLocked(handoverID, model.HandoverStatusRejected, req.Operator, reason)
+		m.writeAudit(h, req.Operator, "reject", true, reason)
 		return m.loadHandoverFull(handoverID)
 	}
 
-	now := time.Now()
-	confirmedAt := now
-	if err := m.storage.UpdateHandoverStatus(handoverID, model.HandoverStatusCompleted, now,
-		"confirmed_at", confirmedAt); err != nil {
+	h2, err := m.executeInternalLocked(h, req.Operator)
+	if err != nil {
+		m.writeAudit(h, req.Operator, "confirm_execute", false, err.Error())
 		return nil, err
 	}
-	m.addTimelineLocked(handoverID, model.HandoverStatusCompleted, req.Operator, "accepted by receiver")
 
-	return m.executeInternalLocked(h, req.Operator)
+	now := time.Now()
+	if err := m.storage.UpdateHandoverStatus(h.ID, model.HandoverStatusCompleted, now,
+		"confirmed_at", now); err != nil {
+		m.writeAudit(h, req.Operator, "confirm_execute", false, err.Error())
+		return nil, err
+	}
+	m.writeAudit(h, req.Operator, "confirm_execute", true, "")
+	return h2, nil
 }
 
 func (m *Manager) Cancel(handoverID int64, req *model.CancelHandoverRequest) (*model.Handover, error) {
@@ -656,6 +679,7 @@ func (m *Manager) Cancel(handoverID int64, req *model.CancelHandoverRequest) (*m
 	if err := m.cancelHandoverInternal(h, req.Operator, req.Reason); err != nil {
 		return nil, err
 	}
+	m.writeAudit(h, req.Operator, "cancel", true, req.Reason)
 	return m.loadHandoverFull(handoverID)
 }
 
@@ -980,4 +1004,33 @@ func (m *Manager) ListHandoversForCaller(callerID string) ([]model.Handover, err
 func toJSON(v interface{}) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+func (m *Manager) writeAudit(h *model.Handover, operator, action string, success bool, detail string) {
+	if m.storage == nil || h == nil {
+		return
+	}
+	resourceDesc := fmt.Sprintf("handover:#%d[%s] %s", h.ID, action, h.FromCaller+"->"+h.ToCaller)
+	if detail != "" {
+		resourceDesc = resourceDesc + " | " + detail
+	}
+	failReason := ""
+	if !success {
+		failReason = detail
+	}
+	callers := []string{h.FromCaller, h.ToCaller}
+	if operator != "" && operator != h.FromCaller && operator != h.ToCaller {
+		callers = append(callers, operator)
+	}
+	for _, c := range callers {
+		entry := &model.AuditLog{
+			Timestamp:  time.Now(),
+			Caller:     c,
+			Operation:  model.AuditOpHandover,
+			Resource:   resourceDesc,
+			Success:    success,
+			FailReason: failReason,
+		}
+		_ = m.storage.AddAuditLog(entry)
+	}
 }
