@@ -562,6 +562,54 @@ func (s *Storage) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_hb_events_type ON heartbeat_events(event_type);
 	CREATE INDEX IF NOT EXISTS idx_frozen_caller ON frozen_resources(caller_id);
 	CREATE INDEX IF NOT EXISTS idx_frozen_released ON frozen_resources(released_at);
+
+	CREATE TABLE IF NOT EXISTS heatmap_lock_stats (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		lock_name TEXT NOT NULL,
+		minute_bucket DATETIME NOT NULL,
+		request_count INTEGER NOT NULL DEFAULT 0,
+		wait_count INTEGER NOT NULL DEFAULT 0,
+		total_wait_ms INTEGER NOT NULL DEFAULT 0,
+		max_wait_ms INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(lock_name, minute_bucket)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_heatmap_lock_name ON heatmap_lock_stats(lock_name);
+	CREATE INDEX IF NOT EXISTS idx_heatmap_bucket ON heatmap_lock_stats(minute_bucket);
+	CREATE INDEX IF NOT EXISTS idx_heatmap_name_bucket ON heatmap_lock_stats(lock_name, minute_bucket);
+
+	CREATE TABLE IF NOT EXISTS heatmap_alerts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		lock_name TEXT NOT NULL,
+		avg_wait_ms REAL NOT NULL DEFAULT 0,
+		threshold_ms REAL NOT NULL DEFAULT 0,
+		request_count INTEGER NOT NULL DEFAULT 0,
+		wait_count INTEGER NOT NULL DEFAULT 0,
+		max_wait_ms INTEGER NOT NULL DEFAULT 0,
+		current_queue_len INTEGER NOT NULL DEFAULT 0,
+		window_minutes INTEGER NOT NULL DEFAULT 5,
+		alert_type TEXT NOT NULL DEFAULT 'avg_wait_exceeded',
+		detail TEXT DEFAULT '',
+		acknowledged INTEGER NOT NULL DEFAULT 0,
+		acknowledged_at DATETIME,
+		acknowledged_by TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_heatmap_alerts_lock ON heatmap_alerts(lock_name);
+	CREATE INDEX IF NOT EXISTS idx_heatmap_alerts_ack ON heatmap_alerts(acknowledged);
+	CREATE INDEX IF NOT EXISTS idx_heatmap_alerts_created ON heatmap_alerts(created_at);
+
+	CREATE TABLE IF NOT EXISTS heatmap_config (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		window_minutes INTEGER NOT NULL DEFAULT 5,
+		alert_threshold_ms REAL NOT NULL DEFAULT 5000,
+		top_n INTEGER NOT NULL DEFAULT 10,
+		history_retention_min INTEGER NOT NULL DEFAULT 1440,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -3857,4 +3905,223 @@ func (s *Storage) ListDegradedGroups() ([]model.HeartbeatGroup, error) {
 		groups = append(groups, g)
 	}
 	return groups, nil
+}
+
+func (s *Storage) UpsertLockContentionStat(stat *model.LockContentionMinuteStat) error {
+	result, err := s.db.Exec(`
+		INSERT INTO heatmap_lock_stats (lock_name, minute_bucket, request_count, wait_count, total_wait_ms, max_wait_ms, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(lock_name, minute_bucket) DO UPDATE SET
+			request_count = request_count + excluded.request_count,
+			wait_count = wait_count + excluded.wait_count,
+			total_wait_ms = total_wait_ms + excluded.total_wait_ms,
+			max_wait_ms = CASE WHEN excluded.max_wait_ms > max_wait_ms THEN excluded.max_wait_ms ELSE max_wait_ms END,
+			updated_at = excluded.updated_at
+	`, stat.LockName, stat.MinuteBucket, stat.RequestCount, stat.WaitCount, stat.TotalWaitMs, stat.MaxWaitMs, stat.CreatedAt, stat.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if stat.ID == 0 {
+		stat.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetLockContentionStatsInWindow(lockName string, startTime time.Time, endTime time.Time) ([]model.LockContentionMinuteStat, error) {
+	var rows *sql.Rows
+	var err error
+	if lockName != "" {
+		rows, err = s.db.Query(`
+			SELECT id, lock_name, minute_bucket, request_count, wait_count, total_wait_ms, max_wait_ms, created_at, updated_at
+			FROM heatmap_lock_stats
+			WHERE lock_name = ? AND minute_bucket >= ? AND minute_bucket < ?
+			ORDER BY minute_bucket
+		`, lockName, startTime, endTime)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, lock_name, minute_bucket, request_count, wait_count, total_wait_ms, max_wait_ms, created_at, updated_at
+			FROM heatmap_lock_stats
+			WHERE minute_bucket >= ? AND minute_bucket < ?
+			ORDER BY minute_bucket
+		`, startTime, endTime)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stats []model.LockContentionMinuteStat
+	for rows.Next() {
+		var st model.LockContentionMinuteStat
+		if err := rows.Scan(&st.ID, &st.LockName, &st.MinuteBucket, &st.RequestCount, &st.WaitCount, &st.TotalWaitMs, &st.MaxWaitMs, &st.CreatedAt, &st.UpdatedAt); err != nil {
+			return nil, err
+		}
+		stats = append(stats, st)
+	}
+	return stats, nil
+}
+
+func (s *Storage) GetAggregatedLockHeatInWindow(startTime time.Time, endTime time.Time) ([]model.LockHeatInfo, error) {
+	rows, err := s.db.Query(`
+		SELECT
+			lock_name,
+			SUM(request_count) as request_count,
+			SUM(wait_count) as wait_count,
+			SUM(total_wait_ms) as total_wait_ms,
+			MAX(max_wait_ms) as max_wait_ms
+		FROM heatmap_lock_stats
+		WHERE minute_bucket >= ? AND minute_bucket < ?
+		GROUP BY lock_name
+		ORDER BY total_wait_ms DESC
+	`, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var heats []model.LockHeatInfo
+	for rows.Next() {
+		var h model.LockHeatInfo
+		var totalWaitMs int64
+		if err := rows.Scan(&h.LockName, &h.RequestCount, &h.WaitCount, &totalWaitMs, &h.MaxWaitMs); err != nil {
+			return nil, err
+		}
+		if h.WaitCount > 0 {
+			h.AvgWaitMs = float64(totalWaitMs) / float64(h.WaitCount)
+		}
+		h.HeatScore = float64(h.RequestCount)*0.3 + h.AvgWaitMs*0.5 + float64(h.MaxWaitMs)*0.2
+		heats = append(heats, h)
+	}
+	return heats, nil
+}
+
+func (s *Storage) PurgeOldLockContentionStats(retentionMin int) (int64, error) {
+	cutoff := time.Now().Add(-time.Duration(retentionMin) * time.Minute)
+	result, err := s.db.Exec(`DELETE FROM heatmap_lock_stats WHERE minute_bucket < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *Storage) CreateHotspotAlert(alert *model.HotspotAlertEvent) error {
+	ackInt := 0
+	if alert.Acknowledged {
+		ackInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO heatmap_alerts (lock_name, avg_wait_ms, threshold_ms, request_count, wait_count, max_wait_ms,
+			current_queue_len, window_minutes, alert_type, detail, acknowledged, acknowledged_at, acknowledged_by, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, alert.LockName, alert.AvgWaitMs, alert.ThresholdMs, alert.RequestCount, alert.WaitCount, alert.MaxWaitMs,
+		alert.CurrentQueueLen, alert.WindowMinutes, alert.AlertType, alert.Detail, ackInt, nullTimePtr(alert.AcknowledgedAt), alert.AcknowledgedBy, alert.CreatedAt)
+	if err != nil {
+		return err
+	}
+	alert.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListHotspotAlerts(lockName string, acknowledged *bool, limit int) ([]model.HotspotAlertEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	query := `
+		SELECT id, lock_name, avg_wait_ms, threshold_ms, request_count, wait_count, max_wait_ms,
+			current_queue_len, window_minutes, alert_type, detail, acknowledged, acknowledged_at, acknowledged_by, created_at
+		FROM heatmap_alerts WHERE 1=1
+	`
+	var args []interface{}
+	if lockName != "" {
+		query += " AND lock_name = ?"
+		args = append(args, lockName)
+	}
+	if acknowledged != nil {
+		query += " AND acknowledged = ?"
+		ackInt := 0
+		if *acknowledged {
+			ackInt = 1
+		}
+		args = append(args, ackInt)
+	}
+	query += " ORDER BY created_at DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var alerts []model.HotspotAlertEvent
+	for rows.Next() {
+		var a model.HotspotAlertEvent
+		var ackInt int
+		var ackAt sql.NullTime
+		var ackBy sql.NullString
+		if err := rows.Scan(&a.ID, &a.LockName, &a.AvgWaitMs, &a.ThresholdMs, &a.RequestCount, &a.WaitCount, &a.MaxWaitMs,
+			&a.CurrentQueueLen, &a.WindowMinutes, &a.AlertType, &a.Detail, &ackInt, &ackAt, &ackBy, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		a.Acknowledged = ackInt != 0
+		if ackAt.Valid {
+			a.AcknowledgedAt = &ackAt.Time
+		}
+		if ackBy.Valid {
+			a.AcknowledgedBy = ackBy.String
+		}
+		alerts = append(alerts, a)
+	}
+	return alerts, nil
+}
+
+func (s *Storage) AcknowledgeHotspotAlert(id int64, acknowledgedBy string) error {
+	now := time.Now()
+	_, err := s.db.Exec(`
+		UPDATE heatmap_alerts SET acknowledged = 1, acknowledged_at = ?, acknowledged_by = ? WHERE id = ?
+	`, now, acknowledgedBy, id)
+	return err
+}
+
+func (s *Storage) GetHeatmapConfig() (*model.HeatmapConfig, error) {
+	row := s.db.QueryRow(`
+		SELECT window_minutes, alert_threshold_ms, top_n, history_retention_min
+		FROM heatmap_config WHERE id = 1
+	`)
+	var cfg model.HeatmapConfig
+	err := row.Scan(&cfg.WindowMinutes, &cfg.AlertThresholdMs, &cfg.TopN, &cfg.HistoryRetentionMin)
+	if err == sql.ErrNoRows {
+		defaultCfg := &model.HeatmapConfig{
+			WindowMinutes:       5,
+			AlertThresholdMs:    5000,
+			TopN:                10,
+			HistoryRetentionMin: 1440,
+		}
+		_, err := s.db.Exec(`
+			INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, top_n, history_retention_min, updated_at)
+			VALUES (1, ?, ?, ?, ?, ?)
+		`, defaultCfg.WindowMinutes, defaultCfg.AlertThresholdMs, defaultCfg.TopN, defaultCfg.HistoryRetentionMin, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		return defaultCfg, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (s *Storage) UpdateHeatmapConfig(cfg *model.HeatmapConfig) error {
+	_, err := s.db.Exec(`
+		INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, top_n, history_retention_min, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			window_minutes = excluded.window_minutes,
+			alert_threshold_ms = excluded.alert_threshold_ms,
+			top_n = excluded.top_n,
+			history_retention_min = excluded.history_retention_min,
+			updated_at = excluded.updated_at
+	`, cfg.WindowMinutes, cfg.AlertThresholdMs, cfg.TopN, cfg.HistoryRetentionMin, time.Now())
+	return err
 }

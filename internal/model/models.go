@@ -1160,3 +1160,79 @@ type GroupStatusInfo struct {
 }
 
 var ErrGroupDegraded = fmt.Errorf("group is degraded, cannot acquire new locks")
+
+type LockContentionMinuteStat struct {
+	ID           int64     `json:"id"`
+	LockName     string    `json:"lock_name"`
+	MinuteBucket time.Time `json:"minute_bucket"`
+	RequestCount int64     `json:"request_count"`
+	WaitCount    int64     `json:"wait_count"`
+	TotalWaitMs  int64     `json:"total_wait_ms"`
+	MaxWaitMs    int64     `json:"max_wait_ms"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type LockHeatInfo struct {
+	LockName        string  `json:"lock_name"`
+	RequestCount    int64   `json:"request_count"`
+	WaitCount       int64   `json:"wait_count"`
+	AvgWaitMs       float64 `json:"avg_wait_ms"`
+	MaxWaitMs       int64   `json:"max_wait_ms"`
+	CurrentQueueLen int     `json:"current_queue_len"`
+	HeatScore       float64 `json:"heat_score"`
+}
+
+type HotspotAlertEvent struct {
+	ID               int64     `json:"id"`
+	LockName         string    `json:"lock_name"`
+	AvgWaitMs        float64   `json:"avg_wait_ms"`
+	ThresholdMs      float64   `json:"threshold_ms"`
+	RequestCount     int64     `json:"request_count"`
+	WaitCount        int64     `json:"wait_count"`
+	MaxWaitMs        int64     `json:"max_wait_ms"`
+	CurrentQueueLen  int       `json:"current_queue_len"`
+	WindowMinutes    int       `json:"window_minutes"`
+	AlertType        string    `json:"alert_type"`
+	Detail           string    `json:"detail,omitempty"`
+	Acknowledged     bool      `json:"acknowledged"`
+	AcknowledgedAt   *time.Time `json:"acknowledged_at,omitempty"`
+	AcknowledgedBy   string    `json:"acknowledged_by,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+type HeatmapConfig struct {
+	WindowMinutes       int     `json:"window_minutes"`
+	AlertThresholdMs    float64 `json:"alert_threshold_ms"`
+	TopN                int     `json:"top_n"`
+	HistoryRetentionMin int     `json:"history_retention_min"`
+}
+
+type LockTrendPoint struct {
+	MinuteBucket time.Time `json:"minute_bucket"`
+	RequestCount int64     `json:"request_count"`
+	WaitCount    int64     `json:"wait_count"`
+	AvgWaitMs    float64   `json:"avg_wait_ms"`
+	MaxWaitMs    int64     `json:"max_wait_ms"`
+}
+
+type HeatmapGlobalStats struct {
+	TotalLocks          int     `json:"total_locks"`
+	HotLocks            int     `json:"hot_locks"`
+	TotalRequests       int64   `json:"total_requests"`
+	TotalWaits          int64   `json:"total_waits"`
+	OverallAvgWaitMs    float64 `json:"overall_avg_wait_ms"`
+	ActiveAlerts        int     `json:"active_alerts"`
+	Config              HeatmapConfig `json:"config"`
+}
+
+type UpdateHeatmapConfigRequest struct {
+	WindowMinutes       *int     `json:"window_minutes"`
+	AlertThresholdMs    *float64 `json:"alert_threshold_ms"`
+	TopN                *int     `json:"top_n"`
+	HistoryRetentionMin *int     `json:"history_retention_min"`
+}
+
+type AcknowledgeAlertRequest struct {
+	AcknowledgedBy string `json:"acknowledged_by" binding:"required"`
+}

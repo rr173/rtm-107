@@ -9,6 +9,7 @@ import (
 	"rtm-107/internal/debt"
 	"rtm-107/internal/handover"
 	"rtm-107/internal/heartbeat"
+	"rtm-107/internal/heatmap"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -93,6 +94,13 @@ func main() {
 	}
 	defer heartbeatMgr.Stop()
 
+	heatmapMgr := heatmap.NewManager(s, mgr)
+	mgr.SetHeatmap(heatmapMgr)
+	if err := heatmapMgr.Start(); err != nil {
+		log.Fatalf("start heatmap manager: %v", err)
+	}
+	defer heatmapMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
@@ -125,6 +133,10 @@ func main() {
 		log.Printf("seed heartbeat demo data: %v", err)
 	}
 
+	if err := seedHeatmapDemoData(heatmapMgr, s, mgr, rlMgr); err != nil {
+		log.Printf("seed heatmap demo data: %v", err)
+	}
+
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -138,7 +150,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr, heatmapMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -968,6 +980,143 @@ func seedHeartbeatDemoData(hbm *heartbeat.Manager, s *storage.Storage, lockMgr *
 	log.Println("[demo-heartbeat]   GET /api/v1/heartbeat/events/service-lost - view lost caller's events")
 	log.Println("[demo-heartbeat]   POST /api/v1/heartbeat/report/service-healthy - report heartbeat")
 	log.Println("[demo-heartbeat]   GET /api/v1/heartbeat/frozen - view frozen resources")
+
+	return nil
+}
+
+func seedHeatmapDemoData(hm *heatmap.Manager, s *storage.Storage, lockMgr *lock.Manager, rlMgr *ratelimit.Manager) error {
+	now := time.Now()
+	bucketNow := now.Truncate(time.Minute)
+
+	targetLocks := []string{"hot-spot-db", "warm-cache-redis", "cold-config-map"}
+	existing, err := s.GetAggregatedLockHeatInWindow(bucketNow.Add(-30*time.Minute), bucketNow.Add(time.Minute))
+	if err != nil {
+		return err
+	}
+	existsCount := 0
+	for _, e := range existing {
+		for _, n := range targetLocks {
+			if e.LockName == n {
+				existsCount++
+			}
+		}
+	}
+	if existsCount == len(targetLocks) {
+		log.Println("[demo-heatmap] heatmap target locks already exist, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-heatmap] seeding heatmap demo data...")
+
+	hotLocks := []struct {
+		name        string
+		levels      int
+		reqPerMin   int64
+		waitPerMin  int64
+		avgWaitMs   int64
+		holder      string
+	}{
+		{"hot-spot-db", 15, 120, 80, 8500, "db-pool-1"},
+		{"warm-cache-redis", 15, 50, 20, 2200, "cache-svc-2"},
+		{"cold-config-map", 15, 5, 1, 300, "config-loader"},
+	}
+
+	for _, hl := range hotLocks {
+		if _, err := lockMgr.AcquireLock(hl.name, hl.holder, 3600, true); err != nil {
+			log.Printf("[demo-heatmap] acquire %s warning: %v", hl.name, err)
+		} else {
+			log.Printf("[demo-heatmap] acquired base lock: %s by %s", hl.name, hl.holder)
+		}
+	}
+
+	for offset := 14; offset >= 0; offset-- {
+		bucket := bucketNow.Add(-time.Duration(offset) * time.Minute)
+
+		for _, hl := range hotLocks {
+			reqCnt := hl.reqPerMin
+			waitCnt := hl.waitPerMin
+			avgWait := hl.avgWaitMs
+
+			if offset >= 10 && hl.name == "hot-spot-db" {
+				reqCnt = int64(float64(reqCnt) * 0.5)
+				waitCnt = int64(float64(waitCnt) * 0.4)
+			}
+			if offset < 5 && hl.name == "hot-spot-db" {
+				reqCnt = int64(float64(reqCnt) * 1.3)
+				waitCnt = int64(float64(waitCnt) * 1.5)
+				avgWait = int64(float64(avgWait) * 1.2)
+			}
+
+			totalWaitMs := waitCnt * avgWait
+			maxWaitMs := int64(float64(avgWait) * 1.8)
+
+			stat := &model.LockContentionMinuteStat{
+				LockName:     hl.name,
+				MinuteBucket: bucket,
+				RequestCount: reqCnt,
+				WaitCount:    waitCnt,
+				TotalWaitMs:  totalWaitMs,
+				MaxWaitMs:    maxWaitMs,
+				CreatedAt:    bucket,
+				UpdatedAt:    bucket.Add(59 * time.Second),
+			}
+			if err := s.UpsertLockContentionStat(stat); err != nil {
+				return fmt.Errorf("upsert stat for %s at %v: %w", hl.name, bucket, err)
+			}
+		}
+	}
+
+	if _, err := lockMgr.AcquireLock("hot-spot-db", "db-pool-2", 60, false); err != nil {
+		log.Printf("[demo-heatmap] queued db-pool-2 warning: %v", err)
+	}
+	if _, err := lockMgr.AcquireLock("hot-spot-db", "db-pool-3", 60, false); err != nil {
+		log.Printf("[demo-heatmap] queued db-pool-3 warning: %v", err)
+	}
+	if _, err := lockMgr.AcquireLock("hot-spot-db", "db-pool-4", 60, false); err != nil {
+		log.Printf("[demo-heatmap] queued db-pool-4 warning: %v", err)
+	}
+	if _, err := lockMgr.AcquireLock("hot-spot-db", "db-pool-5", 60, false); err != nil {
+		log.Printf("[demo-heatmap] queued db-pool-5 warning: %v", err)
+	}
+	log.Println("[demo-heatmap] enqueued 4 waiters for hot-spot-db (current queue depth = 4)")
+
+	histAlert := &model.HotspotAlertEvent{
+		LockName:        "hot-spot-db",
+		AvgWaitMs:       9230.5,
+		ThresholdMs:     5000.0,
+		RequestCount:    1380,
+		WaitCount:       920,
+		MaxWaitMs:       15800,
+		CurrentQueueLen: 6,
+		WindowMinutes:   5,
+		AlertType:       "avg_wait_exceeded",
+		Detail:          "锁 hot-spot-db 在最近 5 分钟内平均等待 9230.50ms 超过阈值 5000.00ms (历史高峰期告警)",
+		Acknowledged:    true,
+		CreatedAt:       now.Add(-45 * time.Minute),
+	}
+	ackTime := now.Add(-30 * time.Minute)
+	histAlert.AcknowledgedAt = &ackTime
+	histAlert.AcknowledgedBy = "sre-oncall-zhang"
+	if err := s.CreateHotspotAlert(histAlert); err != nil {
+		return fmt.Errorf("create hist alert: %w", err)
+	}
+	log.Printf("[demo-heatmap] seeded historical alert: hot-spot-db avg_wait=%.1fms (at %s, ack by %s at %s)",
+		histAlert.AvgWaitMs, histAlert.CreatedAt.Format(time.RFC3339),
+		histAlert.AcknowledgedBy, histAlert.AcknowledgedAt.Format(time.RFC3339))
+
+	log.Println("[demo-heatmap] demo data seeded successfully:")
+	log.Println("[demo-heatmap]   🔥 hot-spot-db: 高热度 - 120 req/min, 80 wait/min, avg 8.5s wait (最近5分钟加剧)")
+	log.Println("[demo-heatmap]   🌡  warm-cache-redis: 中热度 - 50 req/min, 20 wait/min, avg 2.2s wait")
+	log.Println("[demo-heatmap]   ❄️ cold-config-map: 低热度 - 5 req/min, 1 wait/min, avg 0.3s wait")
+	log.Println("[demo-heatmap]   🚨 历史告警: hot-spot-db (45分钟前触发, 30分钟前已确认)")
+	log.Println("[demo-heatmap] tips:")
+	log.Println("[demo-heatmap]   GET /api/v1/heatmap/top - 热力排行榜（Top N）")
+	log.Println("[demo-heatmap]   GET /api/v1/heatmap/locks/hot-spot-db/trend?minutes=15 - 竞争趋势")
+	log.Println("[demo-heatmap]   GET /api/v1/heatmap/alerts - 所有告警事件")
+	log.Println("[demo-heatmap]   GET /api/v1/heatmap/alerts/active - 未确认告警")
+	log.Println("[demo-heatmap]   GET /api/v1/heatmap/stats - 全局热力概览")
+	log.Println("[demo-heatmap]   PUT /api/v1/heatmap/config - 调整告警阈值等配置")
+	log.Println("[demo-heatmap]   POST /api/v1/locks/hot-spot-db/acquire - 继续请求制造新的竞争记录")
 
 	return nil
 }

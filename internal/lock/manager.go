@@ -19,6 +19,15 @@ type Manager struct {
 	mu      sync.Mutex
 	timers  map[string]*time.Timer
 	stopCh  chan struct{}
+	heatmap HeatmapRecorder
+}
+
+type HeatmapRecorder interface {
+	RecordLockRequest(lockName string)
+	RecordLockEnqueue(lockName, holder string)
+	RecordLockGranted(lockName, holder string)
+	RecordLockTimeout(lockName, holder string)
+	RecordLockRequestWithWait(lockName string, waitMs int64)
 }
 
 func NewManager(s *storage.Storage) *Manager {
@@ -27,6 +36,12 @@ func NewManager(s *storage.Storage) *Manager {
 		timers:  make(map[string]*time.Timer),
 		stopCh:  make(chan struct{}),
 	}
+}
+
+func (m *Manager) SetHeatmap(h HeatmapRecorder) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.heatmap = h
 }
 
 func (m *Manager) Start() error {
@@ -112,6 +127,10 @@ func (m *Manager) AcquireLock(lockName, holder string, leaseSec int, reentrant b
 }
 
 func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reentrant bool) (*AcquireResult, error) {
+	if m.heatmap != nil {
+		m.heatmap.RecordLockRequest(lockName)
+	}
+
 	lock, err := m.storage.GetLock(lockName)
 	if err != nil {
 		return nil, err
@@ -186,6 +205,9 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 			return nil, err
 		}
 		m.addHistoryLocked(lockName, holder, model.OpAcquire, "queued")
+		if m.heatmap != nil {
+			m.heatmap.RecordLockEnqueue(lockName, holder)
+		}
 
 		position := len(queue) + 1
 
@@ -296,6 +318,9 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 	now := time.Now()
 	if item.TimeoutAt.Before(now) {
 		m.addHistoryLocked(lockName, item.Holder, model.OpTimeout, "timed out before grant")
+		if m.heatmap != nil {
+			m.heatmap.RecordLockTimeout(lockName, item.Holder)
+		}
 		return m.tryGrantNextLocked(lockName)
 	}
 
@@ -327,6 +352,9 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 
 	m.setLeaseTimerLocked(lockName, time.Duration(item.LeaseSec)*time.Second)
 	m.addHistoryLocked(lockName, item.Holder, model.OpGrantNext, fmt.Sprintf("granted from queue, lease=%ds", item.LeaseSec))
+	if m.heatmap != nil {
+		m.heatmap.RecordLockGranted(lockName, item.Holder)
+	}
 
 	return lock, nil
 }
@@ -447,9 +475,16 @@ func (m *Manager) checkWaitQueueTimeouts() {
 				continue
 			}
 			m.addHistoryLocked(item.LockName, item.Holder, model.OpTimeout, "wait timeout")
+			if m.heatmap != nil {
+				m.heatmap.RecordLockTimeout(item.LockName, item.Holder)
+			}
 			log.Printf("[lock-manager] wait timeout: lock=%s holder=%s", item.LockName, item.Holder)
 		}
 	}
+}
+
+func (m *Manager) WaitQueueLen(lockName string) (int, error) {
+	return m.storage.WaitQueueLen(lockName)
 }
 
 func (m *Manager) ListAllLocks() ([]model.LockStatusInfo, error) {

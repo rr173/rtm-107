@@ -9,6 +9,7 @@ import (
 	"rtm-107/internal/debt"
 	"rtm-107/internal/handover"
 	"rtm-107/internal/heartbeat"
+	"rtm-107/internal/heatmap"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -32,10 +33,11 @@ type Handler struct {
 	debtMgr      *debt.Manager
 	handoverMgr  *handover.Manager
 	heartbeatMgr *heartbeat.Manager
+	heatmapMgr   *heatmap.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager, hmm *heatmap.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm, heatmapMgr: hmm}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -239,6 +241,20 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			heartbeatGroup.GET("/dependencies", h.ListGroupDependencies)
 
 			heartbeatGroup.GET("/degraded", h.ListDegradedGroups)
+		}
+
+		heatmapGroup := api.Group("/heatmap")
+		{
+			heatmapGroup.GET("/stats", h.GetHeatmapGlobalStats)
+			heatmapGroup.GET("/config", h.GetHeatmapConfig)
+			heatmapGroup.PUT("/config", h.UpdateHeatmapConfig)
+
+			heatmapGroup.GET("/top", h.GetTopHeatLocks)
+			heatmapGroup.GET("/locks/:name/trend", h.GetLockTrend)
+
+			heatmapGroup.GET("/alerts", h.ListHotspotAlerts)
+			heatmapGroup.POST("/alerts/:id/ack", h.AcknowledgeHotspotAlert)
+			heatmapGroup.GET("/alerts/active", h.ListActiveHotspotAlerts)
 		}
 	}
 }
@@ -2168,4 +2184,148 @@ func (h *Handler) ReleaseAllFrozenResources(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "all frozen resources released"})
+}
+
+func (h *Handler) GetHeatmapGlobalStats(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	stats, err := h.heatmapMgr.GetGlobalStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
+func (h *Handler) GetHeatmapConfig(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	cfg := h.heatmapMgr.GetConfig()
+	c.JSON(http.StatusOK, gin.H{"config": cfg})
+}
+
+func (h *Handler) UpdateHeatmapConfig(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	var req model.UpdateHeatmapConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	cfg, err := h.heatmapMgr.UpdateConfig(req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"config": cfg})
+}
+
+func (h *Handler) GetTopHeatLocks(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	limitStr := c.DefaultQuery("limit", "10")
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 {
+		limit = 10
+	}
+	ranking, err := h.heatmapMgr.GetTopHeatLocks(limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"top_locks": ranking, "count": len(ranking)})
+}
+
+func (h *Handler) GetLockTrend(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	lockName := c.Param("name")
+	if lockName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "lock name is required"})
+		return
+	}
+	minutesStr := c.DefaultQuery("minutes", "60")
+	minutes, _ := strconv.Atoi(minutesStr)
+	if minutes <= 0 {
+		minutes = 60
+	}
+	trend, err := h.heatmapMgr.GetLockTrend(lockName, minutes)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"lock_name": lockName, "trend": trend, "minutes": minutes})
+}
+
+func (h *Handler) ListHotspotAlerts(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	lockName := c.Query("lock_name")
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+
+	var ackPtr *bool
+	ackStr := c.Query("acknowledged")
+	if ackStr != "" {
+		ack := ackStr == "true"
+		ackPtr = &ack
+	}
+
+	alerts, err := h.heatmapMgr.ListAlerts(lockName, ackPtr, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"alerts": alerts, "count": len(alerts)})
+}
+
+func (h *Handler) ListActiveHotspotAlerts(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+	falseVal := false
+	alerts, err := h.heatmapMgr.ListAlerts("", &falseVal, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"active_alerts": alerts, "count": len(alerts)})
+}
+
+func (h *Handler) AcknowledgeHotspotAlert(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid alert id"})
+		return
+	}
+	var req model.AcknowledgeAlertRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.heatmapMgr.AcknowledgeAlert(id, req.AcknowledgedBy); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "alert acknowledged"})
 }
