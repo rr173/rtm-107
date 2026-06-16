@@ -93,6 +93,7 @@ func (m *Manager) checkAllCallers() {
 
 	now := time.Now()
 	updatedGroups := make(map[string]bool)
+	groupsToRefresh := make(map[string]bool)
 	for _, reg := range registrations {
 		if reg.Status == model.HeartbeatStatusFrozen {
 			continue
@@ -100,12 +101,20 @@ func (m *Manager) checkAllCallers() {
 
 		oldStatus := reg.Status
 		m.checkCallerLocked(&reg, now)
-		if reg.GroupName != "" && reg.Status != oldStatus {
-			updatedGroups[reg.GroupName] = true
+		if reg.GroupName != "" {
+			if reg.Status != oldStatus {
+				updatedGroups[reg.GroupName] = true
+			} else if reg.Status == model.HeartbeatStatusLost || reg.Status == model.HeartbeatStatusRecovered {
+				groupsToRefresh[reg.GroupName] = true
+			}
 		}
 	}
 
 	for groupName := range updatedGroups {
+		m.updateGroupHealthLocked(groupName)
+		delete(groupsToRefresh, groupName)
+	}
+	for groupName := range groupsToRefresh {
 		m.updateGroupHealthLocked(groupName)
 	}
 }
@@ -143,6 +152,14 @@ func (m *Manager) checkCallerLocked(reg *model.HeartbeatRegistration, now time.T
 			m.addEventLocked(reg.CallerID, "status_change",
 				model.HeartbeatStatusSuspect, model.HeartbeatStatusHealthy,
 				fmt.Sprintf("heartbeat restored after %.1fs", timeSinceLast))
+		} else if reg.Status == model.HeartbeatStatusRecovered {
+			reg.Status = model.HeartbeatStatusHealthy
+			reg.MissedCount = 0
+			reg.UpdatedAt = now
+			_ = m.storage.UpdateHeartbeatRegistration(reg)
+			m.addEventLocked(reg.CallerID, "status_change",
+				model.HeartbeatStatusRecovered, model.HeartbeatStatusHealthy,
+				"recovered caller heartbeat confirmed healthy")
 		}
 		return
 	}
@@ -151,7 +168,7 @@ func (m *Manager) checkCallerLocked(reg *model.HeartbeatRegistration, now time.T
 	reg.MissedCount = missedCount
 
 	if timeSinceLast > allowedWindow {
-		if reg.Status == model.HeartbeatStatusHealthy || reg.Status == model.HeartbeatStatusSuspect {
+		if reg.Status == model.HeartbeatStatusHealthy || reg.Status == model.HeartbeatStatusSuspect || reg.Status == model.HeartbeatStatusRecovered {
 			m.handleConnectionLostLocked(reg, now, timeSinceLast)
 		}
 	} else if timeSinceLast > float64(reg.IntervalSec) && reg.Status == model.HeartbeatStatusHealthy {
@@ -193,7 +210,7 @@ func (m *Manager) handleConnectionLostLocked(reg *model.HeartbeatRegistration, n
 	}
 
 	if reg.GroupName != "" {
-		go m.updateGroupHealthLocked(reg.GroupName)
+		m.updateGroupHealthLocked(reg.GroupName)
 	}
 }
 
@@ -406,8 +423,13 @@ func (m *Manager) Register(callerID string, groupName string, intervalSec int, m
 	if err != nil {
 		return nil, fmt.Errorf("check existing: %w", err)
 	}
-	if existing != nil && existing.Status != model.HeartbeatStatusLost && existing.Status != model.HeartbeatStatusRecovered {
-		return nil, fmt.Errorf("caller already registered with status: %s", existing.Status)
+
+	var oldGroupName string
+	if existing != nil {
+		if existing.Status != model.HeartbeatStatusLost && existing.Status != model.HeartbeatStatusRecovered {
+			return nil, fmt.Errorf("caller already registered with status: %s", existing.Status)
+		}
+		oldGroupName = existing.GroupName
 	}
 
 	now := time.Now()
@@ -429,8 +451,11 @@ func (m *Manager) Register(callerID string, groupName string, intervalSec int, m
 		return nil, fmt.Errorf("create registration: %w", err)
 	}
 
+	if oldGroupName != "" && oldGroupName != groupName {
+		m.updateGroupHealthLocked(oldGroupName)
+	}
 	if groupName != "" {
-		go m.updateGroupHealthLocked(groupName)
+		m.updateGroupHealthLocked(groupName)
 	}
 
 	m.addEventLocked(callerID, "registered", "", model.HeartbeatStatusHealthy,
@@ -874,7 +899,7 @@ func (m *Manager) ReportHeartbeat(callerID string) (*model.HeartbeatRegistration
 	}
 
 	if reg.GroupName != "" {
-		go m.updateGroupHealthLocked(reg.GroupName)
+		m.updateGroupHealthLocked(reg.GroupName)
 	}
 
 	return reg, nil
