@@ -107,6 +107,41 @@ func (m *Manager) Start() error {
 				log.Printf("[heatmap] restored %d active wait records from storage", restored)
 			}
 		}
+
+		activeCooldowns, err := m.storage.ListActiveCooldowns()
+		if err != nil {
+			log.Printf("[heatmap] restore active cooldowns warning: %v", err)
+		} else {
+			for _, cd := range activeCooldowns {
+				if cd.Status != model.CooldownStatusActive {
+					continue
+				}
+				m.acceleratedGrants[cd.LockName] = cd.CooldownLeaseSec
+				if err := m.lockMgr.SetAcceleratedGrant(cd.LockName, true, cd.CooldownLeaseSec); err != nil {
+					log.Printf("[heatmap] restore accelerated grant for %s error: %v", cd.LockName, err)
+				}
+
+				lease, err := m.lockMgr.GetActiveLease(cd.LockName)
+				if err == nil && lease != nil && lease.Active {
+					remainingSec := lease.RemainingSec
+					if remainingSec > float64(cd.CooldownLeaseSec) {
+						if _, err := m.lockMgr.ShortenLease(cd.LockName, cd.CooldownLeaseSec); err != nil {
+							log.Printf("[heatmap] restore shorten lease for %s error: %v", cd.LockName, err)
+						} else {
+							cd.LeasesShortened++
+							_ = m.storage.UpsertCooldownState(&cd)
+							log.Printf("[heatmap] restored shorten lease: lock=%s remaining=%.1fs->%ds", cd.LockName, remainingSec, cd.CooldownLeaseSec)
+						}
+					}
+				}
+
+				log.Printf("[heatmap] restored cooldown: lock=%s lease_sec=%d started_at=%s",
+					cd.LockName, cd.CooldownLeaseSec, cd.StartedAt.Format(time.RFC3339))
+			}
+			if len(activeCooldowns) > 0 {
+				log.Printf("[heatmap] restored %d active cooldown states from storage", len(activeCooldowns))
+			}
+		}
 	}
 	m.mu.Unlock()
 
@@ -679,7 +714,11 @@ func (m *Manager) triggerCooldownActions(lockName string, state *model.LockCoold
 		}
 	}
 
-	if state.TriggerType == model.CooldownTriggerAuto && m.config.Cooldown.AcceleratedGrant {
+	shouldAccelerate := m.config.Cooldown.AcceleratedGrant
+	if state.TriggerType == model.CooldownTriggerManual {
+		shouldAccelerate = true
+	}
+	if shouldAccelerate {
 		if err := m.lockMgr.SetAcceleratedGrant(lockName, true, state.CooldownLeaseSec); err != nil {
 			log.Printf("[heatmap-cooldown] set accelerated grant error for %s: %v", lockName, err)
 		} else {
