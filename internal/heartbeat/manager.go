@@ -92,12 +92,21 @@ func (m *Manager) checkAllCallers() {
 	}
 
 	now := time.Now()
+	updatedGroups := make(map[string]bool)
 	for _, reg := range registrations {
 		if reg.Status == model.HeartbeatStatusFrozen {
 			continue
 		}
 
+		oldStatus := reg.Status
 		m.checkCallerLocked(&reg, now)
+		if reg.GroupName != "" && reg.Status != oldStatus {
+			updatedGroups[reg.GroupName] = true
+		}
+	}
+
+	for groupName := range updatedGroups {
+		m.updateGroupHealthLocked(groupName)
 	}
 }
 
@@ -181,6 +190,10 @@ func (m *Manager) handleConnectionLostLocked(reg *model.HeartbeatRegistration, n
 		m.releaseLocksOnlyLocked(reg.CallerID, now)
 	case model.StrategyFreeze:
 		m.freezeResourcesLocked(reg.CallerID, now)
+	}
+
+	if reg.GroupName != "" {
+		go m.updateGroupHealthLocked(reg.GroupName)
 	}
 }
 
@@ -363,7 +376,7 @@ func (m *Manager) freezeResourcesLocked(callerID string, now time.Time) {
 		fmt.Sprintf("frozen %d resources awaiting manual confirmation", frozenCount))
 }
 
-func (m *Manager) Register(callerID string, intervalSec int, maxMissed int, strategy model.DisposalStrategy) (*model.HeartbeatRegistration, error) {
+func (m *Manager) Register(callerID string, groupName string, intervalSec int, maxMissed int, strategy model.DisposalStrategy) (*model.HeartbeatRegistration, error) {
 	if intervalSec <= 0 {
 		return nil, fmt.Errorf("interval_sec must be positive")
 	}
@@ -379,6 +392,16 @@ func (m *Manager) Register(callerID string, intervalSec int, maxMissed int, stra
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if groupName != "" {
+		group, err := m.storage.GetHeartbeatGroup(groupName)
+		if err != nil {
+			return nil, fmt.Errorf("check group: %w", err)
+		}
+		if group == nil {
+			return nil, fmt.Errorf("group not found: %s", groupName)
+		}
+	}
+
 	existing, err := m.storage.GetHeartbeatRegistration(callerID)
 	if err != nil {
 		return nil, fmt.Errorf("check existing: %w", err)
@@ -390,6 +413,7 @@ func (m *Manager) Register(callerID string, intervalSec int, maxMissed int, stra
 	now := time.Now()
 	reg := &model.HeartbeatRegistration{
 		CallerID:        callerID,
+		GroupName:       groupName,
 		IntervalSec:     intervalSec,
 		MaxMissed:       maxMissed,
 		Strategy:        strategy,
@@ -405,13 +429,402 @@ func (m *Manager) Register(callerID string, intervalSec int, maxMissed int, stra
 		return nil, fmt.Errorf("create registration: %w", err)
 	}
 
-	m.addEventLocked(callerID, "registered", "", model.HeartbeatStatusHealthy,
-		fmt.Sprintf("registered with interval=%ds, max_missed=%d, strategy=%s", intervalSec, maxMissed, strategy))
+	if groupName != "" {
+		go m.updateGroupHealthLocked(groupName)
+	}
 
-	log.Printf("[heartbeat-manager] registered caller: %s (interval=%ds, max_missed=%d, strategy=%s)",
-		callerID, intervalSec, maxMissed, strategy)
+	m.addEventLocked(callerID, "registered", "", model.HeartbeatStatusHealthy,
+		fmt.Sprintf("registered with group=%s, interval=%ds, max_missed=%d, strategy=%s", groupName, intervalSec, maxMissed, strategy))
+
+	log.Printf("[heartbeat-manager] registered caller: %s (group=%s, interval=%ds, max_missed=%d, strategy=%s)",
+		callerID, groupName, intervalSec, maxMissed, strategy)
 
 	return reg, nil
+}
+
+func (m *Manager) CreateGroup(name string, survivalThreshold int) (*model.HeartbeatGroup, error) {
+	if name == "" {
+		return nil, fmt.Errorf("group name cannot be empty")
+	}
+	if survivalThreshold <= 0 {
+		return nil, fmt.Errorf("survival_threshold must be positive")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing, err := m.storage.GetHeartbeatGroup(name)
+	if err != nil {
+		return nil, fmt.Errorf("check existing group: %w", err)
+	}
+	if existing != nil {
+		return nil, fmt.Errorf("group already exists: %s", name)
+	}
+
+	now := time.Now()
+	group := &model.HeartbeatGroup{
+		Name:              name,
+		SurvivalThreshold: survivalThreshold,
+		Status:            model.HeartbeatGroupHealthy,
+		AliveCount:        0,
+		TotalCount:        0,
+		Degraded:          false,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+
+	if err := m.storage.CreateHeartbeatGroup(group); err != nil {
+		return nil, fmt.Errorf("create group: %w", err)
+	}
+
+	log.Printf("[heartbeat-manager] created group: %s (survival_threshold=%d)", name, survivalThreshold)
+	return group, nil
+}
+
+func (m *Manager) DeleteGroup(name string) error {
+	if name == "" {
+		return fmt.Errorf("group name cannot be empty")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	group, err := m.storage.GetHeartbeatGroup(name)
+	if err != nil {
+		return fmt.Errorf("get group: %w", err)
+	}
+	if group == nil {
+		return fmt.Errorf("group not found: %s", name)
+	}
+
+	members, err := m.storage.ListHeartbeatRegistrationsByGroup(name)
+	if err != nil {
+		return fmt.Errorf("list group members: %w", err)
+	}
+	if len(members) > 0 {
+		return fmt.Errorf("cannot delete group with %d members", len(members))
+	}
+
+	deps, err := m.storage.ListGroupDependenciesByGroup(name)
+	if err != nil {
+		return fmt.Errorf("list group dependencies: %w", err)
+	}
+	for _, dep := range deps {
+		if err := m.storage.RemoveGroupDependency(dep.GroupName, dep.DependsOn); err != nil {
+			log.Printf("[heartbeat-manager] remove dependency error: %v", err)
+		}
+	}
+
+	reverseDeps, err := m.storage.ListGroupsThatDependOn(name)
+	if err != nil {
+		return fmt.Errorf("list reverse dependencies: %w", err)
+	}
+	for _, dep := range reverseDeps {
+		if err := m.storage.RemoveGroupDependency(dep.GroupName, dep.DependsOn); err != nil {
+			log.Printf("[heartbeat-manager] remove reverse dependency error: %v", err)
+		}
+	}
+
+	if err := m.storage.DeleteHeartbeatGroup(name); err != nil {
+		return fmt.Errorf("delete group: %w", err)
+	}
+
+	log.Printf("[heartbeat-manager] deleted group: %s", name)
+	return nil
+}
+
+func (m *Manager) updateGroupHealthLocked(groupName string) {
+	group, err := m.storage.GetHeartbeatGroup(groupName)
+	if err != nil {
+		log.Printf("[heartbeat-manager] get group error: %v", err)
+		return
+	}
+	if group == nil {
+		return
+	}
+
+	members, err := m.storage.ListHeartbeatRegistrationsByGroup(groupName)
+	if err != nil {
+		log.Printf("[heartbeat-manager] list group members error: %v", err)
+		return
+	}
+
+	aliveCount := 0
+	for _, member := range members {
+		if member.Status == model.HeartbeatStatusHealthy ||
+			member.Status == model.HeartbeatStatusSuspect ||
+			member.Status == model.HeartbeatStatusRecovered {
+			aliveCount++
+		}
+	}
+
+	oldStatus := group.Status
+	group.AliveCount = aliveCount
+	group.TotalCount = len(members)
+
+	if aliveCount >= group.SurvivalThreshold {
+		group.Status = model.HeartbeatGroupHealthy
+	} else {
+		group.Status = model.HeartbeatGroupUnhealthy
+	}
+	group.UpdatedAt = time.Now()
+
+	if err := m.storage.UpdateHeartbeatGroup(group); err != nil {
+		log.Printf("[heartbeat-manager] update group error: %v", err)
+		return
+	}
+
+	if oldStatus != group.Status {
+		log.Printf("[heartbeat-manager] group %s status changed: %s -> %s (alive=%d, threshold=%d)",
+			groupName, oldStatus, group.Status, aliveCount, group.SurvivalThreshold)
+		m.addGroupEventLocked(groupName, "status_change",
+			string(oldStatus), string(group.Status),
+			fmt.Sprintf("alive=%d, threshold=%d", aliveCount, group.SurvivalThreshold))
+	}
+
+	m.checkCascadeDegradeLocked(group)
+}
+
+func (m *Manager) checkCascadeDegradeLocked(group *model.HeartbeatGroup) {
+	if group.Status != model.HeartbeatGroupUnhealthy {
+		dependees, err := m.storage.ListGroupsThatDependOn(group.Name)
+		if err != nil {
+			log.Printf("[heartbeat-manager] list dependees error: %v", err)
+			return
+		}
+		for _, dep := range dependees {
+			depGroup, err := m.storage.GetHeartbeatGroup(dep.GroupName)
+			if err != nil {
+				log.Printf("[heartbeat-manager] get dependant group error: %v", err)
+				continue
+			}
+			if depGroup != nil && depGroup.Degraded {
+				m.tryRestoreGroupLocked(depGroup)
+			}
+		}
+		return
+	}
+
+	dependees, err := m.storage.ListGroupsThatDependOn(group.Name)
+	if err != nil {
+		log.Printf("[heartbeat-manager] list dependees error: %v", err)
+		return
+	}
+
+	for _, dep := range dependees {
+		depGroup, err := m.storage.GetHeartbeatGroup(dep.GroupName)
+		if err != nil {
+			log.Printf("[heartbeat-manager] get dependant group error: %v", err)
+			continue
+		}
+		if depGroup == nil || depGroup.Degraded {
+			continue
+		}
+
+		now := time.Now()
+		depGroup.Degraded = true
+		depGroup.DegradedReason = fmt.Sprintf("dependency group %s is unhealthy", group.Name)
+		depGroup.DegradedAt = &now
+		depGroup.Status = model.HeartbeatGroupDegraded
+		depGroup.UpdatedAt = now
+
+		if err := m.storage.UpdateHeartbeatGroup(depGroup); err != nil {
+			log.Printf("[heartbeat-manager] degrade group error: %v", err)
+			continue
+		}
+
+		log.Printf("[heartbeat-manager] group %s DEGRADED: dependency %s is unhealthy", depGroup.Name, group.Name)
+		m.addGroupEventLocked(depGroup.Name, "degraded",
+			string(depGroup.Status), string(model.HeartbeatGroupDegraded),
+			fmt.Sprintf("dependency group %s is unhealthy", group.Name))
+
+		m.checkCascadeDegradeLocked(depGroup)
+	}
+}
+
+func (m *Manager) tryRestoreGroupLocked(group *model.HeartbeatGroup) {
+	deps, err := m.storage.ListGroupDependenciesByGroup(group.Name)
+	if err != nil {
+		log.Printf("[heartbeat-manager] list dependencies error: %v", err)
+		return
+	}
+
+	allHealthy := true
+	for _, dep := range deps {
+		depGroup, err := m.storage.GetHeartbeatGroup(dep.DependsOn)
+		if err != nil {
+			log.Printf("[heartbeat-manager] get dependency group error: %v", err)
+			allHealthy = false
+			break
+		}
+		if depGroup == nil || depGroup.Status == model.HeartbeatGroupUnhealthy || depGroup.Degraded {
+			allHealthy = false
+			break
+		}
+	}
+
+	if !allHealthy {
+		return
+	}
+
+	now := time.Now()
+	oldStatus := group.Status
+	group.Degraded = false
+	group.DegradedReason = ""
+	group.DegradedAt = nil
+	if group.AliveCount >= group.SurvivalThreshold {
+		group.Status = model.HeartbeatGroupHealthy
+	} else {
+		group.Status = model.HeartbeatGroupUnhealthy
+	}
+	group.UpdatedAt = now
+
+	if err := m.storage.UpdateHeartbeatGroup(group); err != nil {
+		log.Printf("[heartbeat-manager] restore group error: %v", err)
+		return
+	}
+
+	log.Printf("[heartbeat-manager] group %s RESTORED from degraded: %s -> %s",
+		group.Name, oldStatus, group.Status)
+	m.addGroupEventLocked(group.Name, "restored",
+		string(model.HeartbeatGroupDegraded), string(group.Status),
+		"all dependencies are healthy again")
+
+	dependees, err := m.storage.ListGroupsThatDependOn(group.Name)
+	if err != nil {
+		log.Printf("[heartbeat-manager] list dependees error: %v", err)
+		return
+	}
+	for _, dep := range dependees {
+		depGroup, err := m.storage.GetHeartbeatGroup(dep.GroupName)
+		if err != nil {
+			log.Printf("[heartbeat-manager] get dependant group error: %v", err)
+			continue
+		}
+		if depGroup != nil && depGroup.Degraded {
+			m.tryRestoreGroupLocked(depGroup)
+		}
+	}
+}
+
+func (m *Manager) AddGroupDependency(groupName string, dependsOn string) error {
+	if groupName == "" || dependsOn == "" {
+		return fmt.Errorf("group names cannot be empty")
+	}
+	if groupName == dependsOn {
+		return fmt.Errorf("cannot add self-dependency")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	group, err := m.storage.GetHeartbeatGroup(groupName)
+	if err != nil {
+		return fmt.Errorf("get group: %w", err)
+	}
+	if group == nil {
+		return fmt.Errorf("group not found: %s", groupName)
+	}
+
+	depGroup, err := m.storage.GetHeartbeatGroup(dependsOn)
+	if err != nil {
+		return fmt.Errorf("get dependency group: %w", err)
+	}
+	if depGroup == nil {
+		return fmt.Errorf("dependency group not found: %s", dependsOn)
+	}
+
+	if m.wouldCreateCycleLocked(groupName, dependsOn) {
+		return fmt.Errorf("adding dependency would create a cycle")
+	}
+
+	now := time.Now()
+	dep := &model.HeartbeatGroupDependency{
+		GroupName: groupName,
+		DependsOn: dependsOn,
+		CreatedAt: now,
+	}
+
+	if err := m.storage.CreateGroupDependency(dep); err != nil {
+		return fmt.Errorf("create dependency: %w", err)
+	}
+
+	log.Printf("[heartbeat-manager] added dependency: %s -> %s", groupName, dependsOn)
+
+	if depGroup.Status == model.HeartbeatGroupUnhealthy || depGroup.Degraded {
+		m.checkCascadeDegradeLocked(depGroup)
+	}
+
+	return nil
+}
+
+func (m *Manager) wouldCreateCycleLocked(groupName, dependsOn string) bool {
+	visited := make(map[string]bool)
+	var dfs func(string) bool
+	dfs = func(current string) bool {
+		if current == groupName {
+			return true
+		}
+		if visited[current] {
+			return false
+		}
+		visited[current] = true
+		deps, _ := m.storage.ListGroupDependenciesByGroup(current)
+		for _, dep := range deps {
+			if dfs(dep.DependsOn) {
+				return true
+			}
+		}
+		return false
+	}
+	return dfs(dependsOn)
+}
+
+func (m *Manager) RemoveGroupDependency(groupName string, dependsOn string) error {
+	if groupName == "" || dependsOn == "" {
+		return fmt.Errorf("group names cannot be empty")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.storage.RemoveGroupDependency(groupName, dependsOn); err != nil {
+		return fmt.Errorf("remove dependency: %w", err)
+	}
+
+	log.Printf("[heartbeat-manager] removed dependency: %s -> %s", groupName, dependsOn)
+
+	group, err := m.storage.GetHeartbeatGroup(groupName)
+	if err != nil {
+		log.Printf("[heartbeat-manager] get group error: %v", err)
+	} else if group != nil && group.Degraded {
+		m.tryRestoreGroupLocked(group)
+	}
+
+	return nil
+}
+
+func (m *Manager) IsGroupDegraded(callerID string) (bool, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reg, err := m.storage.GetHeartbeatRegistration(callerID)
+	if err != nil {
+		return false, "", fmt.Errorf("get registration: %w", err)
+	}
+	if reg == nil || reg.GroupName == "" {
+		return false, "", nil
+	}
+
+	group, err := m.storage.GetHeartbeatGroup(reg.GroupName)
+	if err != nil {
+		return false, "", fmt.Errorf("get group: %w", err)
+	}
+	if group == nil {
+		return false, "", nil
+	}
+
+	return group.Degraded, group.DegradedReason, nil
 }
 
 func (m *Manager) ReportHeartbeat(callerID string) (*model.HeartbeatRegistration, error) {
@@ -458,6 +871,10 @@ func (m *Manager) ReportHeartbeat(callerID string) (*model.HeartbeatRegistration
 	reg.UpdatedAt = now
 	if err := m.storage.UpdateHeartbeatRegistration(reg); err != nil {
 		return nil, fmt.Errorf("update registration: %w", err)
+	}
+
+	if reg.GroupName != "" {
+		go m.updateGroupHealthLocked(reg.GroupName)
 	}
 
 	return reg, nil
@@ -687,4 +1104,166 @@ func (m *Manager) addEventLocked(callerID string, eventType string, from, to mod
 		CreatedAt:  time.Now(),
 	}
 	_ = m.storage.AddHeartbeatEvent(event)
+}
+
+func (m *Manager) addGroupEventLocked(groupName string, eventType string, from, to string, detail string) {
+	event := &model.HeartbeatEvent{
+		CallerID:  "group:" + groupName,
+		EventType: eventType,
+		FromStatus: model.HeartbeatStatus(from),
+		ToStatus:   model.HeartbeatStatus(to),
+		Detail:     detail,
+		CreatedAt:  time.Now(),
+	}
+	_ = m.storage.AddHeartbeatEvent(event)
+}
+
+func (m *Manager) GetGroup(name string) (*model.HeartbeatGroupInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	group, err := m.storage.GetHeartbeatGroup(name)
+	if err != nil {
+		return nil, fmt.Errorf("get group: %w", err)
+	}
+	if group == nil {
+		return nil, fmt.Errorf("group not found: %s", name)
+	}
+
+	members, err := m.storage.ListHeartbeatRegistrationsByGroup(name)
+	if err != nil {
+		return nil, fmt.Errorf("list group members: %w", err)
+	}
+
+	groupMembers := make([]model.HeartbeatGroupMember, 0, len(members))
+	for _, member := range members {
+		groupMembers = append(groupMembers, model.HeartbeatGroupMember{
+			CallerID:        member.CallerID,
+			Status:          member.Status,
+			LastHeartbeatAt: member.LastHeartbeatAt,
+		})
+	}
+
+	deps, err := m.storage.ListGroupDependenciesByGroup(name)
+	if err != nil {
+		return nil, fmt.Errorf("list dependencies: %w", err)
+	}
+	dependsOn := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		dependsOn = append(dependsOn, dep.DependsOn)
+	}
+
+	reverseDeps, err := m.storage.ListGroupsThatDependOn(name)
+	if err != nil {
+		return nil, fmt.Errorf("list reverse dependencies: %w", err)
+	}
+	dependedBy := make([]string, 0, len(reverseDeps))
+	for _, dep := range reverseDeps {
+		dependedBy = append(dependedBy, dep.GroupName)
+	}
+
+	info := &model.HeartbeatGroupInfo{
+		ID:                group.ID,
+		Name:              group.Name,
+		SurvivalThreshold: group.SurvivalThreshold,
+		Status:            group.Status,
+		AliveCount:        group.AliveCount,
+		TotalCount:        group.TotalCount,
+		Degraded:          group.Degraded,
+		DegradedReason:    group.DegradedReason,
+		DegradedAt:        group.DegradedAt,
+		Members:           groupMembers,
+		DependsOn:         dependsOn,
+		DependedBy:        dependedBy,
+		CreatedAt:         group.CreatedAt,
+	}
+
+	return info, nil
+}
+
+func (m *Manager) ListGroups() ([]model.HeartbeatGroup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.storage.ListHeartbeatGroups()
+}
+
+func (m *Manager) ListGroupStatuses() ([]model.GroupStatusInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	groups, err := m.storage.ListHeartbeatGroups()
+	if err != nil {
+		return nil, fmt.Errorf("list groups: %w", err)
+	}
+
+	result := make([]model.GroupStatusInfo, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, model.GroupStatusInfo{
+			Name:              group.Name,
+			Status:            group.Status,
+			SurvivalThreshold: group.SurvivalThreshold,
+			AliveCount:        group.AliveCount,
+			TotalCount:        group.TotalCount,
+			Degraded:          group.Degraded,
+			DegradedReason:    group.DegradedReason,
+		})
+	}
+
+	return result, nil
+}
+
+func (m *Manager) ListGroupMembers(groupName string) ([]model.HeartbeatGroupMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	group, err := m.storage.GetHeartbeatGroup(groupName)
+	if err != nil {
+		return nil, fmt.Errorf("get group: %w", err)
+	}
+	if group == nil {
+		return nil, fmt.Errorf("group not found: %s", groupName)
+	}
+
+	members, err := m.storage.ListHeartbeatRegistrationsByGroup(groupName)
+	if err != nil {
+		return nil, fmt.Errorf("list group members: %w", err)
+	}
+
+	groupMembers := make([]model.HeartbeatGroupMember, 0, len(members))
+	for _, member := range members {
+		groupMembers = append(groupMembers, model.HeartbeatGroupMember{
+			CallerID:        member.CallerID,
+			Status:          member.Status,
+			LastHeartbeatAt: member.LastHeartbeatAt,
+		})
+	}
+
+	return groupMembers, nil
+}
+
+func (m *Manager) ListGroupDependencies() ([]model.HeartbeatGroupDependency, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.storage.ListGroupDependencies()
+}
+
+func (m *Manager) ListDegradedGroups() ([]model.HeartbeatGroup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.storage.ListDegradedGroups()
+}
+
+func (m *Manager) updateAllGroupsHealthLocked() {
+	groups, err := m.storage.ListHeartbeatGroups()
+	if err != nil {
+		log.Printf("[heartbeat-manager] list groups error: %v", err)
+		return
+	}
+
+	for _, group := range groups {
+		m.updateGroupHealthLocked(group.Name)
+	}
 }

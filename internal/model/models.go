@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type LockStatus string
 
@@ -1015,6 +1018,7 @@ const (
 type HeartbeatRegistration struct {
 	ID               int64            `json:"id"`
 	CallerID         string           `json:"caller_id"`
+	GroupName        string           `json:"group_name,omitempty"`
 	IntervalSec      int              `json:"interval_sec"`
 	MaxMissed        int              `json:"max_missed"`
 	Strategy         DisposalStrategy `json:"strategy"`
@@ -1075,3 +1079,84 @@ type HeartbeatReport struct {
 	FrozenCount      int `json:"frozen_count"`
 	RecoveredCount   int `json:"recovered_count"`
 }
+
+type HeartbeatGroupStatus string
+
+const (
+	HeartbeatGroupHealthy   HeartbeatGroupStatus = "healthy"
+	HeartbeatGroupUnhealthy HeartbeatGroupStatus = "unhealthy"
+	HeartbeatGroupDegraded  HeartbeatGroupStatus = "degraded"
+)
+
+type HeartbeatGroup struct {
+	ID            int64                `json:"id"`
+	Name          string               `json:"name"`
+	SurvivalThreshold int              `json:"survival_threshold"`
+	Status        HeartbeatGroupStatus `json:"status"`
+	AliveCount    int                  `json:"alive_count"`
+	TotalCount    int                  `json:"total_count"`
+	Degraded      bool                 `json:"degraded"`
+	DegradedReason string              `json:"degraded_reason,omitempty"`
+	DegradedAt    *time.Time           `json:"degraded_at,omitempty"`
+	CreatedAt     time.Time            `json:"created_at"`
+	UpdatedAt     time.Time            `json:"updated_at"`
+}
+
+type HeartbeatGroupMember struct {
+	CallerID        string          `json:"caller_id"`
+	Status          HeartbeatStatus `json:"status"`
+	LastHeartbeatAt time.Time       `json:"last_heartbeat_at"`
+}
+
+type HeartbeatGroupInfo struct {
+	ID                int64                     `json:"id"`
+	Name              string                    `json:"name"`
+	SurvivalThreshold int                       `json:"survival_threshold"`
+	Status            HeartbeatGroupStatus      `json:"status"`
+	AliveCount        int                       `json:"alive_count"`
+	TotalCount        int                       `json:"total_count"`
+	Degraded          bool                      `json:"degraded"`
+	DegradedReason    string                    `json:"degraded_reason,omitempty"`
+	DegradedAt        *time.Time                `json:"degraded_at,omitempty"`
+	Members           []HeartbeatGroupMember    `json:"members"`
+	DependsOn         []string                  `json:"depends_on,omitempty"`
+	DependedBy        []string                  `json:"depended_by,omitempty"`
+	CreatedAt         time.Time                 `json:"created_at"`
+}
+
+type HeartbeatGroupDependency struct {
+	ID         int64     `json:"id"`
+	GroupName  string    `json:"group_name"`
+	DependsOn  string    `json:"depends_on"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type CreateHeartbeatGroupRequest struct {
+	Name              string `json:"name" binding:"required"`
+	SurvivalThreshold int    `json:"survival_threshold" binding:"required,min=1"`
+}
+
+type RegisterHeartbeatWithGroupRequest struct {
+	CallerID    string           `json:"caller_id" binding:"required"`
+	GroupName   string           `json:"group_name,omitempty"`
+	IntervalSec int              `json:"interval_sec" binding:"required,min=1"`
+	MaxMissed   int              `json:"max_missed" binding:"required,min=1"`
+	Strategy    DisposalStrategy `json:"strategy" binding:"required"`
+}
+
+type GroupDependencyRequest struct {
+	GroupName string `json:"group_name" binding:"required"`
+	DependsOn string `json:"depends_on" binding:"required"`
+}
+
+type GroupStatusInfo struct {
+	Name              string               `json:"name"`
+	Status            HeartbeatGroupStatus `json:"status"`
+	SurvivalThreshold int                  `json:"survival_threshold"`
+	AliveCount        int                  `json:"alive_count"`
+	TotalCount        int                  `json:"total_count"`
+	Degraded          bool                 `json:"degraded"`
+	DegradedReason    string               `json:"degraded_reason,omitempty"`
+}
+
+var ErrGroupDegraded = fmt.Errorf("group is degraded, cannot acquire new locks")

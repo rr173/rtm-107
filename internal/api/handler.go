@@ -2,6 +2,8 @@ package api
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"rtm-107/internal/audit"
 	"rtm-107/internal/debt"
@@ -225,6 +227,18 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			heartbeatGroup.GET("/frozen/:caller_id", h.GetCallerFrozenResources)
 			heartbeatGroup.POST("/frozen/:caller_id/release/:id", h.ReleaseFrozenResource)
 			heartbeatGroup.POST("/frozen/:caller_id/release-all", h.ReleaseAllFrozenResources)
+
+			heartbeatGroup.POST("/groups", h.CreateHeartbeatGroup)
+			heartbeatGroup.DELETE("/groups/:name", h.DeleteHeartbeatGroup)
+			heartbeatGroup.GET("/groups", h.ListHeartbeatGroups)
+			heartbeatGroup.GET("/groups/:name", h.GetHeartbeatGroup)
+			heartbeatGroup.GET("/groups/:name/members", h.ListHeartbeatGroupMembers)
+
+			heartbeatGroup.POST("/dependencies", h.AddGroupDependency)
+			heartbeatGroup.DELETE("/dependencies/:group_name/:depends_on", h.RemoveGroupDependency)
+			heartbeatGroup.GET("/dependencies", h.ListGroupDependencies)
+
+			heartbeatGroup.GET("/degraded", h.ListDegradedGroups)
 		}
 	}
 }
@@ -276,6 +290,21 @@ func (h *Handler) AcquireLock(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	if h.heartbeatMgr != nil {
+		degraded, reason, err := h.heartbeatMgr.IsGroupDegraded(req.Holder)
+		if err != nil {
+			log.Printf("[handler] check group degraded error: %v", err)
+		} else if degraded {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":               model.ErrGroupDegraded.Error(),
+				"group_degraded":      true,
+				"degraded_reason":     reason,
+				"can_renew":           true,
+			})
+			return
+		}
 	}
 
 	result, err := h.auditMgr.AcquireLock(name, req.Holder, req.LeaseSec, req.Reentrant)
@@ -403,6 +432,21 @@ func (h *Handler) AcquireLocksBatch(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	if h.heartbeatMgr != nil {
+		degraded, reason, err := h.heartbeatMgr.IsGroupDegraded(req.Holder)
+		if err != nil {
+			log.Printf("[handler] check group degraded error: %v", err)
+		} else if degraded {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":               model.ErrGroupDegraded.Error(),
+				"group_degraded":      true,
+				"degraded_reason":     reason,
+				"can_renew":           true,
+			})
+			return
+		}
 	}
 
 	result, err := h.auditMgr.AcquireLocksBatch(req.LockNames, req.Holder, req.LeaseSec, req.Reentrant)
@@ -1818,19 +1862,159 @@ func (h *Handler) GetHandoverTimeline(c *gin.Context) {
 }
 
 func (h *Handler) RegisterHeartbeat(c *gin.Context) {
-	var req model.RegisterHeartbeatRequest
+	var req model.RegisterHeartbeatWithGroupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+		var oldReq model.RegisterHeartbeatRequest
+		if err2 := c.ShouldBindJSON(&oldReq); err2 != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		req = model.RegisterHeartbeatWithGroupRequest{
+			CallerID:    oldReq.CallerID,
+			GroupName:   "",
+			IntervalSec: oldReq.IntervalSec,
+			MaxMissed:   oldReq.MaxMissed,
+			Strategy:    oldReq.Strategy,
+		}
 	}
 
-	reg, err := h.heartbeatMgr.Register(req.CallerID, req.IntervalSec, req.MaxMissed, req.Strategy)
+	reg, err := h.heartbeatMgr.Register(req.CallerID, req.GroupName, req.IntervalSec, req.MaxMissed, req.Strategy)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"registration": reg})
+}
+
+func (h *Handler) CreateHeartbeatGroup(c *gin.Context) {
+	var req model.CreateHeartbeatGroupRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	group, err := h.heartbeatMgr.CreateGroup(req.Name, req.SurvivalThreshold)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"group": group})
+}
+
+func (h *Handler) DeleteHeartbeatGroup(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group name is required"})
+		return
+	}
+
+	if err := h.heartbeatMgr.DeleteGroup(name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "group deleted"})
+}
+
+func (h *Handler) GetHeartbeatGroup(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group name is required"})
+		return
+	}
+
+	group, err := h.heartbeatMgr.GetGroup(name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"group": group})
+}
+
+func (h *Handler) ListHeartbeatGroups(c *gin.Context) {
+	groups, err := h.heartbeatMgr.ListGroupStatuses()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"groups": groups, "count": len(groups)})
+}
+
+func (h *Handler) ListHeartbeatGroupMembers(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group name is required"})
+		return
+	}
+
+	members, err := h.heartbeatMgr.ListGroupMembers(name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"group_name": name, "members": members, "count": len(members)})
+}
+
+func (h *Handler) AddGroupDependency(c *gin.Context) {
+	var req model.GroupDependencyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := h.heartbeatMgr.AddGroupDependency(req.GroupName, req.DependsOn); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":   true,
+		"message":   fmt.Sprintf("dependency added: %s -> %s", req.GroupName, req.DependsOn),
+	})
+}
+
+func (h *Handler) RemoveGroupDependency(c *gin.Context) {
+	groupName := c.Param("group_name")
+	dependsOn := c.Param("depends_on")
+	if groupName == "" || dependsOn == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group_name and depends_on are required"})
+		return
+	}
+
+	if err := h.heartbeatMgr.RemoveGroupDependency(groupName, dependsOn); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": fmt.Sprintf("dependency removed: %s -> %s", groupName, dependsOn),
+	})
+}
+
+func (h *Handler) ListGroupDependencies(c *gin.Context) {
+	deps, err := h.heartbeatMgr.ListGroupDependencies()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"dependencies": deps, "count": len(deps)})
+}
+
+func (h *Handler) ListDegradedGroups(c *gin.Context) {
+	groups, err := h.heartbeatMgr.ListDegradedGroups()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"degraded_groups": groups, "count": len(groups)})
 }
 
 func (h *Handler) ReportHeartbeat(c *gin.Context) {

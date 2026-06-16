@@ -493,6 +493,7 @@ func (s *Storage) initSchema() error {
 	CREATE TABLE IF NOT EXISTS heartbeat_registrations (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		caller_id TEXT NOT NULL UNIQUE,
+		group_name TEXT DEFAULT '',
 		interval_sec INTEGER NOT NULL,
 		max_missed INTEGER NOT NULL,
 		strategy TEXT NOT NULL,
@@ -505,6 +506,28 @@ func (s *Storage) initSchema() error {
 		recovered_at DATETIME,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS heartbeat_groups (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		survival_threshold INTEGER NOT NULL DEFAULT 1,
+		status TEXT NOT NULL DEFAULT 'healthy',
+		alive_count INTEGER NOT NULL DEFAULT 0,
+		total_count INTEGER NOT NULL DEFAULT 0,
+		degraded INTEGER NOT NULL DEFAULT 0,
+		degraded_reason TEXT DEFAULT '',
+		degraded_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS heartbeat_group_dependencies (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		group_name TEXT NOT NULL,
+		depends_on TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(group_name, depends_on)
 	);
 
 	CREATE TABLE IF NOT EXISTS heartbeat_events (
@@ -529,6 +552,12 @@ func (s *Storage) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_hb_reg_status ON heartbeat_registrations(status);
 	CREATE INDEX IF NOT EXISTS idx_hb_reg_caller ON heartbeat_registrations(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_hb_reg_group ON heartbeat_registrations(group_name);
+	CREATE INDEX IF NOT EXISTS idx_hb_groups_name ON heartbeat_groups(name);
+	CREATE INDEX IF NOT EXISTS idx_hb_groups_status ON heartbeat_groups(status);
+	CREATE INDEX IF NOT EXISTS idx_hb_groups_degraded ON heartbeat_groups(degraded);
+	CREATE INDEX IF NOT EXISTS idx_hb_group_deps_group ON heartbeat_group_dependencies(group_name);
+	CREATE INDEX IF NOT EXISTS idx_hb_group_deps_depends ON heartbeat_group_dependencies(depends_on);
 	CREATE INDEX IF NOT EXISTS idx_hb_events_caller ON heartbeat_events(caller_id);
 	CREATE INDEX IF NOT EXISTS idx_hb_events_type ON heartbeat_events(event_type);
 	CREATE INDEX IF NOT EXISTS idx_frozen_caller ON frozen_resources(caller_id);
@@ -561,6 +590,25 @@ func (s *Storage) migrateSchema() error {
 			log.Printf("[storage-migration] adding column %s to rl_caller_bindings", col)
 			_, err := s.db.Exec(fmt.Sprintf(
 				"ALTER TABLE rl_caller_bindings ADD COLUMN %s INTEGER NOT NULL DEFAULT 0", col))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	hbColumns := []string{"group_name"}
+	for _, col := range hbColumns {
+		row := s.db.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('heartbeat_registrations') WHERE name = ?
+		`, col)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			log.Printf("[storage-migration] adding column %s to heartbeat_registrations", col)
+			_, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE heartbeat_registrations ADD COLUMN %s TEXT NOT NULL DEFAULT ''", col))
 			if err != nil {
 				return err
 			}
@@ -3309,11 +3357,12 @@ func nullTimePtr(t *time.Time) interface{} {
 func (s *Storage) CreateHeartbeatRegistration(h *model.HeartbeatRegistration) error {
 	result, err := s.db.Exec(`
 		INSERT INTO heartbeat_registrations (
-			caller_id, interval_sec, max_missed, strategy,
+			caller_id, group_name, interval_sec, max_missed, strategy,
 			last_heartbeat_at, next_expected_at, missed_count, status,
 			frozen_at, lost_at, recovered_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(caller_id) DO UPDATE SET
+			group_name = excluded.group_name,
 			interval_sec = excluded.interval_sec,
 			max_missed = excluded.max_missed,
 			strategy = excluded.strategy,
@@ -3325,7 +3374,7 @@ func (s *Storage) CreateHeartbeatRegistration(h *model.HeartbeatRegistration) er
 			lost_at = excluded.lost_at,
 			recovered_at = excluded.recovered_at,
 			updated_at = excluded.updated_at
-	`, h.CallerID, h.IntervalSec, h.MaxMissed, h.Strategy,
+	`, h.CallerID, h.GroupName, h.IntervalSec, h.MaxMissed, h.Strategy,
 		h.LastHeartbeatAt, h.NextExpectedAt, h.MissedCount, h.Status,
 		nullTimePtr(h.FrozenAt), nullTimePtr(h.LostAt), nullTimePtr(h.RecoveredAt),
 		h.CreatedAt, h.UpdatedAt)
@@ -3340,7 +3389,7 @@ func (s *Storage) CreateHeartbeatRegistration(h *model.HeartbeatRegistration) er
 
 func (s *Storage) GetHeartbeatRegistration(callerID string) (*model.HeartbeatRegistration, error) {
 	row := s.db.QueryRow(`
-		SELECT id, caller_id, interval_sec, max_missed, strategy,
+		SELECT id, caller_id, group_name, interval_sec, max_missed, strategy,
 			last_heartbeat_at, next_expected_at, missed_count, status,
 			frozen_at, lost_at, recovered_at, created_at, updated_at
 		FROM heartbeat_registrations WHERE caller_id = ?
@@ -3348,7 +3397,7 @@ func (s *Storage) GetHeartbeatRegistration(callerID string) (*model.HeartbeatReg
 
 	var h model.HeartbeatRegistration
 	var frozenAt, lostAt, recoveredAt sql.NullTime
-	err := row.Scan(&h.ID, &h.CallerID, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
+	err := row.Scan(&h.ID, &h.CallerID, &h.GroupName, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
 		&h.LastHeartbeatAt, &h.NextExpectedAt, &h.MissedCount, &h.Status,
 		&frozenAt, &lostAt, &recoveredAt, &h.CreatedAt, &h.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -3372,6 +3421,7 @@ func (s *Storage) GetHeartbeatRegistration(callerID string) (*model.HeartbeatReg
 func (s *Storage) UpdateHeartbeatRegistration(h *model.HeartbeatRegistration) error {
 	_, err := s.db.Exec(`
 		UPDATE heartbeat_registrations SET
+			group_name = ?,
 			interval_sec = ?,
 			max_missed = ?,
 			strategy = ?,
@@ -3384,7 +3434,7 @@ func (s *Storage) UpdateHeartbeatRegistration(h *model.HeartbeatRegistration) er
 			recovered_at = ?,
 			updated_at = ?
 		WHERE caller_id = ?
-	`, h.IntervalSec, h.MaxMissed, h.Strategy,
+	`, h.GroupName, h.IntervalSec, h.MaxMissed, h.Strategy,
 		h.LastHeartbeatAt, h.NextExpectedAt, h.MissedCount, h.Status,
 		nullTimePtr(h.FrozenAt), nullTimePtr(h.LostAt), nullTimePtr(h.RecoveredAt),
 		h.UpdatedAt, h.CallerID)
@@ -3393,7 +3443,7 @@ func (s *Storage) UpdateHeartbeatRegistration(h *model.HeartbeatRegistration) er
 
 func (s *Storage) ListHeartbeatRegistrations() ([]model.HeartbeatRegistration, error) {
 	rows, err := s.db.Query(`
-		SELECT id, caller_id, interval_sec, max_missed, strategy,
+		SELECT id, caller_id, group_name, interval_sec, max_missed, strategy,
 			last_heartbeat_at, next_expected_at, missed_count, status,
 			frozen_at, lost_at, recovered_at, created_at, updated_at
 		FROM heartbeat_registrations ORDER BY id
@@ -3407,7 +3457,7 @@ func (s *Storage) ListHeartbeatRegistrations() ([]model.HeartbeatRegistration, e
 	for rows.Next() {
 		var h model.HeartbeatRegistration
 		var frozenAt, lostAt, recoveredAt sql.NullTime
-		if err := rows.Scan(&h.ID, &h.CallerID, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
+		if err := rows.Scan(&h.ID, &h.CallerID, &h.GroupName, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
 			&h.LastHeartbeatAt, &h.NextExpectedAt, &h.MissedCount, &h.Status,
 			&frozenAt, &lostAt, &recoveredAt, &h.CreatedAt, &h.UpdatedAt); err != nil {
 			return nil, err
@@ -3428,7 +3478,7 @@ func (s *Storage) ListHeartbeatRegistrations() ([]model.HeartbeatRegistration, e
 
 func (s *Storage) ListHeartbeatRegistrationsByStatus(status model.HeartbeatStatus) ([]model.HeartbeatRegistration, error) {
 	rows, err := s.db.Query(`
-		SELECT id, caller_id, interval_sec, max_missed, strategy,
+		SELECT id, caller_id, group_name, interval_sec, max_missed, strategy,
 			last_heartbeat_at, next_expected_at, missed_count, status,
 			frozen_at, lost_at, recovered_at, created_at, updated_at
 		FROM heartbeat_registrations WHERE status = ? ORDER BY id
@@ -3442,7 +3492,7 @@ func (s *Storage) ListHeartbeatRegistrationsByStatus(status model.HeartbeatStatu
 	for rows.Next() {
 		var h model.HeartbeatRegistration
 		var frozenAt, lostAt, recoveredAt sql.NullTime
-		if err := rows.Scan(&h.ID, &h.CallerID, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
+		if err := rows.Scan(&h.ID, &h.CallerID, &h.GroupName, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
 			&h.LastHeartbeatAt, &h.NextExpectedAt, &h.MissedCount, &h.Status,
 			&frozenAt, &lostAt, &recoveredAt, &h.CreatedAt, &h.UpdatedAt); err != nil {
 			return nil, err
@@ -3565,4 +3615,246 @@ func (s *Storage) ReleaseAllFrozenResources(callerID string, releasedAt time.Tim
 		UPDATE frozen_resources SET released_at = ? WHERE caller_id = ? AND released_at IS NULL
 	`, releasedAt, callerID)
 	return err
+}
+
+func (s *Storage) CreateHeartbeatGroup(g *model.HeartbeatGroup) error {
+	result, err := s.db.Exec(`
+		INSERT INTO heartbeat_groups (name, survival_threshold, status, alive_count, total_count,
+			degraded, degraded_reason, degraded_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, g.Name, g.SurvivalThreshold, g.Status, g.AliveCount, g.TotalCount,
+		g.Degraded, g.DegradedReason, nullTimePtr(g.DegradedAt),
+		g.CreatedAt, g.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	g.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) GetHeartbeatGroup(name string) (*model.HeartbeatGroup, error) {
+	row := s.db.QueryRow(`
+		SELECT id, name, survival_threshold, status, alive_count, total_count,
+			degraded, degraded_reason, degraded_at, created_at, updated_at
+		FROM heartbeat_groups WHERE name = ?
+	`, name)
+
+	var g model.HeartbeatGroup
+	var degradedInt int
+	var degradedAt sql.NullTime
+	err := row.Scan(&g.ID, &g.Name, &g.SurvivalThreshold, &g.Status, &g.AliveCount, &g.TotalCount,
+		&degradedInt, &g.DegradedReason, &degradedAt, &g.CreatedAt, &g.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	g.Degraded = degradedInt != 0
+	if degradedAt.Valid {
+		g.DegradedAt = &degradedAt.Time
+	}
+	return &g, nil
+}
+
+func (s *Storage) UpdateHeartbeatGroup(g *model.HeartbeatGroup) error {
+	degradedInt := 0
+	if g.Degraded {
+		degradedInt = 1
+	}
+	_, err := s.db.Exec(`
+		UPDATE heartbeat_groups SET
+			survival_threshold = ?,
+			status = ?,
+			alive_count = ?,
+			total_count = ?,
+			degraded = ?,
+			degraded_reason = ?,
+			degraded_at = ?,
+			updated_at = ?
+		WHERE name = ?
+	`, g.SurvivalThreshold, g.Status, g.AliveCount, g.TotalCount,
+		degradedInt, g.DegradedReason, nullTimePtr(g.DegradedAt),
+		g.UpdatedAt, g.Name)
+	return err
+}
+
+func (s *Storage) DeleteHeartbeatGroup(name string) error {
+	_, err := s.db.Exec(`DELETE FROM heartbeat_groups WHERE name = ?`, name)
+	return err
+}
+
+func (s *Storage) ListHeartbeatGroups() ([]model.HeartbeatGroup, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, survival_threshold, status, alive_count, total_count,
+			degraded, degraded_reason, degraded_at, created_at, updated_at
+		FROM heartbeat_groups ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []model.HeartbeatGroup
+	for rows.Next() {
+		var g model.HeartbeatGroup
+		var degradedInt int
+		var degradedAt sql.NullTime
+		if err := rows.Scan(&g.ID, &g.Name, &g.SurvivalThreshold, &g.Status, &g.AliveCount, &g.TotalCount,
+			&degradedInt, &g.DegradedReason, &degradedAt, &g.CreatedAt, &g.UpdatedAt); err != nil {
+			return nil, err
+		}
+		g.Degraded = degradedInt != 0
+		if degradedAt.Valid {
+			g.DegradedAt = &degradedAt.Time
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+func (s *Storage) ListHeartbeatRegistrationsByGroup(groupName string) ([]model.HeartbeatRegistration, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, group_name, interval_sec, max_missed, strategy,
+			last_heartbeat_at, next_expected_at, missed_count, status,
+			frozen_at, lost_at, recovered_at, created_at, updated_at
+		FROM heartbeat_registrations WHERE group_name = ? ORDER BY id
+	`, groupName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var registrations []model.HeartbeatRegistration
+	for rows.Next() {
+		var h model.HeartbeatRegistration
+		var frozenAt, lostAt, recoveredAt sql.NullTime
+		if err := rows.Scan(&h.ID, &h.CallerID, &h.GroupName, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
+			&h.LastHeartbeatAt, &h.NextExpectedAt, &h.MissedCount, &h.Status,
+			&frozenAt, &lostAt, &recoveredAt, &h.CreatedAt, &h.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if frozenAt.Valid {
+			h.FrozenAt = &frozenAt.Time
+		}
+		if lostAt.Valid {
+			h.LostAt = &lostAt.Time
+		}
+		if recoveredAt.Valid {
+			h.RecoveredAt = &recoveredAt.Time
+		}
+		registrations = append(registrations, h)
+	}
+	return registrations, nil
+}
+
+func (s *Storage) CreateGroupDependency(dep *model.HeartbeatGroupDependency) error {
+	result, err := s.db.Exec(`
+		INSERT OR IGNORE INTO heartbeat_group_dependencies (group_name, depends_on, created_at)
+		VALUES (?, ?, ?)
+	`, dep.GroupName, dep.DependsOn, dep.CreatedAt)
+	if err != nil {
+		return err
+	}
+	dep.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) RemoveGroupDependency(groupName, dependsOn string) error {
+	_, err := s.db.Exec(`
+		DELETE FROM heartbeat_group_dependencies WHERE group_name = ? AND depends_on = ?
+	`, groupName, dependsOn)
+	return err
+}
+
+func (s *Storage) ListGroupDependencies() ([]model.HeartbeatGroupDependency, error) {
+	rows, err := s.db.Query(`
+		SELECT id, group_name, depends_on, created_at
+		FROM heartbeat_group_dependencies ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deps []model.HeartbeatGroupDependency
+	for rows.Next() {
+		var d model.HeartbeatGroupDependency
+		if err := rows.Scan(&d.ID, &d.GroupName, &d.DependsOn, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		deps = append(deps, d)
+	}
+	return deps, nil
+}
+
+func (s *Storage) ListGroupDependenciesByGroup(groupName string) ([]model.HeartbeatGroupDependency, error) {
+	rows, err := s.db.Query(`
+		SELECT id, group_name, depends_on, created_at
+		FROM heartbeat_group_dependencies WHERE group_name = ? ORDER BY id
+	`, groupName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deps []model.HeartbeatGroupDependency
+	for rows.Next() {
+		var d model.HeartbeatGroupDependency
+		if err := rows.Scan(&d.ID, &d.GroupName, &d.DependsOn, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		deps = append(deps, d)
+	}
+	return deps, nil
+}
+
+func (s *Storage) ListGroupsThatDependOn(groupName string) ([]model.HeartbeatGroupDependency, error) {
+	rows, err := s.db.Query(`
+		SELECT id, group_name, depends_on, created_at
+		FROM heartbeat_group_dependencies WHERE depends_on = ? ORDER BY id
+	`, groupName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deps []model.HeartbeatGroupDependency
+	for rows.Next() {
+		var d model.HeartbeatGroupDependency
+		if err := rows.Scan(&d.ID, &d.GroupName, &d.DependsOn, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		deps = append(deps, d)
+	}
+	return deps, nil
+}
+
+func (s *Storage) ListDegradedGroups() ([]model.HeartbeatGroup, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, survival_threshold, status, alive_count, total_count,
+			degraded, degraded_reason, degraded_at, created_at, updated_at
+		FROM heartbeat_groups WHERE degraded = 1 ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []model.HeartbeatGroup
+	for rows.Next() {
+		var g model.HeartbeatGroup
+		var degradedInt int
+		var degradedAt sql.NullTime
+		if err := rows.Scan(&g.ID, &g.Name, &g.SurvivalThreshold, &g.Status, &g.AliveCount, &g.TotalCount,
+			&degradedInt, &g.DegradedReason, &degradedAt, &g.CreatedAt, &g.UpdatedAt); err != nil {
+			return nil, err
+		}
+		g.Degraded = degradedInt != 0
+		if degradedAt.Valid {
+			g.DegradedAt = &degradedAt.Time
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
 }

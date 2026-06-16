@@ -874,14 +874,14 @@ func seedHeartbeatDemoData(hbm *heartbeat.Manager, s *storage.Storage, lockMgr *
 		log.Printf("[demo-heartbeat] %s requested 3 tokens, remaining=%d", lostCaller, result.Remaining)
 	}
 
-	healthyReg, err := hbm.Register(healthyCaller, 5, 3, model.StrategyReleaseAll)
+	healthyReg, err := hbm.Register(healthyCaller, "", 5, 3, model.StrategyReleaseAll)
 	if err != nil {
 		return fmt.Errorf("register healthy caller: %w", err)
 	}
 	log.Printf("[demo-heartbeat] registered %s: interval=%ds, max_missed=%d, strategy=%s",
 		healthyCaller, healthyReg.IntervalSec, healthyReg.MaxMissed, healthyReg.Strategy)
 
-	lostReg, err := hbm.Register(lostCaller, 5, 3, model.StrategyReleaseAll)
+	lostReg, err := hbm.Register(lostCaller, "", 5, 3, model.StrategyReleaseAll)
 	if err != nil {
 		return fmt.Errorf("register lost caller: %w", err)
 	}
