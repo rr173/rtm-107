@@ -26,7 +26,9 @@ type HeatmapRecorder interface {
 	RecordLockRequest(lockName string)
 	RecordLockEnqueue(lockName, holder string)
 	RecordLockGranted(lockName, holder string)
+	RecordLockGrantedWithEnqueue(lockName, holder string, enqueuedAt time.Time)
 	RecordLockTimeout(lockName, holder string)
+	RecordLockTimeoutWithEnqueue(lockName, holder string, enqueuedAt time.Time)
 	RecordLockRequestWithWait(lockName string, waitMs int64)
 }
 
@@ -319,7 +321,7 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 	if item.TimeoutAt.Before(now) {
 		m.addHistoryLocked(lockName, item.Holder, model.OpTimeout, "timed out before grant")
 		if m.heatmap != nil {
-			m.heatmap.RecordLockTimeout(lockName, item.Holder)
+			m.heatmap.RecordLockTimeoutWithEnqueue(lockName, item.Holder, item.EnqueuedAt)
 		}
 		return m.tryGrantNextLocked(lockName)
 	}
@@ -353,7 +355,7 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 	m.setLeaseTimerLocked(lockName, time.Duration(item.LeaseSec)*time.Second)
 	m.addHistoryLocked(lockName, item.Holder, model.OpGrantNext, fmt.Sprintf("granted from queue, lease=%ds", item.LeaseSec))
 	if m.heatmap != nil {
-		m.heatmap.RecordLockGranted(lockName, item.Holder)
+		m.heatmap.RecordLockGrantedWithEnqueue(lockName, item.Holder, item.EnqueuedAt)
 	}
 
 	return lock, nil
@@ -476,7 +478,7 @@ func (m *Manager) checkWaitQueueTimeouts() {
 			}
 			m.addHistoryLocked(item.LockName, item.Holder, model.OpTimeout, "wait timeout")
 			if m.heatmap != nil {
-				m.heatmap.RecordLockTimeout(item.LockName, item.Holder)
+				m.heatmap.RecordLockTimeoutWithEnqueue(item.LockName, item.Holder, item.EnqueuedAt)
 			}
 			log.Printf("[lock-manager] wait timeout: lock=%s holder=%s", item.LockName, item.Holder)
 		}
@@ -485,6 +487,10 @@ func (m *Manager) checkWaitQueueTimeouts() {
 
 func (m *Manager) WaitQueueLen(lockName string) (int, error) {
 	return m.storage.WaitQueueLen(lockName)
+}
+
+func (m *Manager) ListAllWaitQueue() ([]model.WaitQueueItem, error) {
+	return m.storage.ListAllWaitQueue()
 }
 
 func (m *Manager) ListAllLocks() ([]model.LockStatusInfo, error) {

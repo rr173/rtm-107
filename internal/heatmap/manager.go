@@ -24,6 +24,7 @@ type Manager struct {
 type LockManager interface {
 	ListAllLocks() ([]model.LockStatusInfo, error)
 	WaitQueueLen(lockName string) (int, error)
+	ListAllWaitQueue() ([]model.WaitQueueItem, error)
 }
 
 type waitRecord struct {
@@ -43,6 +44,7 @@ func NewManager(s *storage.Storage, lockMgr LockManager) *Manager {
 		config: model.HeatmapConfig{
 			WindowMinutes:       5,
 			AlertThresholdMs:    5000,
+			AlertSuppressMin:    10,
 			TopN:                10,
 			HistoryRetentionMin: 1440,
 		},
@@ -57,6 +59,33 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("get heatmap config: %w", err)
 	}
 	m.config = *cfg
+
+	if m.lockMgr != nil {
+		items, err := m.lockMgr.ListAllWaitQueue()
+		if err != nil {
+			log.Printf("[heatmap] restore active waits warning: %v", err)
+		} else {
+			restored := 0
+			for _, it := range items {
+				if it.EnqueuedAt.IsZero() {
+					continue
+				}
+				if m.activeWaits[it.LockName] == nil {
+					m.activeWaits[it.LockName] = make(map[string]*waitRecord)
+				}
+				m.activeWaits[it.LockName][it.Holder] = &waitRecord{
+					LockName:    it.LockName,
+					Holder:      it.Holder,
+					EnqueuedAt:  it.EnqueuedAt,
+					WaitStartAt: it.EnqueuedAt,
+				}
+				restored++
+			}
+			if restored > 0 {
+				log.Printf("[heatmap] restored %d active wait records from storage", restored)
+			}
+		}
+	}
 	m.mu.Unlock()
 
 	go m.backgroundLoop()
@@ -132,6 +161,35 @@ func (m *Manager) RecordLockGranted(lockName, holder string) {
 	m.recordRequestLocked(lockName, 0, 0, waitMs, waitMs)
 }
 
+func (m *Manager) RecordLockGrantedWithEnqueue(lockName, holder string, enqueuedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var waitStart time.Time
+	waitMap, ok := m.activeWaits[lockName]
+	if ok {
+		if wr, ok := waitMap[holder]; ok {
+			waitStart = wr.WaitStartAt
+			delete(waitMap, holder)
+			if len(waitMap) == 0 {
+				delete(m.activeWaits, lockName)
+			}
+		}
+	}
+	if waitStart.IsZero() && !enqueuedAt.IsZero() {
+		waitStart = enqueuedAt
+	}
+	if waitStart.IsZero() {
+		return
+	}
+	waitMs := int64(time.Since(waitStart).Milliseconds())
+	if waitMs < 0 {
+		waitMs = 0
+	}
+
+	m.recordRequestLocked(lockName, 0, 0, waitMs, waitMs)
+}
+
 func (m *Manager) RecordLockTimeout(lockName, holder string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -148,6 +206,35 @@ func (m *Manager) RecordLockTimeout(lockName, holder string) {
 	delete(waitMap, holder)
 	if len(waitMap) == 0 {
 		delete(m.activeWaits, lockName)
+	}
+
+	m.recordRequestLocked(lockName, 0, 0, waitMs, waitMs)
+}
+
+func (m *Manager) RecordLockTimeoutWithEnqueue(lockName, holder string, enqueuedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var waitStart time.Time
+	waitMap, ok := m.activeWaits[lockName]
+	if ok {
+		if wr, ok := waitMap[holder]; ok {
+			waitStart = wr.WaitStartAt
+			delete(waitMap, holder)
+			if len(waitMap) == 0 {
+				delete(m.activeWaits, lockName)
+			}
+		}
+	}
+	if waitStart.IsZero() && !enqueuedAt.IsZero() {
+		waitStart = enqueuedAt
+	}
+	if waitStart.IsZero() {
+		return
+	}
+	waitMs := int64(time.Since(waitStart).Milliseconds())
+	if waitMs < 0 {
+		waitMs = 0
 	}
 
 	m.recordRequestLocked(lockName, 0, 0, waitMs, waitMs)
@@ -185,6 +272,10 @@ func (m *Manager) checkHotspotsAndAlert() {
 	m.mu.RLock()
 	windowMin := m.config.WindowMinutes
 	threshold := m.config.AlertThresholdMs
+	suppressMin := m.config.AlertSuppressMin
+	if suppressMin <= 0 {
+		suppressMin = 10
+	}
 	topN := m.config.TopN
 	m.mu.RUnlock()
 
@@ -208,7 +299,8 @@ func (m *Manager) checkHotspotsAndAlert() {
 		}
 
 		lastAlertAt, exists := m.recentAlertLocks[h.LockName]
-		if exists && now.Sub(lastAlertAt) < 5*time.Minute {
+		suppressDur := time.Duration(suppressMin) * time.Minute
+		if exists && now.Sub(lastAlertAt) < suppressDur {
 			continue
 		}
 
@@ -347,6 +439,9 @@ func (m *Manager) UpdateConfig(req model.UpdateHeatmapConfigRequest) (*model.Hea
 	}
 	if req.AlertThresholdMs != nil && *req.AlertThresholdMs > 0 {
 		m.config.AlertThresholdMs = *req.AlertThresholdMs
+	}
+	if req.AlertSuppressMin != nil && *req.AlertSuppressMin > 0 {
+		m.config.AlertSuppressMin = *req.AlertSuppressMin
 	}
 	if req.TopN != nil && *req.TopN > 0 {
 		m.config.TopN = *req.TopN

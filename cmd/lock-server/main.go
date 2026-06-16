@@ -39,10 +39,9 @@ func main() {
 	defer s.Close()
 
 	mgr := lock.NewManager(s)
-	if err := mgr.Start(); err != nil {
-		log.Fatalf("start lock manager: %v", err)
-	}
-	defer mgr.Stop()
+
+	heatmapMgr := heatmap.NewManager(s, mgr)
+	mgr.SetHeatmap(heatmapMgr)
 
 	rlMgr := ratelimit.NewManager(s)
 	if err := rlMgr.Start(); err != nil {
@@ -88,18 +87,21 @@ func main() {
 	}
 	defer handoverMgr.Stop()
 
+	if err := heatmapMgr.Start(); err != nil {
+		log.Fatalf("start heatmap manager: %v", err)
+	}
+	defer heatmapMgr.Stop()
+
+	if err := mgr.Start(); err != nil {
+		log.Fatalf("start lock manager: %v", err)
+	}
+	defer mgr.Stop()
+
 	heartbeatMgr := heartbeat.NewManager(s, mgr, rlMgr, orchMgr)
 	if err := heartbeatMgr.Start(); err != nil {
 		log.Fatalf("start heartbeat manager: %v", err)
 	}
 	defer heartbeatMgr.Stop()
-
-	heatmapMgr := heatmap.NewManager(s, mgr)
-	mgr.SetHeatmap(heatmapMgr)
-	if err := heatmapMgr.Start(); err != nil {
-		log.Fatalf("start heatmap manager: %v", err)
-	}
-	defer heatmapMgr.Stop()
 
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)

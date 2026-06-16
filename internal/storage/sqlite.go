@@ -606,6 +606,7 @@ func (s *Storage) initSchema() error {
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		window_minutes INTEGER NOT NULL DEFAULT 5,
 		alert_threshold_ms REAL NOT NULL DEFAULT 5000,
+		alert_suppress_min INTEGER NOT NULL DEFAULT 10,
 		top_n INTEGER NOT NULL DEFAULT 10,
 		history_retention_min INTEGER NOT NULL DEFAULT 1440,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -657,6 +658,25 @@ func (s *Storage) migrateSchema() error {
 			log.Printf("[storage-migration] adding column %s to heartbeat_registrations", col)
 			_, err := s.db.Exec(fmt.Sprintf(
 				"ALTER TABLE heartbeat_registrations ADD COLUMN %s TEXT NOT NULL DEFAULT ''", col))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	hmCfgColumns := []string{"alert_suppress_min"}
+	for _, col := range hmCfgColumns {
+		row := s.db.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('heatmap_config') WHERE name = ?
+		`, col)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			log.Printf("[storage-migration] adding column %s to heatmap_config", col)
+			_, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE heatmap_config ADD COLUMN %s INTEGER NOT NULL DEFAULT 10", col))
 			if err != nil {
 				return err
 			}
@@ -4077,30 +4097,38 @@ func (s *Storage) ListHotspotAlerts(lockName string, acknowledged *bool, limit i
 
 func (s *Storage) AcknowledgeHotspotAlert(id int64, acknowledgedBy string) error {
 	now := time.Now()
-	_, err := s.db.Exec(`
+	result, err := s.db.Exec(`
 		UPDATE heatmap_alerts SET acknowledged = 1, acknowledged_at = ?, acknowledged_by = ? WHERE id = ?
 	`, now, acknowledgedBy, id)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("alert %d not found", id)
+	}
+	return nil
 }
 
 func (s *Storage) GetHeatmapConfig() (*model.HeatmapConfig, error) {
 	row := s.db.QueryRow(`
-		SELECT window_minutes, alert_threshold_ms, top_n, history_retention_min
+		SELECT window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min
 		FROM heatmap_config WHERE id = 1
 	`)
 	var cfg model.HeatmapConfig
-	err := row.Scan(&cfg.WindowMinutes, &cfg.AlertThresholdMs, &cfg.TopN, &cfg.HistoryRetentionMin)
+	err := row.Scan(&cfg.WindowMinutes, &cfg.AlertThresholdMs, &cfg.AlertSuppressMin, &cfg.TopN, &cfg.HistoryRetentionMin)
 	if err == sql.ErrNoRows {
 		defaultCfg := &model.HeatmapConfig{
 			WindowMinutes:       5,
 			AlertThresholdMs:    5000,
+			AlertSuppressMin:    10,
 			TopN:                10,
 			HistoryRetentionMin: 1440,
 		}
 		_, err := s.db.Exec(`
-			INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, top_n, history_retention_min, updated_at)
-			VALUES (1, ?, ?, ?, ?, ?)
-		`, defaultCfg.WindowMinutes, defaultCfg.AlertThresholdMs, defaultCfg.TopN, defaultCfg.HistoryRetentionMin, time.Now())
+			INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min, updated_at)
+			VALUES (1, ?, ?, ?, ?, ?, ?)
+		`, defaultCfg.WindowMinutes, defaultCfg.AlertThresholdMs, defaultCfg.AlertSuppressMin, defaultCfg.TopN, defaultCfg.HistoryRetentionMin, time.Now())
 		if err != nil {
 			return nil, err
 		}
@@ -4109,19 +4137,26 @@ func (s *Storage) GetHeatmapConfig() (*model.HeatmapConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.AlertSuppressMin <= 0 {
+		cfg.AlertSuppressMin = 10
+	}
 	return &cfg, nil
 }
 
 func (s *Storage) UpdateHeatmapConfig(cfg *model.HeatmapConfig) error {
+	if cfg.AlertSuppressMin <= 0 {
+		cfg.AlertSuppressMin = 10
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, top_n, history_retention_min, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?)
+		INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			window_minutes = excluded.window_minutes,
 			alert_threshold_ms = excluded.alert_threshold_ms,
+			alert_suppress_min = excluded.alert_suppress_min,
 			top_n = excluded.top_n,
 			history_retention_min = excluded.history_retention_min,
 			updated_at = excluded.updated_at
-	`, cfg.WindowMinutes, cfg.AlertThresholdMs, cfg.TopN, cfg.HistoryRetentionMin, time.Now())
+	`, cfg.WindowMinutes, cfg.AlertThresholdMs, cfg.AlertSuppressMin, cfg.TopN, cfg.HistoryRetentionMin, time.Now())
 	return err
 }

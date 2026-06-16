@@ -1204,6 +1204,7 @@ type HotspotAlertEvent struct {
 type HeatmapConfig struct {
 	WindowMinutes       int     `json:"window_minutes"`
 	AlertThresholdMs    float64 `json:"alert_threshold_ms"`
+	AlertSuppressMin    int     `json:"alert_suppress_min"`
 	TopN                int     `json:"top_n"`
 	HistoryRetentionMin int     `json:"history_retention_min"`
 }
@@ -1229,6 +1230,7 @@ type HeatmapGlobalStats struct {
 type UpdateHeatmapConfigRequest struct {
 	WindowMinutes       *int     `json:"window_minutes"`
 	AlertThresholdMs    *float64 `json:"alert_threshold_ms"`
+	AlertSuppressMin    *int     `json:"alert_suppress_min"`
 	TopN                *int     `json:"top_n"`
 	HistoryRetentionMin *int     `json:"history_retention_min"`
 }
