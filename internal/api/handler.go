@@ -341,6 +341,18 @@ func (h *Handler) RenewLock(c *gin.Context) {
 		return
 	}
 
+	if h.heartbeatMgr != nil {
+		reg, _ := h.heartbeatMgr.GetStatus(req.Holder)
+		if reg != nil && reg.Status == model.HeartbeatStatusFrozen {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":          "caller resources are frozen, cannot renew lock",
+				"frozen":         true,
+				"caller_status":  model.HeartbeatStatusFrozen,
+			})
+			return
+		}
+	}
+
 	lease, err := h.auditMgr.RenewLock(name, req.Holder, req.AddSec)
 	if err != nil {
 		if errors.Is(err, audit.ErrCircuitBreakerOpen) {

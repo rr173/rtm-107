@@ -915,12 +915,40 @@ func seedHeartbeatDemoData(hbm *heartbeat.Manager, s *storage.Storage, lockMgr *
 		return fmt.Errorf("add lost event: %w", err)
 	}
 
+	{
+		leases, err := s.ListActiveLeases()
+		if err == nil {
+			for _, lease := range leases {
+				if lease.Holder == lostCaller {
+					if _, err := lockMgr.ReleaseLock(lease.LockName, lostCaller); err == nil {
+						log.Printf("[demo-heartbeat] actually released lock: %s (holder=%s)", lease.LockName, lostCaller)
+					}
+				}
+			}
+		}
+		_, _ = lockMgr.CancelWaitForHolder(lostCaller)
+
+		binding, err := s.GetCallerBinding(lostCaller)
+		if err == nil && binding != nil && binding.UsedTokens > 0 {
+			if err := rlMgr.ReturnTokens(lostCaller, binding.UsedTokens); err == nil {
+				log.Printf("[demo-heartbeat] actually returned %d tokens for caller: %s", binding.UsedTokens, lostCaller)
+			}
+		}
+
+		waitItems, err := s.ListWaitItemsByCaller(lostCaller)
+		if err == nil {
+			for _, item := range waitItems {
+				_ = s.RemoveWaitItem(item.ID)
+			}
+		}
+	}
+
 	disposalEvent := &model.HeartbeatEvent{
 		CallerID:   lostCaller,
 		EventType:  "disposal_executed",
 		FromStatus: model.HeartbeatStatusLost,
 		ToStatus:   model.HeartbeatStatusLost,
-		Detail:     "seeded demo: strategy=release_all: released locks, returned tokens, cancelled transactions",
+		Detail:     "strategy=release_all: released locks, returned tokens, cancelled transactions",
 		CreatedAt:  lostNextExpected.Add(1 * time.Second),
 	}
 	if err := s.AddHeartbeatEvent(disposalEvent); err != nil {
