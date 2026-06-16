@@ -1,0 +1,690 @@
+package heartbeat
+
+import (
+	"fmt"
+	"log"
+	"rtm-107/internal/lock"
+	"rtm-107/internal/model"
+	"rtm-107/internal/orchestration"
+	"rtm-107/internal/ratelimit"
+	"rtm-107/internal/storage"
+	"sync"
+	"time"
+)
+
+type Manager struct {
+	storage  *storage.Storage
+	lockMgr  *lock.Manager
+	rlMgr    *ratelimit.Manager
+	orchMgr  *orchestration.Manager
+	mu       sync.Mutex
+	stopCh   chan struct{}
+	ticker   *time.Ticker
+}
+
+func NewManager(s *storage.Storage, lm *lock.Manager, rlm *ratelimit.Manager, om *orchestration.Manager) *Manager {
+	return &Manager{
+		storage: s,
+		lockMgr: lm,
+		rlMgr:   rlm,
+		orchMgr: om,
+		stopCh:  make(chan struct{}),
+	}
+}
+
+func (m *Manager) Start() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	registrations, err := m.storage.ListHeartbeatRegistrations()
+	if err != nil {
+		return fmt.Errorf("load registrations: %w", err)
+	}
+
+	now := time.Now()
+	for _, reg := range registrations {
+		if reg.Status == model.HeartbeatStatusLost || reg.Status == model.HeartbeatStatusFrozen {
+			log.Printf("[heartbeat-manager] restored %s caller: %s (status=%s)", reg.Status, reg.CallerID, reg.Status)
+		} else if reg.NextExpectedAt.Before(now) {
+			missedDuration := now.Sub(reg.LastHeartbeatAt).Seconds()
+			allowedWindow := float64(reg.IntervalSec * reg.MaxMissed)
+			if missedDuration > allowedWindow {
+				log.Printf("[heartbeat-manager] caller %s already missed heartbeat window on startup, checking status", reg.CallerID)
+				go m.checkAndHandleCaller(reg.CallerID)
+			}
+		}
+	}
+
+	m.ticker = time.NewTicker(500 * time.Millisecond)
+	go m.heartbeatCheckLoop()
+
+	log.Printf("[heartbeat-manager] started with %d registered callers", len(registrations))
+	return nil
+}
+
+func (m *Manager) Stop() {
+	close(m.stopCh)
+	if m.ticker != nil {
+		m.ticker.Stop()
+	}
+	log.Println("[heartbeat-manager] stopped")
+}
+
+func (m *Manager) heartbeatCheckLoop() {
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-m.ticker.C:
+			m.checkAllCallers()
+		}
+	}
+}
+
+func (m *Manager) checkAllCallers() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	registrations, err := m.storage.ListHeartbeatRegistrations()
+	if err != nil {
+		log.Printf("[heartbeat-manager] list registrations error: %v", err)
+		return
+	}
+
+	now := time.Now()
+	for _, reg := range registrations {
+		if reg.Status == model.HeartbeatStatusFrozen {
+			continue
+		}
+
+		m.checkCallerLocked(&reg, now)
+	}
+}
+
+func (m *Manager) checkAndHandleCaller(callerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reg, err := m.storage.GetHeartbeatRegistration(callerID)
+	if err != nil {
+		log.Printf("[heartbeat-manager] get registration error: %v", err)
+		return
+	}
+	if reg == nil {
+		return
+	}
+
+	m.checkCallerLocked(reg, time.Now())
+}
+
+func (m *Manager) checkCallerLocked(reg *model.HeartbeatRegistration, now time.Time) {
+	if reg.Status == model.HeartbeatStatusFrozen {
+		return
+	}
+
+	allowedWindow := float64(reg.IntervalSec * reg.MaxMissed)
+	timeSinceLast := now.Sub(reg.LastHeartbeatAt).Seconds()
+
+	if timeSinceLast <= float64(reg.IntervalSec) {
+		if reg.Status == model.HeartbeatStatusSuspect {
+			reg.Status = model.HeartbeatStatusHealthy
+			reg.MissedCount = 0
+			reg.UpdatedAt = now
+			_ = m.storage.UpdateHeartbeatRegistration(reg)
+			m.addEventLocked(reg.CallerID, "status_change",
+				model.HeartbeatStatusSuspect, model.HeartbeatStatusHealthy,
+				fmt.Sprintf("heartbeat restored after %.1fs", timeSinceLast))
+		}
+		return
+	}
+
+	missedCount := int(timeSinceLast / float64(reg.IntervalSec))
+	reg.MissedCount = missedCount
+
+	if timeSinceLast > allowedWindow {
+		if reg.Status == model.HeartbeatStatusHealthy || reg.Status == model.HeartbeatStatusSuspect {
+			m.handleConnectionLostLocked(reg, now, timeSinceLast)
+		}
+	} else if timeSinceLast > float64(reg.IntervalSec) && reg.Status == model.HeartbeatStatusHealthy {
+		reg.Status = model.HeartbeatStatusSuspect
+		reg.UpdatedAt = now
+		_ = m.storage.UpdateHeartbeatRegistration(reg)
+		m.addEventLocked(reg.CallerID, "status_change",
+			model.HeartbeatStatusHealthy, model.HeartbeatStatusSuspect,
+			fmt.Sprintf("missed %.1fs of %ds interval, %.0f%% of allowed window",
+				timeSinceLast, reg.IntervalSec, (timeSinceLast/allowedWindow)*100))
+		log.Printf("[heartbeat-manager] caller %s suspect: missed %.1fs (allowed %.1fs)",
+			reg.CallerID, timeSinceLast, allowedWindow)
+	}
+}
+
+func (m *Manager) handleConnectionLostLocked(reg *model.HeartbeatRegistration, now time.Time, timeSinceLast float64) {
+	oldStatus := reg.Status
+	reg.Status = model.HeartbeatStatusLost
+	lostAt := now
+	reg.LostAt = &lostAt
+	reg.UpdatedAt = now
+	_ = m.storage.UpdateHeartbeatRegistration(reg)
+
+	m.addEventLocked(reg.CallerID, "connection_lost",
+		oldStatus, model.HeartbeatStatusLost,
+		fmt.Sprintf("no heartbeat for %.1fs (allowed %.1fs = %ds * %d)",
+			timeSinceLast, float64(reg.IntervalSec*reg.MaxMissed), reg.IntervalSec, reg.MaxMissed))
+
+	log.Printf("[heartbeat-manager] caller %s LOST: no heartbeat for %.1fs, strategy=%s",
+		reg.CallerID, timeSinceLast, reg.Strategy)
+
+	switch reg.Strategy {
+	case model.StrategyReleaseAll:
+		m.releaseAllResourcesLocked(reg.CallerID, now)
+	case model.StrategyReleaseLock:
+		m.releaseLocksOnlyLocked(reg.CallerID, now)
+	case model.StrategyFreeze:
+		m.freezeResourcesLocked(reg.CallerID, now)
+	}
+}
+
+func (m *Manager) releaseAllResourcesLocked(callerID string, now time.Time) {
+	log.Printf("[heartbeat-manager] releasing ALL resources for lost caller: %s", callerID)
+
+	m.releaseLocksOnlyLocked(callerID, now)
+	m.returnTokensLocked(callerID, now)
+	m.cancelOrchestrationTxsLocked(callerID, now)
+
+	m.addEventLocked(callerID, "disposal_executed",
+		model.HeartbeatStatusLost, model.HeartbeatStatusLost,
+		"strategy=release_all: released locks, returned tokens, cancelled transactions")
+}
+
+func (m *Manager) releaseLocksOnlyLocked(callerID string, now time.Time) {
+	log.Printf("[heartbeat-manager] releasing locks for lost caller: %s", callerID)
+
+	leases, err := m.storage.ListActiveLeases()
+	if err != nil {
+		log.Printf("[heartbeat-manager] list leases error: %v", err)
+		return
+	}
+
+	releasedCount := 0
+	for _, lease := range leases {
+		if lease.Holder == callerID {
+			if _, err := m.lockMgr.ReleaseLock(lease.LockName, callerID); err != nil {
+				log.Printf("[heartbeat-manager] release lock %s error: %v", lease.LockName, err)
+			} else {
+				releasedCount++
+				log.Printf("[heartbeat-manager] released lock: %s (holder=%s)", lease.LockName, callerID)
+			}
+		}
+	}
+
+	_, _ = m.lockMgr.CancelWaitForHolder(callerID)
+
+	if releasedCount > 0 {
+		m.addEventLocked(callerID, "locks_released",
+			model.HeartbeatStatusLost, model.HeartbeatStatusLost,
+			fmt.Sprintf("released %d active locks", releasedCount))
+	}
+}
+
+func (m *Manager) returnTokensLocked(callerID string, now time.Time) {
+	log.Printf("[heartbeat-manager] returning tokens for lost caller: %s", callerID)
+
+	binding, err := m.storage.GetCallerBinding(callerID)
+	if err != nil {
+		log.Printf("[heartbeat-manager] get caller binding error: %v", err)
+		return
+	}
+	if binding == nil {
+		log.Printf("[heartbeat-manager] no caller binding for: %s", callerID)
+		return
+	}
+
+	if binding.UsedTokens > 0 {
+		if err := m.rlMgr.ReturnTokens(callerID, binding.UsedTokens); err != nil {
+			log.Printf("[heartbeat-manager] return tokens error: %v", err)
+		} else {
+			log.Printf("[heartbeat-manager] returned %d tokens for caller: %s", binding.UsedTokens, callerID)
+			m.addEventLocked(callerID, "tokens_returned",
+				model.HeartbeatStatusLost, model.HeartbeatStatusLost,
+				fmt.Sprintf("returned %d used tokens to quota pool", binding.UsedTokens))
+		}
+	}
+
+	waitItems, err := m.storage.ListWaitItemsByCaller(callerID)
+	if err != nil {
+		log.Printf("[heartbeat-manager] list wait items error: %v", err)
+	} else {
+		for _, item := range waitItems {
+			_ = m.storage.RemoveWaitItem(item.ID)
+		}
+	}
+}
+
+func (m *Manager) cancelOrchestrationTxsLocked(callerID string, now time.Time) {
+	log.Printf("[heartbeat-manager] cancelling orchestration transactions for lost caller: %s", callerID)
+
+	txs, err := m.storage.ListOrchTxs(string(model.TxStatusCommitted))
+	if err != nil {
+		log.Printf("[heartbeat-manager] list txs error: %v", err)
+		return
+	}
+
+	cancelledCount := 0
+	for _, tx := range txs {
+		if tx.Holder == callerID {
+			if _, err := m.orchMgr.ReleaseTx(tx.ID, callerID); err != nil {
+				log.Printf("[heartbeat-manager] cancel tx %s error: %v", tx.ID, err)
+			} else {
+				cancelledCount++
+				log.Printf("[heartbeat-manager] cancelled orchestration tx: %s (holder=%s)", tx.ID, callerID)
+			}
+		}
+	}
+
+	if cancelledCount > 0 {
+		m.addEventLocked(callerID, "transactions_cancelled",
+			model.HeartbeatStatusLost, model.HeartbeatStatusLost,
+			fmt.Sprintf("cancelled %d active orchestration transactions", cancelledCount))
+	}
+}
+
+func (m *Manager) freezeResourcesLocked(callerID string, now time.Time) {
+	log.Printf("[heartbeat-manager] FREEZING resources for lost caller: %s", callerID)
+
+	reg, _ := m.storage.GetHeartbeatRegistration(callerID)
+	if reg != nil {
+		reg.Status = model.HeartbeatStatusFrozen
+		frozenAt := now
+		reg.FrozenAt = &frozenAt
+		reg.UpdatedAt = now
+		_ = m.storage.UpdateHeartbeatRegistration(reg)
+	}
+
+	leases, err := m.storage.ListActiveLeases()
+	if err != nil {
+		log.Printf("[heartbeat-manager] list leases error: %v", err)
+		return
+	}
+
+	frozenCount := 0
+	for _, lease := range leases {
+		if lease.Holder == callerID {
+			fr := &model.FrozenResource{
+				CallerID:     callerID,
+				ResourceType: "lock",
+				ResourceKey:  lease.LockName,
+				FrozenAt:     now,
+			}
+			if err := m.storage.CreateFrozenResource(fr); err != nil {
+				log.Printf("[heartbeat-manager] freeze lock %s error: %v", lease.LockName, err)
+			} else {
+				frozenCount++
+				log.Printf("[heartbeat-manager] frozen lock: %s", lease.LockName)
+			}
+		}
+	}
+
+	binding, _ := m.storage.GetCallerBinding(callerID)
+	if binding != nil && binding.UsedTokens > 0 {
+		fr := &model.FrozenResource{
+			CallerID:     callerID,
+			ResourceType: "tokens",
+			ResourceKey:  binding.PolicyName,
+			FrozenAt:     now,
+		}
+		if err := m.storage.CreateFrozenResource(fr); err != nil {
+			log.Printf("[heartbeat-manager] freeze tokens error: %v", err)
+		} else {
+			frozenCount++
+			log.Printf("[heartbeat-manager] frozen %d tokens for policy: %s", binding.UsedTokens, binding.PolicyName)
+		}
+	}
+
+	txs, _ := m.storage.ListOrchTxs(string(model.TxStatusCommitted))
+	for _, tx := range txs {
+		if tx.Holder == callerID {
+			fr := &model.FrozenResource{
+				CallerID:     callerID,
+				ResourceType: "orchestration_tx",
+				ResourceKey:  tx.ID,
+				FrozenAt:     now,
+			}
+			if err := m.storage.CreateFrozenResource(fr); err != nil {
+				log.Printf("[heartbeat-manager] freeze tx %s error: %v", tx.ID, err)
+			} else {
+				frozenCount++
+				log.Printf("[heartbeat-manager] frozen orchestration tx: %s", tx.ID)
+			}
+		}
+	}
+
+	m.addEventLocked(callerID, "resources_frozen",
+		model.HeartbeatStatusLost, model.HeartbeatStatusFrozen,
+		fmt.Sprintf("frozen %d resources awaiting manual confirmation", frozenCount))
+}
+
+func (m *Manager) Register(callerID string, intervalSec int, maxMissed int, strategy model.DisposalStrategy) (*model.HeartbeatRegistration, error) {
+	if intervalSec <= 0 {
+		return nil, fmt.Errorf("interval_sec must be positive")
+	}
+	if maxMissed <= 0 {
+		return nil, fmt.Errorf("max_missed must be positive")
+	}
+	if strategy != model.StrategyReleaseAll &&
+		strategy != model.StrategyReleaseLock &&
+		strategy != model.StrategyFreeze {
+		return nil, fmt.Errorf("invalid strategy: %s", strategy)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing, err := m.storage.GetHeartbeatRegistration(callerID)
+	if err != nil {
+		return nil, fmt.Errorf("check existing: %w", err)
+	}
+	if existing != nil && existing.Status != model.HeartbeatStatusLost && existing.Status != model.HeartbeatStatusRecovered {
+		return nil, fmt.Errorf("caller already registered with status: %s", existing.Status)
+	}
+
+	now := time.Now()
+	reg := &model.HeartbeatRegistration{
+		CallerID:        callerID,
+		IntervalSec:     intervalSec,
+		MaxMissed:       maxMissed,
+		Strategy:        strategy,
+		LastHeartbeatAt: now,
+		NextExpectedAt:  now.Add(time.Duration(intervalSec) * time.Second),
+		MissedCount:     0,
+		Status:          model.HeartbeatStatusHealthy,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	if err := m.storage.CreateHeartbeatRegistration(reg); err != nil {
+		return nil, fmt.Errorf("create registration: %w", err)
+	}
+
+	m.addEventLocked(callerID, "registered", "", model.HeartbeatStatusHealthy,
+		fmt.Sprintf("registered with interval=%ds, max_missed=%d, strategy=%s", intervalSec, maxMissed, strategy))
+
+	log.Printf("[heartbeat-manager] registered caller: %s (interval=%ds, max_missed=%d, strategy=%s)",
+		callerID, intervalSec, maxMissed, strategy)
+
+	return reg, nil
+}
+
+func (m *Manager) ReportHeartbeat(callerID string) (*model.HeartbeatRegistration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reg, err := m.storage.GetHeartbeatRegistration(callerID)
+	if err != nil {
+		return nil, fmt.Errorf("get registration: %w", err)
+	}
+	if reg == nil {
+		return nil, fmt.Errorf("caller not registered: %s", callerID)
+	}
+
+	now := time.Now()
+
+	if reg.Status == model.HeartbeatStatusFrozen {
+		return nil, fmt.Errorf("caller resources are frozen, cannot renew heartbeat")
+	}
+
+	reg.LastHeartbeatAt = now
+	reg.NextExpectedAt = now.Add(time.Duration(reg.IntervalSec) * time.Second)
+	reg.MissedCount = 0
+
+	if reg.Status == model.HeartbeatStatusLost {
+		reg.Status = model.HeartbeatStatusRecovered
+		recoveredAt := now
+		reg.RecoveredAt = &recoveredAt
+		m.addEventLocked(callerID, "recovered",
+			model.HeartbeatStatusLost, model.HeartbeatStatusRecovered,
+			fmt.Sprintf("caller recovered after %.1fs outage. NOTE: previously released resources are NOT restored automatically.",
+				now.Sub(*reg.LostAt).Seconds()))
+		log.Printf("[heartbeat-manager] caller %s RECOVERED after %.1fs outage",
+			callerID, now.Sub(*reg.LostAt).Seconds())
+	} else if reg.Status == model.HeartbeatStatusSuspect {
+		reg.Status = model.HeartbeatStatusHealthy
+		m.addEventLocked(callerID, "recovered",
+			model.HeartbeatStatusSuspect, model.HeartbeatStatusHealthy,
+			"heartbeat resumed after temporary suspension")
+	} else {
+		reg.Status = model.HeartbeatStatusHealthy
+	}
+
+	reg.UpdatedAt = now
+	if err := m.storage.UpdateHeartbeatRegistration(reg); err != nil {
+		return nil, fmt.Errorf("update registration: %w", err)
+	}
+
+	return reg, nil
+}
+
+func (m *Manager) GetStatus(callerID string) (*model.HeartbeatStatusInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reg, err := m.storage.GetHeartbeatRegistration(callerID)
+	if err != nil {
+		return nil, fmt.Errorf("get registration: %w", err)
+	}
+	if reg == nil {
+		return nil, fmt.Errorf("caller not registered: %s", callerID)
+	}
+
+	now := time.Now()
+	info := &model.HeartbeatStatusInfo{
+		CallerID:         reg.CallerID,
+		Status:           reg.Status,
+		IntervalSec:      reg.IntervalSec,
+		MaxMissed:        reg.MaxMissed,
+		LastHeartbeatAt:  reg.LastHeartbeatAt,
+		NextExpectedAt:   reg.NextExpectedAt,
+		MissedCount:      reg.MissedCount,
+		Strategy:         reg.Strategy,
+		SecondsSinceLast: now.Sub(reg.LastHeartbeatAt).Seconds(),
+	}
+
+	return info, nil
+}
+
+func (m *Manager) ListAllStatuses() ([]model.HeartbeatStatusInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	registrations, err := m.storage.ListHeartbeatRegistrations()
+	if err != nil {
+		return nil, fmt.Errorf("list registrations: %w", err)
+	}
+
+	now := time.Now()
+	result := make([]model.HeartbeatStatusInfo, 0, len(registrations))
+	for _, reg := range registrations {
+		info := model.HeartbeatStatusInfo{
+			CallerID:         reg.CallerID,
+			Status:           reg.Status,
+			IntervalSec:      reg.IntervalSec,
+			MaxMissed:        reg.MaxMissed,
+			LastHeartbeatAt:  reg.LastHeartbeatAt,
+			NextExpectedAt:   reg.NextExpectedAt,
+			MissedCount:      reg.MissedCount,
+			Strategy:         reg.Strategy,
+			SecondsSinceLast: now.Sub(reg.LastHeartbeatAt).Seconds(),
+		}
+		result = append(result, info)
+	}
+
+	return result, nil
+}
+
+func (m *Manager) GetReport() (*model.HeartbeatReport, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	registrations, err := m.storage.ListHeartbeatRegistrations()
+	if err != nil {
+		return nil, fmt.Errorf("list registrations: %w", err)
+	}
+
+	report := &model.HeartbeatReport{
+		RegisteredCount: len(registrations),
+	}
+
+	for _, reg := range registrations {
+		switch reg.Status {
+		case model.HeartbeatStatusHealthy:
+			report.HealthyCount++
+		case model.HeartbeatStatusSuspect:
+			report.SuspectCount++
+		case model.HeartbeatStatusLost:
+			report.LostCount++
+		case model.HeartbeatStatusFrozen:
+			report.FrozenCount++
+		case model.HeartbeatStatusRecovered:
+			report.RecoveredCount++
+		}
+	}
+
+	return report, nil
+}
+
+func (m *Manager) ListEvents(callerID string, limit int) ([]model.HeartbeatEvent, error) {
+	return m.storage.ListHeartbeatEvents(callerID, limit)
+}
+
+func (m *Manager) ListFrozenResources(callerID string) ([]model.FrozenResource, error) {
+	return m.storage.ListFrozenResources(callerID)
+}
+
+func (m *Manager) ReleaseFrozenResource(id int64, callerID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	frozen, err := m.storage.ListFrozenResources(callerID)
+	if err != nil {
+		return fmt.Errorf("list frozen resources: %w", err)
+	}
+
+	var target *model.FrozenResource
+	for _, f := range frozen {
+		if f.ID == id {
+			target = &f
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("frozen resource not found or not owned by caller: %d", id)
+	}
+
+	now := time.Now()
+	if err := m.storage.ReleaseFrozenResource(id, now); err != nil {
+		return fmt.Errorf("release frozen resource: %w", err)
+	}
+
+	switch target.ResourceType {
+	case "lock":
+		if _, err := m.lockMgr.ReleaseLock(target.ResourceKey, callerID); err != nil {
+			log.Printf("[heartbeat-manager] release frozen lock %s error: %v", target.ResourceKey, err)
+		} else {
+			log.Printf("[heartbeat-manager] released frozen lock: %s for caller: %s", target.ResourceKey, callerID)
+		}
+	case "tokens":
+		binding, _ := m.storage.GetCallerBinding(callerID)
+		if binding != nil && binding.UsedTokens > 0 {
+			if err := m.rlMgr.ReturnTokens(callerID, binding.UsedTokens); err != nil {
+				log.Printf("[heartbeat-manager] return frozen tokens error: %v", err)
+			} else {
+				log.Printf("[heartbeat-manager] returned frozen tokens for caller: %s", callerID)
+			}
+		}
+	case "orchestration_tx":
+		if _, err := m.orchMgr.ReleaseTx(target.ResourceKey, callerID); err != nil {
+			log.Printf("[heartbeat-manager] cancel frozen tx %s error: %v", target.ResourceKey, err)
+		} else {
+			log.Printf("[heartbeat-manager] cancelled frozen tx: %s for caller: %s", target.ResourceKey, callerID)
+		}
+	}
+
+	reg, _ := m.storage.GetHeartbeatRegistration(callerID)
+	if reg != nil {
+		remaining, _ := m.storage.ListFrozenResources(callerID)
+		if len(remaining) == 0 {
+			reg.Status = model.HeartbeatStatusRecovered
+			reg.UpdatedAt = now
+			_ = m.storage.UpdateHeartbeatRegistration(reg)
+			m.addEventLocked(callerID, "frozen_resources_released",
+				model.HeartbeatStatusFrozen, model.HeartbeatStatusRecovered,
+				fmt.Sprintf("released frozen resource id=%d (%s: %s), all resources now released",
+					id, target.ResourceType, target.ResourceKey))
+		} else {
+			m.addEventLocked(callerID, "frozen_resource_released",
+				model.HeartbeatStatusFrozen, model.HeartbeatStatusFrozen,
+				fmt.Sprintf("released frozen resource id=%d (%s: %s), %d remaining",
+					id, target.ResourceType, target.ResourceKey, len(remaining)))
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) ReleaseAllFrozenResources(callerID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	frozen, err := m.storage.ListFrozenResources(callerID)
+	if err != nil {
+		return fmt.Errorf("list frozen resources: %w", err)
+	}
+
+	now := time.Now()
+	for _, f := range frozen {
+		if err := m.storage.ReleaseFrozenResource(f.ID, now); err != nil {
+			log.Printf("[heartbeat-manager] release frozen resource %d error: %v", f.ID, err)
+			continue
+		}
+
+		switch f.ResourceType {
+		case "lock":
+			_, _ = m.lockMgr.ReleaseLock(f.ResourceKey, callerID)
+		case "tokens":
+			binding, _ := m.storage.GetCallerBinding(callerID)
+			if binding != nil && binding.UsedTokens > 0 {
+				_ = m.rlMgr.ReturnTokens(callerID, binding.UsedTokens)
+			}
+		case "orchestration_tx":
+			_, _ = m.orchMgr.ReleaseTx(f.ResourceKey, callerID)
+		}
+	}
+
+	if err := m.storage.ReleaseAllFrozenResources(callerID, now); err != nil {
+		log.Printf("[heartbeat-manager] release all frozen resources error: %v", err)
+	}
+
+	reg, _ := m.storage.GetHeartbeatRegistration(callerID)
+	if reg != nil {
+		reg.Status = model.HeartbeatStatusRecovered
+		reg.UpdatedAt = now
+		_ = m.storage.UpdateHeartbeatRegistration(reg)
+		m.addEventLocked(callerID, "all_frozen_released",
+			model.HeartbeatStatusFrozen, model.HeartbeatStatusRecovered,
+			fmt.Sprintf("manually released all %d frozen resources", len(frozen)))
+	}
+
+	log.Printf("[heartbeat-manager] manually released all %d frozen resources for caller: %s", len(frozen), callerID)
+	return nil
+}
+
+func (m *Manager) addEventLocked(callerID string, eventType string, from, to model.HeartbeatStatus, detail string) {
+	event := &model.HeartbeatEvent{
+		CallerID:  callerID,
+		EventType: eventType,
+		FromStatus: from,
+		ToStatus:   to,
+		Detail:     detail,
+		CreatedAt:  time.Now(),
+	}
+	_ = m.storage.AddHeartbeatEvent(event)
+}

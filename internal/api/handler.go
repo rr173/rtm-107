@@ -6,6 +6,7 @@ import (
 	"rtm-107/internal/audit"
 	"rtm-107/internal/debt"
 	"rtm-107/internal/handover"
+	"rtm-107/internal/heartbeat"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -28,10 +29,11 @@ type Handler struct {
 	shadowMgr    *shadow.Manager
 	debtMgr      *debt.Manager
 	handoverMgr  *handover.Manager
+	heartbeatMgr *heartbeat.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager) *Handler {
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -208,6 +210,21 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			handoverGroup.GET("/callers/:caller", h.ListCallerHandovers)
 			handoverGroup.GET("/callers/:caller/summary", h.GetCallerHandoverSummary)
 			handoverGroup.GET("/:id/timeline", h.GetHandoverTimeline)
+		}
+
+		heartbeatGroup := api.Group("/heartbeat")
+		{
+			heartbeatGroup.POST("/register", h.RegisterHeartbeat)
+			heartbeatGroup.POST("/report/:caller_id", h.ReportHeartbeat)
+			heartbeatGroup.GET("/status/:caller_id", h.GetHeartbeatStatus)
+			heartbeatGroup.GET("/statuses", h.ListAllHeartbeatStatuses)
+			heartbeatGroup.GET("/report", h.GetHeartbeatReport)
+			heartbeatGroup.GET("/events", h.ListHeartbeatEvents)
+			heartbeatGroup.GET("/events/:caller_id", h.GetCallerHeartbeatEvents)
+			heartbeatGroup.GET("/frozen", h.ListAllFrozenResources)
+			heartbeatGroup.GET("/frozen/:caller_id", h.GetCallerFrozenResources)
+			heartbeatGroup.POST("/frozen/:caller_id/release/:id", h.ReleaseFrozenResource)
+			heartbeatGroup.POST("/frozen/:caller_id/release-all", h.ReleaseAllFrozenResources)
 		}
 	}
 }
@@ -1786,4 +1803,173 @@ func (h *Handler) GetHandoverTimeline(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"timeline": hando.Timeline, "handover_id": id})
+}
+
+func (h *Handler) RegisterHeartbeat(c *gin.Context) {
+	var req model.RegisterHeartbeatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	reg, err := h.heartbeatMgr.Register(req.CallerID, req.IntervalSec, req.MaxMissed, req.Strategy)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"registration": reg})
+}
+
+func (h *Handler) ReportHeartbeat(c *gin.Context) {
+	callerID := c.Param("caller_id")
+	if callerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller_id is required"})
+		return
+	}
+
+	reg, err := h.heartbeatMgr.ReportHeartbeat(callerID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "registration": reg})
+}
+
+func (h *Handler) GetHeartbeatStatus(c *gin.Context) {
+	callerID := c.Param("caller_id")
+	if callerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller_id is required"})
+		return
+	}
+
+	status, err := h.heartbeatMgr.GetStatus(callerID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": status})
+}
+
+func (h *Handler) ListAllHeartbeatStatuses(c *gin.Context) {
+	statuses, err := h.heartbeatMgr.ListAllStatuses()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"statuses": statuses, "count": len(statuses)})
+}
+
+func (h *Handler) GetHeartbeatReport(c *gin.Context) {
+	report, err := h.heartbeatMgr.GetReport()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"report": report})
+}
+
+func (h *Handler) ListHeartbeatEvents(c *gin.Context) {
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		limit = 100
+	}
+
+	events, err := h.heartbeatMgr.ListEvents("", limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"events": events, "count": len(events)})
+}
+
+func (h *Handler) GetCallerHeartbeatEvents(c *gin.Context) {
+	callerID := c.Param("caller_id")
+	if callerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller_id is required"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		limit = 100
+	}
+
+	events, err := h.heartbeatMgr.ListEvents(callerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"caller_id": callerID, "events": events, "count": len(events)})
+}
+
+func (h *Handler) ListAllFrozenResources(c *gin.Context) {
+	resources, err := h.heartbeatMgr.ListFrozenResources("")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"frozen_resources": resources, "count": len(resources)})
+}
+
+func (h *Handler) GetCallerFrozenResources(c *gin.Context) {
+	callerID := c.Param("caller_id")
+	if callerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller_id is required"})
+		return
+	}
+
+	resources, err := h.heartbeatMgr.ListFrozenResources(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"caller_id": callerID, "frozen_resources": resources, "count": len(resources)})
+}
+
+func (h *Handler) ReleaseFrozenResource(c *gin.Context) {
+	callerID := c.Param("caller_id")
+	idStr := c.Param("id")
+	if callerID == "" || idStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller_id and id are required"})
+		return
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource id"})
+		return
+	}
+
+	if err := h.heartbeatMgr.ReleaseFrozenResource(id, callerID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "frozen resource released"})
+}
+
+func (h *Handler) ReleaseAllFrozenResources(c *gin.Context) {
+	callerID := c.Param("caller_id")
+	if callerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller_id is required"})
+		return
+	}
+
+	if err := h.heartbeatMgr.ReleaseAllFrozenResources(callerID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "all frozen resources released"})
 }

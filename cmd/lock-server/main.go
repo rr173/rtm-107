@@ -8,6 +8,7 @@ import (
 	"rtm-107/internal/audit"
 	"rtm-107/internal/debt"
 	"rtm-107/internal/handover"
+	"rtm-107/internal/heartbeat"
 	"rtm-107/internal/lock"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
@@ -86,6 +87,12 @@ func main() {
 	}
 	defer handoverMgr.Stop()
 
+	heartbeatMgr := heartbeat.NewManager(s, mgr, rlMgr, orchMgr)
+	if err := heartbeatMgr.Start(); err != nil {
+		log.Fatalf("start heartbeat manager: %v", err)
+	}
+	defer heartbeatMgr.Stop()
+
 	if err := seedDemoData(mgr, rlMgr); err != nil {
 		log.Printf("seed demo data: %v", err)
 	}
@@ -114,6 +121,10 @@ func main() {
 		log.Printf("seed handover demo data: %v", err)
 	}
 
+	if err := seedHeartbeatDemoData(heartbeatMgr, s, mgr, rlMgr); err != nil {
+		log.Printf("seed heartbeat demo data: %v", err)
+	}
+
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -127,7 +138,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -812,6 +823,123 @@ func seedHandoverDemoData(hm *handover.Manager, lockMgr *lock.Manager, rlMgr *ra
 	log.Println("[demo-handover] tip: view cancelled handover via GET /api/v1/handovers?status=cancelled")
 	log.Println("[demo-handover] tip: view alice's outgoing/incoming via GET /api/v1/handovers/callers/alice/summary")
 	log.Println("[demo-handover] tip: view handover timeline via GET /api/v1/handovers/<id>/timeline")
+
+	return nil
+}
+
+func seedHeartbeatDemoData(hbm *heartbeat.Manager, s *storage.Storage, lockMgr *lock.Manager, rlMgr *ratelimit.Manager) error {
+	existing, err := s.ListHeartbeatRegistrations()
+	if err != nil {
+		return err
+	}
+	if len(existing) > 0 {
+		log.Println("[demo-heartbeat] heartbeat data already exists, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-heartbeat] seeding heartbeat demo data...")
+
+	healthyCaller := "service-healthy"
+	lostCaller := "service-lost"
+
+	if _, err := lockMgr.AcquireLock("heartbeat-demo-lock-1", healthyCaller, 3600, false); err != nil {
+		log.Printf("[demo-heartbeat] acquire lock for healthy caller warning: %v", err)
+	} else {
+		log.Printf("[demo-heartbeat] %s acquired lock: heartbeat-demo-lock-1", healthyCaller)
+	}
+
+	if _, err := lockMgr.AcquireLock("heartbeat-demo-lock-2", lostCaller, 3600, false); err != nil {
+		log.Printf("[demo-heartbeat] acquire lock for lost caller warning: %v", err)
+	} else {
+		log.Printf("[demo-heartbeat] %s acquired lock: heartbeat-demo-lock-2", lostCaller)
+	}
+
+	if _, err := rlMgr.BindCaller(healthyCaller, "token-bucket-policy", 50); err != nil {
+		log.Printf("[demo-heartbeat] bind healthy caller warning: %v", err)
+	} else {
+		log.Printf("[demo-heartbeat] bound %s to token-bucket-policy (quota=50)", healthyCaller)
+	}
+
+	if _, err := rlMgr.BindCaller(lostCaller, "sliding-window-policy", 30); err != nil {
+		log.Printf("[demo-heartbeat] bind lost caller warning: %v", err)
+	} else {
+		log.Printf("[demo-heartbeat] bound %s to sliding-window-policy (quota=30)", lostCaller)
+	}
+
+	if result, err := rlMgr.RequestTokens(healthyCaller, 5, false, 0); err == nil && result.Allowed {
+		log.Printf("[demo-heartbeat] %s requested 5 tokens, remaining=%d", healthyCaller, result.Remaining)
+	}
+
+	if result, err := rlMgr.RequestTokens(lostCaller, 3, false, 0); err == nil && result.Allowed {
+		log.Printf("[demo-heartbeat] %s requested 3 tokens, remaining=%d", lostCaller, result.Remaining)
+	}
+
+	healthyReg, err := hbm.Register(healthyCaller, 5, 3, model.StrategyReleaseAll)
+	if err != nil {
+		return fmt.Errorf("register healthy caller: %w", err)
+	}
+	log.Printf("[demo-heartbeat] registered %s: interval=%ds, max_missed=%d, strategy=%s",
+		healthyCaller, healthyReg.IntervalSec, healthyReg.MaxMissed, healthyReg.Strategy)
+
+	lostReg, err := hbm.Register(lostCaller, 5, 3, model.StrategyReleaseAll)
+	if err != nil {
+		return fmt.Errorf("register lost caller: %w", err)
+	}
+	log.Printf("[demo-heartbeat] registered %s: interval=%ds, max_missed=%d, strategy=%s",
+		lostCaller, lostReg.IntervalSec, lostReg.MaxMissed, lostReg.Strategy)
+
+	now := time.Now()
+	lostLastHeartbeat := now.Add(-30 * time.Second)
+	lostNextExpected := now.Add(-25 * time.Second)
+
+	lostReg.LastHeartbeatAt = lostLastHeartbeat
+	lostReg.NextExpectedAt = lostNextExpected
+	lostReg.MissedCount = 6
+	lostReg.Status = model.HeartbeatStatusLost
+	lostReg.LostAt = &lostNextExpected
+	lostReg.UpdatedAt = now
+
+	if err := s.UpdateHeartbeatRegistration(lostReg); err != nil {
+		return fmt.Errorf("update lost caller status: %w", err)
+	}
+
+	lostEvent := &model.HeartbeatEvent{
+		CallerID:   lostCaller,
+		EventType:  "connection_lost",
+		FromStatus: model.HeartbeatStatusHealthy,
+		ToStatus:   model.HeartbeatStatusLost,
+		Detail:     fmt.Sprintf("seeded demo: no heartbeat for 30s (allowed 15s = 5s * 3)"),
+		CreatedAt:  lostNextExpected,
+	}
+	if err := s.AddHeartbeatEvent(lostEvent); err != nil {
+		return fmt.Errorf("add lost event: %w", err)
+	}
+
+	disposalEvent := &model.HeartbeatEvent{
+		CallerID:   lostCaller,
+		EventType:  "disposal_executed",
+		FromStatus: model.HeartbeatStatusLost,
+		ToStatus:   model.HeartbeatStatusLost,
+		Detail:     "seeded demo: strategy=release_all: released locks, returned tokens, cancelled transactions",
+		CreatedAt:  lostNextExpected.Add(1 * time.Second),
+	}
+	if err := s.AddHeartbeatEvent(disposalEvent); err != nil {
+		return fmt.Errorf("add disposal event: %w", err)
+	}
+
+	log.Printf("[demo-heartbeat] set %s status to LOST (simulated 30s outage)", lostCaller)
+	log.Printf("[demo-heartbeat] lost event recorded at %s", lostNextExpected.Format(time.RFC3339))
+
+	log.Println("[demo-heartbeat] demo data seeded successfully:")
+	log.Printf("[demo-heartbeat]   - %s: HEALTHY (interval=5s, max_missed=3)", healthyCaller)
+	log.Printf("[demo-heartbeat]   - %s: LOST (30s outage, resources auto-released)", lostCaller)
+	log.Println("[demo-heartbeat] tips:")
+	log.Println("[demo-heartbeat]   GET /api/v1/heartbeat/statuses - view all caller statuses")
+	log.Println("[demo-heartbeat]   GET /api/v1/heartbeat/report - view summary report")
+	log.Println("[demo-heartbeat]   GET /api/v1/heartbeat/events - view all events")
+	log.Println("[demo-heartbeat]   GET /api/v1/heartbeat/events/service-lost - view lost caller's events")
+	log.Println("[demo-heartbeat]   POST /api/v1/heartbeat/report/service-healthy - report heartbeat")
+	log.Println("[demo-heartbeat]   GET /api/v1/heartbeat/frozen - view frozen resources")
 
 	return nil
 }

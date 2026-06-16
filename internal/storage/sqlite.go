@@ -489,6 +489,50 @@ func (s *Storage) initSchema() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_ht_handover ON handover_timeline(handover_id);
+
+	CREATE TABLE IF NOT EXISTS heartbeat_registrations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		interval_sec INTEGER NOT NULL,
+		max_missed INTEGER NOT NULL,
+		strategy TEXT NOT NULL,
+		last_heartbeat_at DATETIME NOT NULL,
+		next_expected_at DATETIME NOT NULL,
+		missed_count INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'healthy',
+		frozen_at DATETIME,
+		lost_at DATETIME,
+		recovered_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS heartbeat_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		from_status TEXT,
+		to_status TEXT,
+		detail TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS frozen_resources (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		resource_type TEXT NOT NULL,
+		resource_key TEXT NOT NULL,
+		frozen_at DATETIME NOT NULL,
+		released_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_hb_reg_status ON heartbeat_registrations(status);
+	CREATE INDEX IF NOT EXISTS idx_hb_reg_caller ON heartbeat_registrations(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_hb_events_caller ON heartbeat_events(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_hb_events_type ON heartbeat_events(event_type);
+	CREATE INDEX IF NOT EXISTS idx_frozen_caller ON frozen_resources(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_frozen_released ON frozen_resources(released_at);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -3260,4 +3304,265 @@ func nullTimePtr(t *time.Time) interface{} {
 		return nil
 	}
 	return *t
+}
+
+func (s *Storage) CreateHeartbeatRegistration(h *model.HeartbeatRegistration) error {
+	result, err := s.db.Exec(`
+		INSERT INTO heartbeat_registrations (
+			caller_id, interval_sec, max_missed, strategy,
+			last_heartbeat_at, next_expected_at, missed_count, status,
+			frozen_at, lost_at, recovered_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			interval_sec = excluded.interval_sec,
+			max_missed = excluded.max_missed,
+			strategy = excluded.strategy,
+			last_heartbeat_at = excluded.last_heartbeat_at,
+			next_expected_at = excluded.next_expected_at,
+			missed_count = excluded.missed_count,
+			status = excluded.status,
+			frozen_at = excluded.frozen_at,
+			lost_at = excluded.lost_at,
+			recovered_at = excluded.recovered_at,
+			updated_at = excluded.updated_at
+	`, h.CallerID, h.IntervalSec, h.MaxMissed, h.Strategy,
+		h.LastHeartbeatAt, h.NextExpectedAt, h.MissedCount, h.Status,
+		nullTimePtr(h.FrozenAt), nullTimePtr(h.LostAt), nullTimePtr(h.RecoveredAt),
+		h.CreatedAt, h.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if h.ID == 0 {
+		h.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetHeartbeatRegistration(callerID string) (*model.HeartbeatRegistration, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, interval_sec, max_missed, strategy,
+			last_heartbeat_at, next_expected_at, missed_count, status,
+			frozen_at, lost_at, recovered_at, created_at, updated_at
+		FROM heartbeat_registrations WHERE caller_id = ?
+	`, callerID)
+
+	var h model.HeartbeatRegistration
+	var frozenAt, lostAt, recoveredAt sql.NullTime
+	err := row.Scan(&h.ID, &h.CallerID, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
+		&h.LastHeartbeatAt, &h.NextExpectedAt, &h.MissedCount, &h.Status,
+		&frozenAt, &lostAt, &recoveredAt, &h.CreatedAt, &h.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if frozenAt.Valid {
+		h.FrozenAt = &frozenAt.Time
+	}
+	if lostAt.Valid {
+		h.LostAt = &lostAt.Time
+	}
+	if recoveredAt.Valid {
+		h.RecoveredAt = &recoveredAt.Time
+	}
+	return &h, nil
+}
+
+func (s *Storage) UpdateHeartbeatRegistration(h *model.HeartbeatRegistration) error {
+	_, err := s.db.Exec(`
+		UPDATE heartbeat_registrations SET
+			interval_sec = ?,
+			max_missed = ?,
+			strategy = ?,
+			last_heartbeat_at = ?,
+			next_expected_at = ?,
+			missed_count = ?,
+			status = ?,
+			frozen_at = ?,
+			lost_at = ?,
+			recovered_at = ?,
+			updated_at = ?
+		WHERE caller_id = ?
+	`, h.IntervalSec, h.MaxMissed, h.Strategy,
+		h.LastHeartbeatAt, h.NextExpectedAt, h.MissedCount, h.Status,
+		nullTimePtr(h.FrozenAt), nullTimePtr(h.LostAt), nullTimePtr(h.RecoveredAt),
+		h.UpdatedAt, h.CallerID)
+	return err
+}
+
+func (s *Storage) ListHeartbeatRegistrations() ([]model.HeartbeatRegistration, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, interval_sec, max_missed, strategy,
+			last_heartbeat_at, next_expected_at, missed_count, status,
+			frozen_at, lost_at, recovered_at, created_at, updated_at
+		FROM heartbeat_registrations ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var registrations []model.HeartbeatRegistration
+	for rows.Next() {
+		var h model.HeartbeatRegistration
+		var frozenAt, lostAt, recoveredAt sql.NullTime
+		if err := rows.Scan(&h.ID, &h.CallerID, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
+			&h.LastHeartbeatAt, &h.NextExpectedAt, &h.MissedCount, &h.Status,
+			&frozenAt, &lostAt, &recoveredAt, &h.CreatedAt, &h.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if frozenAt.Valid {
+			h.FrozenAt = &frozenAt.Time
+		}
+		if lostAt.Valid {
+			h.LostAt = &lostAt.Time
+		}
+		if recoveredAt.Valid {
+			h.RecoveredAt = &recoveredAt.Time
+		}
+		registrations = append(registrations, h)
+	}
+	return registrations, nil
+}
+
+func (s *Storage) ListHeartbeatRegistrationsByStatus(status model.HeartbeatStatus) ([]model.HeartbeatRegistration, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, interval_sec, max_missed, strategy,
+			last_heartbeat_at, next_expected_at, missed_count, status,
+			frozen_at, lost_at, recovered_at, created_at, updated_at
+		FROM heartbeat_registrations WHERE status = ? ORDER BY id
+	`, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var registrations []model.HeartbeatRegistration
+	for rows.Next() {
+		var h model.HeartbeatRegistration
+		var frozenAt, lostAt, recoveredAt sql.NullTime
+		if err := rows.Scan(&h.ID, &h.CallerID, &h.IntervalSec, &h.MaxMissed, &h.Strategy,
+			&h.LastHeartbeatAt, &h.NextExpectedAt, &h.MissedCount, &h.Status,
+			&frozenAt, &lostAt, &recoveredAt, &h.CreatedAt, &h.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if frozenAt.Valid {
+			h.FrozenAt = &frozenAt.Time
+		}
+		if lostAt.Valid {
+			h.LostAt = &lostAt.Time
+		}
+		if recoveredAt.Valid {
+			h.RecoveredAt = &recoveredAt.Time
+		}
+		registrations = append(registrations, h)
+	}
+	return registrations, nil
+}
+
+func (s *Storage) AddHeartbeatEvent(e *model.HeartbeatEvent) error {
+	result, err := s.db.Exec(`
+		INSERT INTO heartbeat_events (caller_id, event_type, from_status, to_status, detail, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, e.CallerID, e.EventType, e.FromStatus, e.ToStatus, e.Detail, e.CreatedAt)
+	if err != nil {
+		return err
+	}
+	e.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListHeartbeatEvents(callerID string, limit int) ([]model.HeartbeatEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var rows *sql.Rows
+	var err error
+	if callerID != "" {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, event_type, from_status, to_status, detail, created_at
+			FROM heartbeat_events WHERE caller_id = ? ORDER BY id DESC LIMIT ?
+		`, callerID, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, event_type, from_status, to_status, detail, created_at
+			FROM heartbeat_events ORDER BY id DESC LIMIT ?
+		`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []model.HeartbeatEvent
+	for rows.Next() {
+		var e model.HeartbeatEvent
+		if err := rows.Scan(&e.ID, &e.CallerID, &e.EventType, &e.FromStatus, &e.ToStatus, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+func (s *Storage) CreateFrozenResource(f *model.FrozenResource) error {
+	result, err := s.db.Exec(`
+		INSERT INTO frozen_resources (caller_id, resource_type, resource_key, frozen_at, released_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, f.CallerID, f.ResourceType, f.ResourceKey, f.FrozenAt, nullTimePtr(f.ReleasedAt), f.FrozenAt)
+	if err != nil {
+		return err
+	}
+	f.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListFrozenResources(callerID string) ([]model.FrozenResource, error) {
+	var rows *sql.Rows
+	var err error
+	if callerID != "" {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, resource_type, resource_key, frozen_at, released_at
+			FROM frozen_resources WHERE caller_id = ? AND released_at IS NULL ORDER BY id
+		`, callerID)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, resource_type, resource_key, frozen_at, released_at
+			FROM frozen_resources WHERE released_at IS NULL ORDER BY id
+		`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var resources []model.FrozenResource
+	for rows.Next() {
+		var f model.FrozenResource
+		var releasedAt sql.NullTime
+		if err := rows.Scan(&f.ID, &f.CallerID, &f.ResourceType, &f.ResourceKey, &f.FrozenAt, &releasedAt); err != nil {
+			return nil, err
+		}
+		if releasedAt.Valid {
+			f.ReleasedAt = &releasedAt.Time
+		}
+		resources = append(resources, f)
+	}
+	return resources, nil
+}
+
+func (s *Storage) ReleaseFrozenResource(id int64, releasedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE frozen_resources SET released_at = ? WHERE id = ?
+	`, releasedAt, id)
+	return err
+}
+
+func (s *Storage) ReleaseAllFrozenResources(callerID string, releasedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE frozen_resources SET released_at = ? WHERE caller_id = ? AND released_at IS NULL
+	`, releasedAt, callerID)
+	return err
 }

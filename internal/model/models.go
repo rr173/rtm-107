@@ -987,9 +987,91 @@ type CancelHandoverRequest struct {
 }
 
 type CallerHandoverSummary struct {
-	CallerID        string     `json:"caller_id"`
-	TransferringOut int        `json:"transferring_out"`
-	TransferringIn  int        `json:"transferring_in"`
-	Completed       int        `json:"completed"`
-	Cancelled       int        `json:"cancelled"`
+	CallerID        string `json:"caller_id"`
+	TransferringOut int    `json:"transferring_out"`
+	TransferringIn  int    `json:"transferring_in"`
+	Completed       int    `json:"completed"`
+	Cancelled       int    `json:"cancelled"`
+}
+
+type HeartbeatStatus string
+
+const (
+	HeartbeatStatusHealthy   HeartbeatStatus = "healthy"
+	HeartbeatStatusSuspect   HeartbeatStatus = "suspect"
+	HeartbeatStatusLost      HeartbeatStatus = "lost"
+	HeartbeatStatusFrozen    HeartbeatStatus = "frozen"
+	HeartbeatStatusRecovered HeartbeatStatus = "recovered"
+)
+
+type DisposalStrategy string
+
+const (
+	StrategyReleaseAll     DisposalStrategy = "release_all"
+	StrategyReleaseLock   DisposalStrategy = "release_lock_only"
+	StrategyFreeze        DisposalStrategy = "freeze"
+)
+
+type HeartbeatRegistration struct {
+	ID               int64            `json:"id"`
+	CallerID         string           `json:"caller_id"`
+	IntervalSec      int              `json:"interval_sec"`
+	MaxMissed        int              `json:"max_missed"`
+	Strategy         DisposalStrategy `json:"strategy"`
+	LastHeartbeatAt  time.Time        `json:"last_heartbeat_at"`
+	NextExpectedAt   time.Time        `json:"next_expected_at"`
+	MissedCount      int              `json:"missed_count"`
+	Status           HeartbeatStatus  `json:"status"`
+	FrozenAt         *time.Time       `json:"frozen_at,omitempty"`
+	LostAt           *time.Time       `json:"lost_at,omitempty"`
+	RecoveredAt      *time.Time       `json:"recovered_at,omitempty"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+}
+
+type HeartbeatEvent struct {
+	ID               int64           `json:"id"`
+	CallerID         string          `json:"caller_id"`
+	EventType        string          `json:"event_type"`
+	FromStatus       HeartbeatStatus `json:"from_status,omitempty"`
+	ToStatus         HeartbeatStatus `json:"to_status,omitempty"`
+	Detail           string          `json:"detail,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+}
+
+type FrozenResource struct {
+	ID               int64           `json:"id"`
+	CallerID         string          `json:"caller_id"`
+	ResourceType     string          `json:"resource_type"`
+	ResourceKey      string          `json:"resource_key"`
+	FrozenAt         time.Time       `json:"frozen_at"`
+	ReleasedAt       *time.Time      `json:"released_at,omitempty"`
+}
+
+type RegisterHeartbeatRequest struct {
+	CallerID    string           `json:"caller_id" binding:"required"`
+	IntervalSec int              `json:"interval_sec" binding:"required,min=1"`
+	MaxMissed   int              `json:"max_missed" binding:"required,min=1"`
+	Strategy    DisposalStrategy `json:"strategy" binding:"required"`
+}
+
+type HeartbeatStatusInfo struct {
+	CallerID         string           `json:"caller_id"`
+	Status           HeartbeatStatus  `json:"status"`
+	IntervalSec      int              `json:"interval_sec"`
+	MaxMissed        int              `json:"max_missed"`
+	LastHeartbeatAt  time.Time        `json:"last_heartbeat_at"`
+	NextExpectedAt   time.Time        `json:"next_expected_at"`
+	MissedCount      int              `json:"missed_count"`
+	Strategy         DisposalStrategy `json:"strategy"`
+	SecondsSinceLast float64          `json:"seconds_since_last"`
+}
+
+type HeartbeatReport struct {
+	RegisteredCount  int `json:"registered_count"`
+	HealthyCount     int `json:"healthy_count"`
+	SuspectCount     int `json:"suspect_count"`
+	LostCount        int `json:"lost_count"`
+	FrozenCount      int `json:"frozen_count"`
+	RecoveredCount   int `json:"recovered_count"`
 }
