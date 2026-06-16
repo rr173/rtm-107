@@ -42,6 +42,7 @@ func main() {
 
 	heatmapMgr := heatmap.NewManager(s, mgr)
 	mgr.SetHeatmap(heatmapMgr)
+	mgr.SetHeatmapCooldownManager(heatmapMgr)
 
 	rlMgr := ratelimit.NewManager(s)
 	if err := rlMgr.Start(); err != nil {

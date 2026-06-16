@@ -609,8 +609,58 @@ func (s *Storage) initSchema() error {
 		alert_suppress_min INTEGER NOT NULL DEFAULT 10,
 		top_n INTEGER NOT NULL DEFAULT 10,
 		history_retention_min INTEGER NOT NULL DEFAULT 1440,
+		cooldown_enabled INTEGER NOT NULL DEFAULT 1,
+		cooldown_consecutive_hot_cycles INTEGER NOT NULL DEFAULT 3,
+		cooldown_lease_sec INTEGER NOT NULL DEFAULT 30,
+		cooldown_lease_min_pct REAL NOT NULL DEFAULT 10,
+		cooldown_resolve_threshold_ms REAL NOT NULL DEFAULT 1000,
+		cooldown_resolve_cycles INTEGER NOT NULL DEFAULT 2,
+		cooldown_max_sec INTEGER NOT NULL DEFAULT 3600,
+		cooldown_accelerated_grant INTEGER NOT NULL DEFAULT 1,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
+
+	CREATE TABLE IF NOT EXISTS lock_cooldown_states (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		lock_name TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'active',
+		trigger_type TEXT NOT NULL DEFAULT 'auto',
+		original_lease_sec INTEGER NOT NULL DEFAULT 0,
+		cooldown_lease_sec INTEGER NOT NULL DEFAULT 0,
+		leases_shortened INTEGER NOT NULL DEFAULT 0,
+		consecutive_hot_cycles INTEGER NOT NULL DEFAULT 0,
+		avg_wait_ms_at_start REAL NOT NULL DEFAULT 0,
+		threshold_ms_at_start REAL NOT NULL DEFAULT 0,
+		started_at DATETIME NOT NULL,
+		resolved_at DATETIME,
+		resolve_reason TEXT,
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	);
+
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_cooldown_states_lock_active ON lock_cooldown_states(lock_name) WHERE status = 'active';
+	CREATE INDEX IF NOT EXISTS idx_cooldown_states_status ON lock_cooldown_states(status);
+	CREATE INDEX IF NOT EXISTS idx_cooldown_states_started ON lock_cooldown_states(started_at);
+
+	CREATE TABLE IF NOT EXISTS cooldown_history_records (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		lock_name TEXT NOT NULL,
+		trigger_type TEXT NOT NULL,
+		original_lease_sec INTEGER NOT NULL DEFAULT 0,
+		cooldown_lease_sec INTEGER NOT NULL DEFAULT 0,
+		leases_shortened INTEGER NOT NULL DEFAULT 0,
+		avg_wait_ms_at_start REAL NOT NULL DEFAULT 0,
+		avg_wait_ms_at_end REAL NOT NULL DEFAULT 0,
+		threshold_ms REAL NOT NULL DEFAULT 0,
+		duration_sec REAL NOT NULL DEFAULT 0,
+		started_at DATETIME NOT NULL,
+		ended_at DATETIME NOT NULL,
+		resolve_reason TEXT,
+		created_at DATETIME NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_cooldown_history_lock ON cooldown_history_records(lock_name);
+	CREATE INDEX IF NOT EXISTS idx_cooldown_history_created ON cooldown_history_records(created_at);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -682,6 +732,55 @@ func (s *Storage) migrateSchema() error {
 			}
 		}
 	}
+
+	cooldownIntColumns := map[string]int{
+		"cooldown_enabled":                 1,
+		"cooldown_consecutive_hot_cycles":  3,
+		"cooldown_lease_sec":               30,
+		"cooldown_resolve_cycles":          2,
+		"cooldown_max_sec":                 3600,
+		"cooldown_accelerated_grant":       1,
+	}
+	for col, defaultValue := range cooldownIntColumns {
+		row := s.db.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('heatmap_config') WHERE name = ?
+		`, col)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			log.Printf("[storage-migration] adding column %s to heatmap_config", col)
+			_, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE heatmap_config ADD COLUMN %s INTEGER NOT NULL DEFAULT %d", col, defaultValue))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	cooldownRealColumns := map[string]float64{
+		"cooldown_lease_min_pct":         10.0,
+		"cooldown_resolve_threshold_ms": 1000.0,
+	}
+	for col, defaultValue := range cooldownRealColumns {
+		row := s.db.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('heatmap_config') WHERE name = ?
+		`, col)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			log.Printf("[storage-migration] adding column %s to heatmap_config", col)
+			_, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE heatmap_config ADD COLUMN %s REAL NOT NULL DEFAULT %f", col, defaultValue))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -4110,13 +4209,171 @@ func (s *Storage) AcknowledgeHotspotAlert(id int64, acknowledgedBy string) error
 	return nil
 }
 
+func (s *Storage) UpsertCooldownState(state *model.LockCooldownState) error {
+	now := time.Now()
+	if state.ID > 0 {
+		result, err := s.db.Exec(`
+			UPDATE lock_cooldown_states SET
+				status = ?, trigger_type = ?, original_lease_sec = ?, cooldown_lease_sec = ?,
+				leases_shortened = ?, consecutive_hot_cycles = ?, avg_wait_ms_at_start = ?,
+				threshold_ms_at_start = ?, started_at = ?, resolved_at = ?, resolve_reason = ?,
+				updated_at = ?
+			WHERE id = ?
+		`, state.Status, state.TriggerType, state.OriginalLeaseSec, state.CooldownLeaseSec,
+			state.LeasesShortened, state.ConsecutiveHotCycles, state.AvgWaitMsAtStart,
+			state.ThresholdMsAtStart, state.StartedAt, state.ResolvedAt, state.ResolveReason,
+			now, state.ID)
+		if err != nil {
+			return err
+		}
+		rows, _ := result.RowsAffected()
+		if rows > 0 {
+			return nil
+		}
+	}
+
+	result, err := s.db.Exec(`
+		INSERT INTO lock_cooldown_states (
+			lock_name, status, trigger_type, original_lease_sec, cooldown_lease_sec,
+			leases_shortened, consecutive_hot_cycles, avg_wait_ms_at_start, threshold_ms_at_start,
+			started_at, resolved_at, resolve_reason, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, state.LockName, state.Status, state.TriggerType, state.OriginalLeaseSec, state.CooldownLeaseSec,
+		state.LeasesShortened, state.ConsecutiveHotCycles, state.AvgWaitMsAtStart, state.ThresholdMsAtStart,
+		state.StartedAt, state.ResolvedAt, state.ResolveReason, now, now)
+	if err != nil {
+		return err
+	}
+	id, err := result.LastInsertId()
+	if err == nil {
+		state.ID = id
+	}
+	return nil
+}
+
+func (s *Storage) GetActiveCooldown(lockName string) (*model.LockCooldownState, error) {
+	row := s.db.QueryRow(`
+		SELECT id, lock_name, status, trigger_type, original_lease_sec, cooldown_lease_sec,
+			leases_shortened, consecutive_hot_cycles, avg_wait_ms_at_start, threshold_ms_at_start,
+			started_at, resolved_at, resolve_reason, created_at, updated_at
+		FROM lock_cooldown_states
+		WHERE lock_name = ? AND status = 'active'
+		ORDER BY id DESC LIMIT 1
+	`, lockName)
+
+	var state model.LockCooldownState
+	err := row.Scan(&state.ID, &state.LockName, &state.Status, &state.TriggerType, &state.OriginalLeaseSec, &state.CooldownLeaseSec,
+		&state.LeasesShortened, &state.ConsecutiveHotCycles, &state.AvgWaitMsAtStart, &state.ThresholdMsAtStart,
+		&state.StartedAt, &state.ResolvedAt, &state.ResolveReason, &state.CreatedAt, &state.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+func (s *Storage) ListActiveCooldowns() ([]model.LockCooldownState, error) {
+	rows, err := s.db.Query(`
+		SELECT id, lock_name, status, trigger_type, original_lease_sec, cooldown_lease_sec,
+			leases_shortened, consecutive_hot_cycles, avg_wait_ms_at_start, threshold_ms_at_start,
+			started_at, resolved_at, resolve_reason, created_at, updated_at
+		FROM lock_cooldown_states
+		WHERE status = 'active'
+		ORDER BY started_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var states []model.LockCooldownState
+	for rows.Next() {
+		var state model.LockCooldownState
+		err := rows.Scan(&state.ID, &state.LockName, &state.Status, &state.TriggerType, &state.OriginalLeaseSec, &state.CooldownLeaseSec,
+			&state.LeasesShortened, &state.ConsecutiveHotCycles, &state.AvgWaitMsAtStart, &state.ThresholdMsAtStart,
+			&state.StartedAt, &state.ResolvedAt, &state.ResolveReason, &state.CreatedAt, &state.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	return states, nil
+}
+
+func (s *Storage) CreateCooldownHistory(history *model.CooldownHistoryRecord) error {
+	now := time.Now()
+	result, err := s.db.Exec(`
+		INSERT INTO cooldown_history_records (
+			lock_name, trigger_type, original_lease_sec, cooldown_lease_sec, leases_shortened,
+			avg_wait_ms_at_start, avg_wait_ms_at_end, threshold_ms, duration_sec,
+			started_at, ended_at, resolve_reason, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, history.LockName, history.TriggerType, history.OriginalLeaseSec, history.CooldownLeaseSec, history.LeasesShortened,
+		history.AvgWaitMsAtStart, history.AvgWaitMsAtEnd, history.ThresholdMs, history.DurationSec,
+		history.StartedAt, history.EndedAt, history.ResolveReason, now)
+	if err != nil {
+		return err
+	}
+	id, err := result.LastInsertId()
+	if err == nil {
+		history.ID = id
+	}
+	return nil
+}
+
+func (s *Storage) ListCooldownHistory(lockName string, limit int) ([]model.CooldownHistoryRecord, error) {
+	var rows *sql.Rows
+	var err error
+
+	query := `
+		SELECT id, lock_name, trigger_type, original_lease_sec, cooldown_lease_sec, leases_shortened,
+			avg_wait_ms_at_start, avg_wait_ms_at_end, threshold_ms, duration_sec,
+			started_at, ended_at, resolve_reason, created_at
+		FROM cooldown_history_records
+	`
+	if lockName != "" {
+		query += ` WHERE lock_name = ? `
+	}
+	query += ` ORDER BY created_at DESC LIMIT ? `
+
+	if lockName != "" {
+		rows, err = s.db.Query(query, lockName, limit)
+	} else {
+		rows, err = s.db.Query(query, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []model.CooldownHistoryRecord
+	for rows.Next() {
+		var r model.CooldownHistoryRecord
+		err := rows.Scan(&r.ID, &r.LockName, &r.TriggerType, &r.OriginalLeaseSec, &r.CooldownLeaseSec, &r.LeasesShortened,
+			&r.AvgWaitMsAtStart, &r.AvgWaitMsAtEnd, &r.ThresholdMs, &r.DurationSec,
+			&r.StartedAt, &r.EndedAt, &r.ResolveReason, &r.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
 func (s *Storage) GetHeatmapConfig() (*model.HeatmapConfig, error) {
 	row := s.db.QueryRow(`
-		SELECT window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min
+		SELECT window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min,
+			cooldown_enabled, cooldown_consecutive_hot_cycles, cooldown_lease_sec, cooldown_lease_min_pct,
+			cooldown_resolve_threshold_ms, cooldown_resolve_cycles, cooldown_max_sec, cooldown_accelerated_grant
 		FROM heatmap_config WHERE id = 1
 	`)
 	var cfg model.HeatmapConfig
-	err := row.Scan(&cfg.WindowMinutes, &cfg.AlertThresholdMs, &cfg.AlertSuppressMin, &cfg.TopN, &cfg.HistoryRetentionMin)
+	var cooldownEnabledInt, cooldownAcceleratedGrantInt int
+	err := row.Scan(&cfg.WindowMinutes, &cfg.AlertThresholdMs, &cfg.AlertSuppressMin, &cfg.TopN, &cfg.HistoryRetentionMin,
+		&cooldownEnabledInt, &cfg.Cooldown.ConsecutiveHotCycles, &cfg.Cooldown.CooldownLeaseSec, &cfg.Cooldown.CooldownLeaseMinPct,
+		&cfg.Cooldown.ResolveThresholdMs, &cfg.Cooldown.ResolveConsecutiveCycles, &cfg.Cooldown.MaxCooldownSec, &cooldownAcceleratedGrantInt)
 	if err == sql.ErrNoRows {
 		defaultCfg := &model.HeatmapConfig{
 			WindowMinutes:       5,
@@ -4124,11 +4381,25 @@ func (s *Storage) GetHeatmapConfig() (*model.HeatmapConfig, error) {
 			AlertSuppressMin:    10,
 			TopN:                10,
 			HistoryRetentionMin: 1440,
+			Cooldown: model.CooldownConfig{
+				Enabled:                true,
+				ConsecutiveHotCycles:   3,
+				CooldownLeaseSec:       30,
+				CooldownLeaseMinPct:    10,
+				ResolveThresholdMs:     1000,
+				ResolveConsecutiveCycles: 2,
+				MaxCooldownSec:         3600,
+				AcceleratedGrant:       true,
+			},
 		}
 		_, err := s.db.Exec(`
-			INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min, updated_at)
-			VALUES (1, ?, ?, ?, ?, ?, ?)
-		`, defaultCfg.WindowMinutes, defaultCfg.AlertThresholdMs, defaultCfg.AlertSuppressMin, defaultCfg.TopN, defaultCfg.HistoryRetentionMin, time.Now())
+			INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min,
+				cooldown_enabled, cooldown_consecutive_hot_cycles, cooldown_lease_sec, cooldown_lease_min_pct,
+				cooldown_resolve_threshold_ms, cooldown_resolve_cycles, cooldown_max_sec, cooldown_accelerated_grant, updated_at)
+			VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, defaultCfg.WindowMinutes, defaultCfg.AlertThresholdMs, defaultCfg.AlertSuppressMin, defaultCfg.TopN, defaultCfg.HistoryRetentionMin,
+			1, defaultCfg.Cooldown.ConsecutiveHotCycles, defaultCfg.Cooldown.CooldownLeaseSec, defaultCfg.Cooldown.CooldownLeaseMinPct,
+			defaultCfg.Cooldown.ResolveThresholdMs, defaultCfg.Cooldown.ResolveConsecutiveCycles, defaultCfg.Cooldown.MaxCooldownSec, 1, time.Now())
 		if err != nil {
 			return nil, err
 		}
@@ -4140,6 +4411,8 @@ func (s *Storage) GetHeatmapConfig() (*model.HeatmapConfig, error) {
 	if cfg.AlertSuppressMin <= 0 {
 		cfg.AlertSuppressMin = 10
 	}
+	cfg.Cooldown.Enabled = cooldownEnabledInt != 0
+	cfg.Cooldown.AcceleratedGrant = cooldownAcceleratedGrantInt != 0
 	return &cfg, nil
 }
 
@@ -4147,16 +4420,36 @@ func (s *Storage) UpdateHeatmapConfig(cfg *model.HeatmapConfig) error {
 	if cfg.AlertSuppressMin <= 0 {
 		cfg.AlertSuppressMin = 10
 	}
+	cooldownEnabledInt := 0
+	if cfg.Cooldown.Enabled {
+		cooldownEnabledInt = 1
+	}
+	cooldownAcceleratedGrantInt := 0
+	if cfg.Cooldown.AcceleratedGrant {
+		cooldownAcceleratedGrantInt = 1
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?)
+		INSERT INTO heatmap_config (id, window_minutes, alert_threshold_ms, alert_suppress_min, top_n, history_retention_min,
+			cooldown_enabled, cooldown_consecutive_hot_cycles, cooldown_lease_sec, cooldown_lease_min_pct,
+			cooldown_resolve_threshold_ms, cooldown_resolve_cycles, cooldown_max_sec, cooldown_accelerated_grant, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			window_minutes = excluded.window_minutes,
 			alert_threshold_ms = excluded.alert_threshold_ms,
 			alert_suppress_min = excluded.alert_suppress_min,
 			top_n = excluded.top_n,
 			history_retention_min = excluded.history_retention_min,
+			cooldown_enabled = excluded.cooldown_enabled,
+			cooldown_consecutive_hot_cycles = excluded.cooldown_consecutive_hot_cycles,
+			cooldown_lease_sec = excluded.cooldown_lease_sec,
+			cooldown_lease_min_pct = excluded.cooldown_lease_min_pct,
+			cooldown_resolve_threshold_ms = excluded.cooldown_resolve_threshold_ms,
+			cooldown_resolve_cycles = excluded.cooldown_resolve_cycles,
+			cooldown_max_sec = excluded.cooldown_max_sec,
+			cooldown_accelerated_grant = excluded.cooldown_accelerated_grant,
 			updated_at = excluded.updated_at
-	`, cfg.WindowMinutes, cfg.AlertThresholdMs, cfg.AlertSuppressMin, cfg.TopN, cfg.HistoryRetentionMin, time.Now())
+	`, cfg.WindowMinutes, cfg.AlertThresholdMs, cfg.AlertSuppressMin, cfg.TopN, cfg.HistoryRetentionMin,
+		cooldownEnabledInt, cfg.Cooldown.ConsecutiveHotCycles, cfg.Cooldown.CooldownLeaseSec, cfg.Cooldown.CooldownLeaseMinPct,
+		cfg.Cooldown.ResolveThresholdMs, cfg.Cooldown.ResolveConsecutiveCycles, cfg.Cooldown.MaxCooldownSec, cooldownAcceleratedGrantInt, time.Now())
 	return err
 }

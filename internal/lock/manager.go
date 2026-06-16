@@ -15,11 +15,17 @@ const (
 )
 
 type Manager struct {
-	storage *storage.Storage
-	mu      sync.Mutex
-	timers  map[string]*time.Timer
-	stopCh  chan struct{}
-	heatmap HeatmapRecorder
+	storage          *storage.Storage
+	mu               sync.Mutex
+	timers           map[string]*time.Timer
+	stopCh           chan struct{}
+	heatmap          HeatmapRecorder
+	acceleratedGrants map[string]int
+	heatmapMgr       HeatmapCooldownManager
+}
+
+type HeatmapCooldownManager interface {
+	IncrementLeaseShortenedCount(lockName string) error
 }
 
 type HeatmapRecorder interface {
@@ -34,10 +40,17 @@ type HeatmapRecorder interface {
 
 func NewManager(s *storage.Storage) *Manager {
 	return &Manager{
-		storage: s,
-		timers:  make(map[string]*time.Timer),
-		stopCh:  make(chan struct{}),
+		storage:           s,
+		timers:            make(map[string]*time.Timer),
+		stopCh:            make(chan struct{}),
+		acceleratedGrants: make(map[string]int),
 	}
+}
+
+func (m *Manager) SetHeatmapCooldownManager(h HeatmapCooldownManager) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.heatmapMgr = h
 }
 
 func (m *Manager) SetHeatmap(h HeatmapRecorder) {
@@ -216,6 +229,15 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 		return &AcquireResult{Queued: true, Position: position, Lock: lock}, nil
 	}
 
+	effectiveLeaseSec := leaseSec
+	accelerated := false
+	if cooldownSec, ok := m.acceleratedGrants[lockName]; ok && cooldownSec > 0 {
+		if effectiveLeaseSec > cooldownSec {
+			effectiveLeaseSec = cooldownSec
+			accelerated = true
+		}
+	}
+
 	lock.Status = model.LockStatusHeld
 	lock.Holder = holder
 	lock.Reentrant = reentrant
@@ -228,17 +250,25 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 	lease := &model.Lease{
 		LockName:   lockName,
 		Holder:     holder,
-		LeaseSec:   leaseSec,
+		LeaseSec:   effectiveLeaseSec,
 		AcquiredAt: now,
-		ExpiresAt:  now.Add(time.Duration(leaseSec) * time.Second),
+		ExpiresAt:  now.Add(time.Duration(effectiveLeaseSec) * time.Second),
 		Active:     true,
 	}
 	if err := m.storage.CreateLease(lease); err != nil {
 		return nil, err
 	}
 
-	m.setLeaseTimerLocked(lockName, time.Duration(leaseSec)*time.Second)
-	m.addHistoryLocked(lockName, holder, model.OpAcquire, fmt.Sprintf("acquired, lease=%ds", leaseSec))
+	m.setLeaseTimerLocked(lockName, time.Duration(effectiveLeaseSec)*time.Second)
+
+	historyDetail := fmt.Sprintf("acquired, lease=%ds", effectiveLeaseSec)
+	if accelerated {
+		historyDetail += fmt.Sprintf(" (加速授予: 原租约%ds)", leaseSec)
+		if m.heatmapMgr != nil {
+			_ = m.heatmapMgr.IncrementLeaseShortenedCount(lockName)
+		}
+	}
+	m.addHistoryLocked(lockName, holder, model.OpAcquire, historyDetail)
 
 	fillLeaseRemaining(lease)
 	return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
@@ -331,6 +361,15 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 		return nil, err
 	}
 
+	leaseSec := item.LeaseSec
+	accelerated := false
+	if cooldownSec, ok := m.acceleratedGrants[lockName]; ok && cooldownSec > 0 {
+		if leaseSec > cooldownSec {
+			leaseSec = cooldownSec
+			accelerated = true
+		}
+	}
+
 	lock.Status = model.LockStatusHeld
 	lock.Holder = item.Holder
 	lock.Reentrant = item.Reentrant
@@ -343,17 +382,25 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 	lease := &model.Lease{
 		LockName:   lockName,
 		Holder:     item.Holder,
-		LeaseSec:   item.LeaseSec,
+		LeaseSec:   leaseSec,
 		AcquiredAt: now,
-		ExpiresAt:  now.Add(time.Duration(item.LeaseSec) * time.Second),
+		ExpiresAt:  now.Add(time.Duration(leaseSec) * time.Second),
 		Active:     true,
 	}
 	if err := m.storage.CreateLease(lease); err != nil {
 		return nil, err
 	}
 
-	m.setLeaseTimerLocked(lockName, time.Duration(item.LeaseSec)*time.Second)
-	m.addHistoryLocked(lockName, item.Holder, model.OpGrantNext, fmt.Sprintf("granted from queue, lease=%ds", item.LeaseSec))
+	m.setLeaseTimerLocked(lockName, time.Duration(leaseSec)*time.Second)
+
+	grantDetail := fmt.Sprintf("granted from queue, lease=%ds", leaseSec)
+	if accelerated {
+		grantDetail += fmt.Sprintf(" (加速授予: 原租约%ds)", item.LeaseSec)
+		if m.heatmapMgr != nil {
+			_ = m.heatmapMgr.IncrementLeaseShortenedCount(lockName)
+		}
+	}
+	m.addHistoryLocked(lockName, item.Holder, model.OpGrantNext, grantDetail)
 	if m.heatmap != nil {
 		m.heatmap.RecordLockGrantedWithEnqueue(lockName, item.Holder, item.EnqueuedAt)
 	}
@@ -382,7 +429,19 @@ func (m *Manager) RenewLease(lockName, holder string, addSec int) (*model.Lease,
 		return nil, fmt.Errorf("lease already expired")
 	}
 
-	newExpiresAt := lease.ExpiresAt.Add(time.Duration(addSec) * time.Second)
+	addSeconds := addSec
+	if cooldownSec, ok := m.acceleratedGrants[lockName]; ok && cooldownSec > 0 {
+		maxAllowedExpiry := now.Add(time.Duration(cooldownSec) * time.Second)
+		newExpiresAt := lease.ExpiresAt.Add(time.Duration(addSec) * time.Second)
+		if newExpiresAt.After(maxAllowedExpiry) {
+			addSeconds = int(maxAllowedExpiry.Sub(now).Seconds())
+			if addSeconds < 0 {
+				addSeconds = 0
+			}
+		}
+	}
+
+	newExpiresAt := lease.ExpiresAt.Add(time.Duration(addSeconds) * time.Second)
 	if err := m.storage.UpdateLeaseExpiry(lockName, newExpiresAt); err != nil {
 		return nil, err
 	}
@@ -391,7 +450,11 @@ func (m *Manager) RenewLease(lockName, holder string, addSec int) (*model.Lease,
 	m.setLeaseTimerLocked(lockName, remaining)
 	lease.ExpiresAt = newExpiresAt
 
-	m.addHistoryLocked(lockName, holder, model.OpRenew, fmt.Sprintf("renewed +%ds", addSec))
+	historyDetail := fmt.Sprintf("renewed +%ds", addSec)
+	if addSeconds != addSec {
+		historyDetail += fmt.Sprintf(" (降温状态限制续期, 实际+%ds)", addSeconds)
+	}
+	m.addHistoryLocked(lockName, holder, model.OpRenew, historyDetail)
 
 	fillLeaseRemaining(lease)
 	return lease, nil
@@ -947,4 +1010,92 @@ func (m *Manager) rollbackBatchLocked(locks []*model.Lock, holder string) {
 		_, _ = m.releaseLockLocked(lock.Name, holder)
 		m.addHistoryLocked(lock.Name, holder, model.OpRelease, "batch rollback")
 	}
+}
+
+func (m *Manager) GetActiveLease(lockName string) (*model.Lease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	lease, err := m.storage.GetActiveLease(lockName)
+	if err != nil {
+		return nil, err
+	}
+	if lease != nil {
+		fillLeaseRemaining(lease)
+	}
+	return lease, nil
+}
+
+func (m *Manager) ShortenLease(lockName string, newLeaseSec int) (*model.Lease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	lease, err := m.storage.GetActiveLease(lockName)
+	if err != nil {
+		return nil, err
+	}
+	if lease == nil || !lease.Active {
+		return nil, fmt.Errorf("no active lease for lock: %s", lockName)
+	}
+
+	now := time.Now()
+	currentRemaining := time.Until(lease.ExpiresAt).Seconds()
+	if currentRemaining < 0 {
+		currentRemaining = 0
+	}
+
+	if newLeaseSec <= 0 {
+		return nil, fmt.Errorf("newLeaseSec must be positive")
+	}
+
+	newExpiresAt := now.Add(time.Duration(newLeaseSec) * time.Second)
+	if newExpiresAt.After(lease.ExpiresAt) {
+		newExpiresAt = lease.ExpiresAt
+	}
+
+	if err := m.storage.UpdateLeaseExpiry(lockName, newExpiresAt); err != nil {
+		return nil, err
+	}
+
+	remaining := time.Until(newExpiresAt)
+	m.setLeaseTimerLocked(lockName, remaining)
+
+	lease.ExpiresAt = newExpiresAt
+	lease.LeaseSec = newLeaseSec
+	fillLeaseRemaining(lease)
+
+	if m.heatmapMgr != nil {
+		_ = m.heatmapMgr.IncrementLeaseShortenedCount(lockName)
+	}
+
+	m.addHistoryLocked(lockName, lease.Holder, model.OpCooldownStart,
+		fmt.Sprintf("租约缩短: 原剩余%.1fs, 新租约%ds, 新到期时间%s",
+			currentRemaining, newLeaseSec, newExpiresAt.Format(time.RFC3339)))
+
+	return lease, nil
+}
+
+func (m *Manager) SetAcceleratedGrant(lockName string, enabled bool, cooldownLeaseSec int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if enabled {
+		m.acceleratedGrants[lockName] = cooldownLeaseSec
+	} else {
+		delete(m.acceleratedGrants, lockName)
+	}
+	return nil
+}
+
+func (m *Manager) IsAcceleratedGrant(lockName string) (bool, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	leaseSec, ok := m.acceleratedGrants[lockName]
+	return ok, leaseSec
+}
+
+func (m *Manager) AddCooldownHistory(lockName string, holder string, detail string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addHistoryLocked(lockName, holder, model.OpCooldownStart, detail)
 }

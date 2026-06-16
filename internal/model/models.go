@@ -1202,11 +1202,12 @@ type HotspotAlertEvent struct {
 }
 
 type HeatmapConfig struct {
-	WindowMinutes       int     `json:"window_minutes"`
-	AlertThresholdMs    float64 `json:"alert_threshold_ms"`
-	AlertSuppressMin    int     `json:"alert_suppress_min"`
-	TopN                int     `json:"top_n"`
-	HistoryRetentionMin int     `json:"history_retention_min"`
+	WindowMinutes       int           `json:"window_minutes"`
+	AlertThresholdMs    float64       `json:"alert_threshold_ms"`
+	AlertSuppressMin    int           `json:"alert_suppress_min"`
+	TopN                int           `json:"top_n"`
+	HistoryRetentionMin int           `json:"history_retention_min"`
+	Cooldown            CooldownConfig `json:"cooldown"`
 }
 
 type LockTrendPoint struct {
@@ -1224,17 +1225,131 @@ type HeatmapGlobalStats struct {
 	TotalWaits          int64   `json:"total_waits"`
 	OverallAvgWaitMs    float64 `json:"overall_avg_wait_ms"`
 	ActiveAlerts        int     `json:"active_alerts"`
+	ActiveCooldowns     int     `json:"active_cooldowns"`
+	TotalCooldownToday  int64   `json:"total_cooldown_today"`
 	Config              HeatmapConfig `json:"config"`
 }
 
 type UpdateHeatmapConfigRequest struct {
-	WindowMinutes       *int     `json:"window_minutes"`
-	AlertThresholdMs    *float64 `json:"alert_threshold_ms"`
-	AlertSuppressMin    *int     `json:"alert_suppress_min"`
-	TopN                *int     `json:"top_n"`
-	HistoryRetentionMin *int     `json:"history_retention_min"`
+	WindowMinutes       *int                 `json:"window_minutes"`
+	AlertThresholdMs    *float64             `json:"alert_threshold_ms"`
+	AlertSuppressMin    *int                 `json:"alert_suppress_min"`
+	TopN                *int                 `json:"top_n"`
+	HistoryRetentionMin *int                 `json:"history_retention_min"`
+	Cooldown            *UpdateCooldownConfigRequest `json:"cooldown"`
 }
 
 type AcknowledgeAlertRequest struct {
 	AcknowledgedBy string `json:"acknowledged_by" binding:"required"`
 }
+
+type CooldownTriggerType string
+
+const (
+	CooldownTriggerAuto   CooldownTriggerType = "auto"
+	CooldownTriggerManual CooldownTriggerType = "manual"
+)
+
+type CooldownStatus string
+
+const (
+	CooldownStatusActive   CooldownStatus = "active"
+	CooldownStatusResolved CooldownStatus = "resolved"
+)
+
+type LockCooldownState struct {
+	ID                 int64             `json:"id"`
+	LockName           string            `json:"lock_name"`
+	Status             CooldownStatus    `json:"status"`
+	TriggerType        CooldownTriggerType `json:"trigger_type"`
+	OriginalLeaseSec   int               `json:"original_lease_sec"`
+	CooldownLeaseSec   int               `json:"cooldown_lease_sec"`
+	LeasesShortened    int64             `json:"leases_shortened"`
+	ConsecutiveHotCycles int             `json:"consecutive_hot_cycles"`
+	AvgWaitMsAtStart   float64           `json:"avg_wait_ms_at_start"`
+	ThresholdMsAtStart float64           `json:"threshold_ms_at_start"`
+	StartedAt          time.Time         `json:"started_at"`
+	ResolvedAt         *time.Time        `json:"resolved_at,omitempty"`
+	ResolveReason      string            `json:"resolve_reason,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
+}
+
+type CooldownHistoryRecord struct {
+	ID                 int64             `json:"id"`
+	LockName           string            `json:"lock_name"`
+	TriggerType        CooldownTriggerType `json:"trigger_type"`
+	OriginalLeaseSec   int               `json:"original_lease_sec"`
+	CooldownLeaseSec   int               `json:"cooldown_lease_sec"`
+	LeasesShortened    int64             `json:"leases_shortened"`
+	AvgWaitMsAtStart   float64           `json:"avg_wait_ms_at_start"`
+	AvgWaitMsAtEnd     float64           `json:"avg_wait_ms_at_end"`
+	ThresholdMs        float64           `json:"threshold_ms"`
+	DurationSec        float64           `json:"duration_sec"`
+	StartedAt          time.Time         `json:"started_at"`
+	EndedAt            time.Time         `json:"ended_at"`
+	ResolveReason      string            `json:"resolve_reason,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+}
+
+type CooldownConfig struct {
+	Enabled                bool    `json:"enabled"`
+	ConsecutiveHotCycles   int     `json:"consecutive_hot_cycles"`
+	CooldownLeaseSec       int     `json:"cooldown_lease_sec"`
+	CooldownLeaseMinPct    float64 `json:"cooldown_lease_min_pct"`
+	ResolveThresholdMs     float64 `json:"resolve_threshold_ms"`
+	ResolveConsecutiveCycles int   `json:"resolve_consecutive_cycles"`
+	MaxCooldownSec         int     `json:"max_cooldown_sec"`
+	AcceleratedGrant       bool    `json:"accelerated_grant"`
+}
+
+type CooldownStatusInfo struct {
+	LockName           string    `json:"lock_name"`
+	Status             CooldownStatus `json:"status"`
+	TriggerType        CooldownTriggerType `json:"trigger_type"`
+	OriginalLeaseSec   int       `json:"original_lease_sec"`
+	CooldownLeaseSec   int       `json:"cooldown_lease_sec"`
+	LeasesShortened    int64     `json:"leases_shortened"`
+	ConsecutiveHotCycles int     `json:"consecutive_hot_cycles"`
+	AvgWaitMsAtStart   float64   `json:"avg_wait_ms_at_start"`
+	CurrentAvgWaitMs   float64   `json:"current_avg_wait_ms"`
+	ThresholdMs        float64   `json:"threshold_ms"`
+	StartedAt          time.Time `json:"started_at"`
+	DurationSec        float64   `json:"duration_sec"`
+	CurrentHolder      string    `json:"current_holder,omitempty"`
+	RemainingSec       float64   `json:"remaining_sec,omitempty"`
+	WaitQueueLen       int       `json:"wait_queue_len"`
+}
+
+type CooldownSuggestion struct {
+	LockName         string  `json:"lock_name"`
+	AvgWaitMs        float64 `json:"avg_wait_ms"`
+	ThresholdMs      float64 `json:"threshold_ms"`
+	ConsecutiveHot   int     `json:"consecutive_hot"`
+	SuggestedLeaseSec int    `json:"suggested_lease_sec"`
+	CurrentLeaseSec  int     `json:"current_lease_sec"`
+	QueueLen         int     `json:"queue_len"`
+	Reason           string  `json:"reason"`
+}
+
+type UpdateCooldownConfigRequest struct {
+	Enabled                *bool    `json:"enabled"`
+	ConsecutiveHotCycles   *int     `json:"consecutive_hot_cycles"`
+	CooldownLeaseSec       *int     `json:"cooldown_lease_sec"`
+	CooldownLeaseMinPct    *float64 `json:"cooldown_lease_min_pct"`
+	ResolveThresholdMs     *float64 `json:"resolve_threshold_ms"`
+	ResolveConsecutiveCycles *int   `json:"resolve_consecutive_cycles"`
+	MaxCooldownSec         *int     `json:"max_cooldown_sec"`
+	AcceleratedGrant       *bool    `json:"accelerated_grant"`
+}
+
+type ManualCooldownRequest struct {
+	LockName         string `json:"lock_name" binding:"required"`
+	CooldownLeaseSec int    `json:"cooldown_lease_sec" binding:"required,min=1"`
+	Reason           string `json:"reason"`
+}
+
+const (
+	OpCooldownStart OperationType = "cooldown_start"
+	OpCooldownEnd   OperationType = "cooldown_end"
+)

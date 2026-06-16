@@ -255,6 +255,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			heatmapGroup.GET("/alerts", h.ListHotspotAlerts)
 			heatmapGroup.POST("/alerts/:id/ack", h.AcknowledgeHotspotAlert)
 			heatmapGroup.GET("/alerts/active", h.ListActiveHotspotAlerts)
+
+			heatmapGroup.GET("/cooldowns/active", h.ListActiveCooldowns)
+			heatmapGroup.GET("/cooldowns/history", h.ListCooldownHistory)
+			heatmapGroup.GET("/cooldowns/suggestions", h.GetCooldownSuggestions)
+			heatmapGroup.POST("/cooldowns/:name/start", h.ManualStartCooldown)
+			heatmapGroup.POST("/cooldowns/:name/stop", h.ManualStopCooldown)
 		}
 	}
 }
@@ -2328,4 +2334,97 @@ func (h *Handler) AcknowledgeHotspotAlert(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "alert acknowledged"})
+}
+
+func (h *Handler) ListActiveCooldowns(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+
+	cooldowns, err := h.heatmapMgr.ListActiveCooldowns()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"active_cooldowns": cooldowns, "count": len(cooldowns)})
+}
+
+func (h *Handler) ListCooldownHistory(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+
+	lockName := c.Query("lock_name")
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		limit = 100
+	}
+
+	history, err := h.heatmapMgr.ListCooldownHistory(lockName, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"history": history, "count": len(history)})
+}
+
+func (h *Handler) GetCooldownSuggestions(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+
+	suggestions, err := h.heatmapMgr.GetCooldownSuggestions()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"suggestions": suggestions, "count": len(suggestions)})
+}
+
+func (h *Handler) ManualStartCooldown(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+
+	lockName := c.Param("name")
+	var req model.ManualCooldownRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	state, err := h.heatmapMgr.ManualStartCooldown(lockName, req.CooldownLeaseSec, req.Reason)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "cooldown": state})
+}
+
+func (h *Handler) ManualStopCooldown(c *gin.Context) {
+	if h.heatmapMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "heatmap manager not initialized"})
+		return
+	}
+
+	lockName := c.Param("name")
+	type stopRequest struct {
+		Reason string `json:"reason"`
+	}
+	var req stopRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.Reason = ""
+	}
+
+	state, err := h.heatmapMgr.ManualStopCooldown(lockName, req.Reason)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "cooldown": state})
 }
