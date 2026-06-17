@@ -14,6 +14,7 @@ import (
 	"rtm-107/internal/lockbudget"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
+	"rtm-107/internal/ratealert"
 	"rtm-107/internal/ratelimit"
 	"rtm-107/internal/shadow"
 	"rtm-107/internal/storage"
@@ -47,6 +48,13 @@ func main() {
 	}
 	defer budgetMgr.Stop()
 	mgr.SetBudgetManager(budgetMgr)
+
+	rateAlertMgr := ratealert.NewManager(s)
+	if err := rateAlertMgr.Start(); err != nil {
+		log.Fatalf("start rate alert manager: %v", err)
+	}
+	defer rateAlertMgr.Stop()
+	budgetMgr.SetRateAlertManager(rateAlertMgr)
 
 	heatmapMgr := heatmap.NewManager(s, mgr)
 	mgr.SetHeatmap(heatmapMgr)
@@ -148,6 +156,10 @@ func main() {
 		log.Printf("seed heatmap demo data: %v", err)
 	}
 
+	if err := seedRateAlertDemoData(rateAlertMgr, s, budgetMgr); err != nil {
+		log.Printf("seed rate alert demo data: %v", err)
+	}
+
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -161,7 +173,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr, heatmapMgr, budgetMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr, heatmapMgr, budgetMgr, rateAlertMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")
@@ -1128,6 +1140,85 @@ func seedHeatmapDemoData(hm *heatmap.Manager, s *storage.Storage, lockMgr *lock.
 	log.Println("[demo-heatmap]   GET /api/v1/heatmap/stats - 全局热力概览")
 	log.Println("[demo-heatmap]   PUT /api/v1/heatmap/config - 调整告警阈值等配置")
 	log.Println("[demo-heatmap]   POST /api/v1/locks/hot-spot-db/acquire - 继续请求制造新的竞争记录")
+
+	return nil
+}
+
+func seedRateAlertDemoData(ram *ratealert.Manager, s *storage.Storage, bm *lockbudget.Manager) error {
+	existingRules, err := ram.ListRules()
+	if err != nil {
+		return err
+	}
+	if len(existingRules) > 0 {
+		log.Println("[demo-ratealert] rate alert data already exists, skipping seed")
+		return nil
+	}
+
+	log.Println("[demo-ratealert] seeding rate alert & freeze demo data...")
+
+	if _, err := bm.SetBudget("service-alpha", 10000, 3600, 80); err != nil {
+		return fmt.Errorf("set budget for service-alpha: %w", err)
+	}
+	log.Println("[demo-ratealert] set budget for service-alpha: 10000 units/hour")
+
+	rule1, err := ram.SetRule("service-alpha", 60, 500, 3, true)
+	if err != nil {
+		return fmt.Errorf("set rate alert rule for service-alpha: %w", err)
+	}
+	log.Printf("[demo-ratealert] created rule for service-alpha: window=%ds, max=%d units, freeze_after=%d warnings",
+		rule1.WindowSec, rule1.MaxUnitsInWindow, rule1.FreezeTriggerN)
+
+	if _, err := bm.SetBudget("service-beta", 5000, 3600, 70); err != nil {
+		return fmt.Errorf("set budget for service-beta: %w", err)
+	}
+	log.Println("[demo-ratealert] set budget for service-beta: 5000 units/hour")
+
+	rule2, err := ram.SetRule("service-beta", 30, 200, 2, true)
+	if err != nil {
+		return fmt.Errorf("set rate alert rule for service-beta: %w", err)
+	}
+	log.Printf("[demo-ratealert] created rule for service-beta: window=%ds, max=%d units, freeze_after=%d warnings",
+		rule2.WindowSec, rule2.MaxUnitsInWindow, rule2.FreezeTriggerN)
+
+	now := time.Now()
+	historyEvent1 := &model.LockBudgetRateAlertEvent{
+		CallerID:         "service-alpha",
+		CreatedAt:        now.Add(-2 * time.Hour),
+		WindowSec:        60,
+		MaxUnitsInWindow: 500,
+		ConsumedInWindow: 620,
+		ActualRate:       620.0 / 60.0,
+	}
+	if err := s.AddRateAlertEvent(historyEvent1); err != nil {
+		return fmt.Errorf("add history alert event 1: %w", err)
+	}
+	log.Println("[demo-ratealert] seeded historical alert event for service-alpha (2h ago)")
+
+	historyEvent2 := &model.LockBudgetRateAlertEvent{
+		CallerID:         "service-alpha",
+		CreatedAt:        now.Add(-90 * time.Minute),
+		WindowSec:        60,
+		MaxUnitsInWindow: 500,
+		ConsumedInWindow: 580,
+		ActualRate:       580.0 / 60.0,
+	}
+	if err := s.AddRateAlertEvent(historyEvent2); err != nil {
+		return fmt.Errorf("add history alert event 2: %w", err)
+	}
+	log.Println("[demo-ratealert] seeded historical alert event for service-alpha (90m ago)")
+
+	log.Println("[demo-ratealert] demo data seeded successfully:")
+	log.Println("[demo-ratealert]   - service-alpha: budget=10000/hour, alert rule=60s/500 units, freeze after 3 consecutive warnings")
+	log.Println("[demo-ratealert]   - service-beta: budget=5000/hour, alert rule=30s/200 units, freeze after 2 consecutive warnings")
+	log.Println("[demo-ratealert]   - seeded 2 historical alert events for service-alpha")
+	log.Println("[demo-ratealert] tips:")
+	log.Println("[demo-ratealert]   GET  /api/v1/ratealert/rules - 查看所有预警规则")
+	log.Println("[demo-ratealert]   GET  /api/v1/ratealert/rules/service-alpha - 查看特定调用方规则")
+	log.Println("[demo-ratealert]   POST /api/v1/ratealert/rules - 设置预警规则 (body: {caller_id, window_sec, max_units_in_window, freeze_trigger_n})")
+	log.Println("[demo-ratealert]   GET  /api/v1/ratealert/events - 查看所有预警事件")
+	log.Println("[demo-ratealert]   GET  /api/v1/ratealert/events/service-alpha - 查看特定调用方预警历史")
+	log.Println("[demo-ratealert]   GET  /api/v1/ratealert/freezes - 查看当前冻结中的调用方")
+	log.Println("[demo-ratealert]   POST /api/v1/ratealert/freezes/<caller>/unfreeze - 手动解冻调用方")
 
 	return nil
 }

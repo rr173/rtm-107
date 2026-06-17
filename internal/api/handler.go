@@ -14,6 +14,7 @@ import (
 	"rtm-107/internal/lockbudget"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
+	"rtm-107/internal/ratealert"
 	"rtm-107/internal/ratelimit"
 	"rtm-107/internal/shadow"
 	"rtm-107/internal/topology"
@@ -36,13 +37,17 @@ type Handler struct {
 	heartbeatMgr *heartbeat.Manager
 	heatmapMgr   *heatmap.Manager
 	budgetMgr    *lockbudget.Manager
+	rateAlertMgr *ratealert.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager, hmm *heatmap.Manager, bm *lockbudget.Manager) *Handler {
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager, hmm *heatmap.Manager, bm *lockbudget.Manager, ram *ratealert.Manager) *Handler {
 	if bm == nil {
 		bm = m.BudgetManager()
 	}
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm, heatmapMgr: hmm, budgetMgr: bm}
+	if ram == nil && bm != nil {
+		ram = bm.RateAlertManager()
+	}
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm, heatmapMgr: hmm, budgetMgr: bm, rateAlertMgr: ram}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -275,6 +280,21 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			budgetGroup.GET("/bills/:id", h.GetBudgetSettlementBillDetail)
 			budgetGroup.GET("/arrears", h.ListBudgetArrears)
 			budgetGroup.POST("/recharge", h.RechargeBudget)
+		}
+
+		rateAlertGroup := api.Group("/ratealert")
+		{
+			rateAlertGroup.POST("/rules", h.SetRateAlertRule)
+			rateAlertGroup.GET("/rules", h.ListRateAlertRules)
+			rateAlertGroup.GET("/rules/:caller", h.GetRateAlertRule)
+			rateAlertGroup.DELETE("/rules/:caller", h.DeleteRateAlertRule)
+
+			rateAlertGroup.GET("/events", h.ListRateAlertEvents)
+			rateAlertGroup.GET("/events/:caller", h.GetCallerRateAlertEvents)
+
+			rateAlertGroup.GET("/freezes", h.ListFrozenCallers)
+			rateAlertGroup.GET("/freezes/:caller", h.GetCallerFreezeStatus)
+			rateAlertGroup.POST("/freezes/:caller/unfreeze", h.UnfreezeCaller)
 		}
 
 		heatmapGroup := api.Group("/heatmap")
@@ -2844,4 +2864,197 @@ func (h *Handler) RechargeBudget(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+type SetRateAlertRuleRequest struct {
+	CallerID         string `json:"caller_id" binding:"required"`
+	WindowSec        int    `json:"window_sec" binding:"required,min=1"`
+	MaxUnitsInWindow int    `json:"max_units_in_window" binding:"required,min=1"`
+	FreezeTriggerN   int    `json:"freeze_trigger_n"`
+	Enabled          *bool  `json:"enabled"`
+}
+
+func (h *Handler) SetRateAlertRule(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	var req SetRateAlertRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	freezeN := req.FreezeTriggerN
+	if freezeN <= 0 {
+		freezeN = 3
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	rule, err := h.rateAlertMgr.SetRule(req.CallerID, req.WindowSec, req.MaxUnitsInWindow, freezeN, enabled)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"rule": rule})
+}
+
+func (h *Handler) ListRateAlertRules(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	rules, err := h.rateAlertMgr.ListRules()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"rules": rules})
+}
+
+func (h *Handler) GetRateAlertRule(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	callerID := c.Param("caller")
+	rule, err := h.rateAlertMgr.GetRule(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if rule == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "rule not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"rule": rule})
+}
+
+func (h *Handler) DeleteRateAlertRule(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	callerID := c.Param("caller")
+	if err := h.rateAlertMgr.DeleteRule(callerID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) ListRateAlertEvents(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 {
+		limit = 100
+	}
+
+	events, err := h.rateAlertMgr.ListEvents("", limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+func (h *Handler) GetCallerRateAlertEvents(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	callerID := c.Param("caller")
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 {
+		limit = 100
+	}
+
+	events, err := h.rateAlertMgr.ListEvents(callerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"caller_id": callerID, "events": events})
+}
+
+func (h *Handler) ListFrozenCallers(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	freezes, err := h.rateAlertMgr.ListFrozenCallers()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"frozen_callers": freezes})
+}
+
+func (h *Handler) GetCallerFreezeStatus(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	callerID := c.Param("caller")
+	freeze, err := h.rateAlertMgr.GetFreezeStatus(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if freeze == nil || !freeze.Active {
+		c.JSON(http.StatusOK, gin.H{"caller_id": callerID, "frozen": false})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"caller_id": callerID, "frozen": true, "freeze": freeze})
+}
+
+type UnfreezeCallerRequest struct {
+	UnfrozenBy string `json:"unfrozen_by"`
+	Reason     string `json:"reason"`
+}
+
+func (h *Handler) UnfreezeCaller(c *gin.Context) {
+	if h.rateAlertMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate alert manager not initialized"})
+		return
+	}
+
+	callerID := c.Param("caller")
+
+	var req UnfreezeCallerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.UnfrozenBy = "admin"
+		req.Reason = ""
+	}
+
+	if err := h.rateAlertMgr.Unfreeze(callerID, req.UnfrozenBy, req.Reason); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "caller unfrozen"})
 }

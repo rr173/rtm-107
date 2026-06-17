@@ -1657,3 +1657,84 @@ type BudgetBillListQuery struct {
 	Offset   int    `form:"offset,default=0"`
 }
 
+type LockBudgetRateAlertRule struct {
+	ID               int64     `json:"id"`
+	CallerID         string    `json:"caller_id"`
+	WindowSec        int       `json:"window_sec"`
+	MaxUnitsInWindow int       `json:"max_units_in_window"`
+	FreezeTriggerN   int       `json:"freeze_trigger_n"`
+	Enabled          bool      `json:"enabled"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type LockBudgetRateAlertEvent struct {
+	ID               int64     `json:"id"`
+	CallerID         string    `json:"caller_id"`
+	WindowSec        int       `json:"window_sec"`
+	MaxUnitsInWindow int       `json:"max_units_in_window"`
+	ActualRate       float64   `json:"actual_rate"`
+	ConsumedInWindow int       `json:"consumed_in_window"`
+	Detail           string    `json:"detail,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+type LockBudgetCallerFreeze struct {
+	ID               int64     `json:"id"`
+	CallerID         string    `json:"caller_id"`
+	FrozenAt         time.Time `json:"frozen_at"`
+	FrozenBy         string    `json:"frozen_by"`
+	Reason           string    `json:"reason"`
+	AlertCountBefore int       `json:"alert_count_before"`
+	UnfrozenAt       *time.Time `json:"unfrozen_at,omitempty"`
+	UnfrozenBy       string    `json:"unfrozen_by,omitempty"`
+	UnfreezeReason   string    `json:"unfreeze_reason,omitempty"`
+	Active           bool      `json:"active"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type SetRateAlertRuleRequest struct {
+	CallerID         string `json:"caller_id" binding:"required"`
+	WindowSec        int    `json:"window_sec" binding:"required,min=1"`
+	MaxUnitsInWindow int    `json:"max_units_in_window" binding:"required,min=1"`
+	FreezeTriggerN   int    `json:"freeze_trigger_n" binding:"min=1"`
+	Enabled          bool   `json:"enabled"`
+}
+
+type RateAlertEventListQuery struct {
+	CallerID string `form:"caller_id"`
+	Limit    int    `form:"limit,default=50"`
+	Offset   int    `form:"offset,default=0"`
+}
+
+type RateAlertEventListResult struct {
+	Total  int64                     `json:"total"`
+	Items  []LockBudgetRateAlertEvent `json:"items"`
+	Limit  int                       `json:"limit"`
+	Offset int                       `json:"offset"`
+}
+
+type FreezeListResult struct {
+	Total int                      `json:"total"`
+	Items []LockBudgetCallerFreeze `json:"items"`
+}
+
+type UnfreezeRequest struct {
+	CallerID string `json:"caller_id" binding:"required"`
+	Operator string `json:"operator" binding:"required"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+type CallerRateStatus struct {
+	CallerID           string                      `json:"caller_id"`
+	Rule               *LockBudgetRateAlertRule    `json:"rule,omitempty"`
+	CurrentRate        float64                     `json:"current_rate"`
+	ConsumedInWindow   int                         `json:"consumed_in_window"`
+	WindowSec          int                         `json:"window_sec"`
+	MaxUnitsInWindow   int                         `json:"max_units_in_window"`
+	ConsecutiveAlerts  int                         `json:"consecutive_alerts"`
+	IsFrozen           bool                        `json:"is_frozen"`
+	FreezeInfo         *LockBudgetCallerFreeze     `json:"freeze_info,omitempty"`
+}
+

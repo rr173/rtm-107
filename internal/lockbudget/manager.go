@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"rtm-107/internal/model"
+	"rtm-107/internal/ratealert"
 	"rtm-107/internal/storage"
 	"sync"
 	"time"
@@ -39,12 +40,13 @@ type holdingState struct {
 }
 
 type Manager struct {
-	storage   *storage.Storage
-	mu        sync.Mutex
-	callers   map[string]*callerRuntimeState
-	stopCh    chan struct{}
-	ticker    *time.Ticker
-	dirty     bool
+	storage     *storage.Storage
+	mu          sync.Mutex
+	callers     map[string]*callerRuntimeState
+	stopCh      chan struct{}
+	ticker      *time.Ticker
+	dirty       bool
+	rateAlertMgr *ratealert.Manager
 }
 
 func NewManager(s *storage.Storage) *Manager {
@@ -53,6 +55,18 @@ func NewManager(s *storage.Storage) *Manager {
 		callers: make(map[string]*callerRuntimeState),
 		stopCh:  make(chan struct{}),
 	}
+}
+
+func (m *Manager) SetRateAlertManager(ram *ratealert.Manager) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rateAlertMgr = ram
+}
+
+func (m *Manager) RateAlertManager() *ratealert.Manager {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rateAlertMgr
 }
 
 func (m *Manager) Start() error {
@@ -447,6 +461,10 @@ func (m *Manager) meterCallerLocked(callerID string, rt *callerRuntimeState, now
 					}
 				}
 
+				if m.rateAlertMgr != nil {
+					_ = m.rateAlertMgr.RecordConsumption(callerID, unitsToAdd, now)
+				}
+
 				_ = m.storage.UpdateBudgetHoldingMeter(callerID, lockName, h.lastMeteredAt, h.unitsAccrued)
 				m.dirty = true
 			}
@@ -665,6 +683,16 @@ func (m *Manager) CheckAcquire(callerID string, lockName string, leaseSec int) (
 		}, nil
 	}
 
+	if m.rateAlertMgr != nil {
+		allowed, freezeReason, _ := m.rateAlertMgr.CheckAcquire(callerID)
+		if !allowed {
+			return &model.BudgetAcquireCheckResult{
+				Allowed: false,
+				Reason:  freezeReason,
+			}, nil
+		}
+	}
+
 	now := time.Now()
 	m.refreshCallerLocked(callerID, rt, now)
 
@@ -812,6 +840,10 @@ func (m *Manager) StopHolding(callerID string, lockName string, releasedAt time.
 
 			if rt.consumedUnits > rt.config.BudgetLimit {
 				rt.currentOverdraft = rt.consumedUnits - rt.config.BudgetLimit
+			}
+
+			if m.rateAlertMgr != nil {
+				_ = m.rateAlertMgr.RecordConsumption(callerID, unitsToAdd, releasedAt)
 			}
 		}
 	}

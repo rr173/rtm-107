@@ -799,6 +799,49 @@ func (s *Storage) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_budget_arrears_caller ON lock_budget_caller_arrears(caller_id);
 	CREATE INDEX IF NOT EXISTS idx_budget_arrears_status ON lock_budget_caller_arrears(status);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_rate_alert_rules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		window_sec INTEGER NOT NULL,
+		max_units_in_window INTEGER NOT NULL,
+		freeze_trigger_n INTEGER NOT NULL DEFAULT 3,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_rate_alert_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		window_sec INTEGER NOT NULL,
+		max_units_in_window INTEGER NOT NULL,
+		actual_rate REAL NOT NULL,
+		consumed_in_window INTEGER NOT NULL,
+		detail TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_rate_alert_events_caller ON lock_budget_rate_alert_events(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_rate_alert_events_created ON lock_budget_rate_alert_events(created_at);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_caller_freezes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		frozen_at DATETIME NOT NULL,
+		frozen_by TEXT NOT NULL DEFAULT 'system',
+		reason TEXT NOT NULL DEFAULT '',
+		alert_count_before INTEGER NOT NULL DEFAULT 0,
+		unfrozen_at DATETIME,
+		unfrozen_by TEXT DEFAULT '',
+		unfreeze_reason TEXT DEFAULT '',
+		active INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_caller_freezes_active ON lock_budget_caller_freezes(active);
+	CREATE INDEX IF NOT EXISTS idx_caller_freezes_caller ON lock_budget_caller_freezes(caller_id);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -5390,5 +5433,275 @@ func (s *Storage) ListBudgetTransfersInPeriod(callerID string, startAt, endAt ti
 		records = append(records, r)
 	}
 	return records, nil
+}
+
+func (s *Storage) UpsertRateAlertRule(rule *model.LockBudgetRateAlertRule) error {
+	enabledInt := 0
+	if rule.Enabled {
+		enabledInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_rate_alert_rules (
+			caller_id, window_sec, max_units_in_window, freeze_trigger_n, enabled, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			window_sec = excluded.window_sec,
+			max_units_in_window = excluded.max_units_in_window,
+			freeze_trigger_n = excluded.freeze_trigger_n,
+			enabled = excluded.enabled,
+			updated_at = excluded.updated_at
+	`, rule.CallerID, rule.WindowSec, rule.MaxUnitsInWindow, rule.FreezeTriggerN, enabledInt, rule.CreatedAt, rule.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if rule.ID == 0 {
+		rule.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetRateAlertRule(callerID string) (*model.LockBudgetRateAlertRule, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, window_sec, max_units_in_window, freeze_trigger_n, enabled, created_at, updated_at
+		FROM lock_budget_rate_alert_rules WHERE caller_id = ?
+	`, callerID)
+
+	var rule model.LockBudgetRateAlertRule
+	var enabledInt int
+	err := row.Scan(&rule.ID, &rule.CallerID, &rule.WindowSec, &rule.MaxUnitsInWindow, &rule.FreezeTriggerN, &enabledInt, &rule.CreatedAt, &rule.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rule.Enabled = enabledInt != 0
+	return &rule, nil
+}
+
+func (s *Storage) ListRateAlertRules() ([]model.LockBudgetRateAlertRule, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, window_sec, max_units_in_window, freeze_trigger_n, enabled, created_at, updated_at
+		FROM lock_budget_rate_alert_rules ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []model.LockBudgetRateAlertRule
+	for rows.Next() {
+		var rule model.LockBudgetRateAlertRule
+		var enabledInt int
+		if err := rows.Scan(&rule.ID, &rule.CallerID, &rule.WindowSec, &rule.MaxUnitsInWindow, &rule.FreezeTriggerN, &enabledInt, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rule.Enabled = enabledInt != 0
+		rules = append(rules, rule)
+	}
+	return rules, nil
+}
+
+func (s *Storage) DeleteRateAlertRule(callerID string) error {
+	_, err := s.db.Exec(`DELETE FROM lock_budget_rate_alert_rules WHERE caller_id = ?`, callerID)
+	return err
+}
+
+func (s *Storage) AddRateAlertEvent(e *model.LockBudgetRateAlertEvent) error {
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_rate_alert_events (
+			caller_id, window_sec, max_units_in_window, actual_rate, consumed_in_window, detail, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, e.CallerID, e.WindowSec, e.MaxUnitsInWindow, e.ActualRate, e.ConsumedInWindow, e.Detail, e.CreatedAt)
+	if err != nil {
+		return err
+	}
+	e.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListRateAlertEvents(query *model.RateAlertEventListQuery) ([]model.LockBudgetRateAlertEvent, int64, error) {
+	if query.Limit <= 0 {
+		query.Limit = 50
+	}
+	if query.Offset < 0 {
+		query.Offset = 0
+	}
+
+	var total int64
+	var rows *sql.Rows
+	var err error
+
+	if query.CallerID != "" {
+		err = s.db.QueryRow(`
+			SELECT COUNT(*) FROM lock_budget_rate_alert_events WHERE caller_id = ?
+		`, query.CallerID).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, window_sec, max_units_in_window, actual_rate, consumed_in_window, detail, created_at
+			FROM lock_budget_rate_alert_events WHERE caller_id = ?
+			ORDER BY id DESC LIMIT ? OFFSET ?
+		`, query.CallerID, query.Limit, query.Offset)
+	} else {
+		err = s.db.QueryRow(`SELECT COUNT(*) FROM lock_budget_rate_alert_events`).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, window_sec, max_units_in_window, actual_rate, consumed_in_window, detail, created_at
+			FROM lock_budget_rate_alert_events
+			ORDER BY id DESC LIMIT ? OFFSET ?
+		`, query.Limit, query.Offset)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var events []model.LockBudgetRateAlertEvent
+	for rows.Next() {
+		var e model.LockBudgetRateAlertEvent
+		if err := rows.Scan(&e.ID, &e.CallerID, &e.WindowSec, &e.MaxUnitsInWindow, &e.ActualRate, &e.ConsumedInWindow, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		events = append(events, e)
+	}
+	return events, total, nil
+}
+
+func (s *Storage) CountRecentRateAlertEvents(callerID string, since time.Time) (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM lock_budget_rate_alert_events
+		WHERE caller_id = ? AND created_at >= ?
+		ORDER BY id DESC
+	`, callerID, since).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) FreezeCaller(freeze *model.LockBudgetCallerFreeze) error {
+	activeInt := 0
+	if freeze.Active {
+		activeInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_caller_freezes (
+			caller_id, frozen_at, frozen_by, reason, alert_count_before,
+			unfrozen_at, unfrozen_by, unfreeze_reason, active, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			frozen_at = excluded.frozen_at,
+			frozen_by = excluded.frozen_by,
+			reason = excluded.reason,
+			alert_count_before = excluded.alert_count_before,
+			unfrozen_at = excluded.unfrozen_at,
+			unfrozen_by = excluded.unfrozen_by,
+			unfreeze_reason = excluded.unfreeze_reason,
+			active = excluded.active,
+			updated_at = excluded.updated_at
+	`, freeze.CallerID, freeze.FrozenAt, freeze.FrozenBy, freeze.Reason, freeze.AlertCountBefore,
+		nullTimePtr(freeze.UnfrozenAt), freeze.UnfrozenBy, freeze.UnfreezeReason, activeInt,
+		freeze.CreatedAt, freeze.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if freeze.ID == 0 {
+		freeze.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) UnfreezeCaller(callerID string, unfrozenAt time.Time, unfrozenBy string, reason string) error {
+	_, err := s.db.Exec(`
+		UPDATE lock_budget_caller_freezes SET
+			active = 0,
+			unfrozen_at = ?,
+			unfrozen_by = ?,
+			unfreeze_reason = ?,
+			updated_at = ?
+		WHERE caller_id = ? AND active = 1
+	`, unfrozenAt, unfrozenBy, reason, unfrozenAt, callerID)
+	return err
+}
+
+func (s *Storage) GetActiveFreeze(callerID string) (*model.LockBudgetCallerFreeze, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, frozen_at, frozen_by, reason, alert_count_before,
+			unfrozen_at, unfrozen_by, unfreeze_reason, active, created_at, updated_at
+		FROM lock_budget_caller_freezes WHERE caller_id = ? AND active = 1
+	`, callerID)
+
+	var freeze model.LockBudgetCallerFreeze
+	var activeInt int
+	var unfrozenAt sql.NullTime
+	var unfrozenBy, unfreezeReason sql.NullString
+	err := row.Scan(&freeze.ID, &freeze.CallerID, &freeze.FrozenAt, &freeze.FrozenBy, &freeze.Reason,
+		&freeze.AlertCountBefore, &unfrozenAt, &unfrozenBy, &unfreezeReason, &activeInt,
+		&freeze.CreatedAt, &freeze.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	freeze.Active = activeInt != 0
+	if unfrozenAt.Valid {
+		freeze.UnfrozenAt = &unfrozenAt.Time
+	}
+	if unfrozenBy.Valid {
+		freeze.UnfrozenBy = unfrozenBy.String
+	}
+	if unfreezeReason.Valid {
+		freeze.UnfreezeReason = unfreezeReason.String
+	}
+	return &freeze, nil
+}
+
+func (s *Storage) ListActiveFreezes() ([]model.LockBudgetCallerFreeze, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, frozen_at, frozen_by, reason, alert_count_before,
+			unfrozen_at, unfrozen_by, unfreeze_reason, active, created_at, updated_at
+		FROM lock_budget_caller_freezes WHERE active = 1 ORDER BY frozen_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var freezes []model.LockBudgetCallerFreeze
+	for rows.Next() {
+		var freeze model.LockBudgetCallerFreeze
+		var activeInt int
+		var unfrozenAt sql.NullTime
+		var unfrozenBy, unfreezeReason sql.NullString
+		if err := rows.Scan(&freeze.ID, &freeze.CallerID, &freeze.FrozenAt, &freeze.FrozenBy, &freeze.Reason,
+			&freeze.AlertCountBefore, &unfrozenAt, &unfrozenBy, &unfreezeReason, &activeInt,
+			&freeze.CreatedAt, &freeze.UpdatedAt); err != nil {
+			return nil, err
+		}
+		freeze.Active = activeInt != 0
+		if unfrozenAt.Valid {
+			freeze.UnfrozenAt = &unfrozenAt.Time
+		}
+		if unfrozenBy.Valid {
+			freeze.UnfrozenBy = unfrozenBy.String
+		}
+		if unfreezeReason.Valid {
+			freeze.UnfreezeReason = unfreezeReason.String
+		}
+		freezes = append(freezes, freeze)
+	}
+	return freezes, nil
+}
+
+func (s *Storage) CountConsecutiveAlertsSince(callerID string, since time.Time) (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM lock_budget_rate_alert_events
+		WHERE caller_id = ? AND created_at >= ?
+	`, callerID, since).Scan(&count)
+	return count, err
 }
 
