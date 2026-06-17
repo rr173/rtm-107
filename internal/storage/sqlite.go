@@ -661,6 +661,64 @@ func (s *Storage) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_cooldown_history_lock ON cooldown_history_records(lock_name);
 	CREATE INDEX IF NOT EXISTS idx_cooldown_history_created ON cooldown_history_records(created_at);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_configs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		budget_limit INTEGER NOT NULL,
+		period_sec INTEGER NOT NULL,
+		warning_pct INTEGER NOT NULL DEFAULT 80,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_holdings (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		lock_name TEXT NOT NULL,
+		acquired_at DATETIME NOT NULL,
+		expires_at DATETIME NOT NULL,
+		last_metered_at DATETIME NOT NULL,
+		units_accrued INTEGER NOT NULL DEFAULT 0,
+		UNIQUE(caller_id, lock_name)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_budget_holdings_caller ON lock_budget_holdings(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_budget_holdings_lock ON lock_budget_holdings(lock_name);
+	CREATE INDEX IF NOT EXISTS idx_budget_holdings_expires ON lock_budget_holdings(expires_at);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_exhaust_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		consumed_units INTEGER NOT NULL,
+		budget_limit INTEGER NOT NULL,
+		period_start_at DATETIME NOT NULL,
+		period_end_at DATETIME NOT NULL,
+		attempted_lock TEXT DEFAULT '',
+		units_requested INTEGER NOT NULL DEFAULT 0,
+		detail TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_budget_exhaust_caller ON lock_budget_exhaust_events(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_budget_exhaust_created ON lock_budget_exhaust_events(created_at);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_period_summaries (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		period_start_at DATETIME NOT NULL,
+		period_end_at DATETIME NOT NULL,
+		budget_limit INTEGER NOT NULL,
+		total_consumed INTEGER NOT NULL,
+		peak_concurrent INTEGER NOT NULL DEFAULT 0,
+		lock_count INTEGER NOT NULL DEFAULT 0,
+		exhaust_events INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(caller_id, period_start_at)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_budget_summary_caller ON lock_budget_period_summaries(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_budget_summary_period ON lock_budget_period_summaries(period_start_at);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -4453,3 +4511,299 @@ func (s *Storage) UpdateHeatmapConfig(cfg *model.HeatmapConfig) error {
 		cfg.Cooldown.ResolveThresholdMs, cfg.Cooldown.ResolveConsecutiveCycles, cfg.Cooldown.MaxCooldownSec, cooldownAcceleratedGrantInt, time.Now())
 	return err
 }
+
+func (s *Storage) UpsertLockBudgetConfig(cfg *model.LockBudgetConfig) error {
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_configs (caller_id, budget_limit, period_sec, warning_pct, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			budget_limit = excluded.budget_limit,
+			period_sec = excluded.period_sec,
+			warning_pct = excluded.warning_pct,
+			updated_at = excluded.updated_at
+	`, cfg.CallerID, cfg.BudgetLimit, cfg.PeriodSec, cfg.WarningPct, cfg.CreatedAt, cfg.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if cfg.ID == 0 {
+		cfg.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetLockBudgetConfig(callerID string) (*model.LockBudgetConfig, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, created_at, updated_at
+		FROM lock_budget_configs WHERE caller_id = ?
+	`, callerID)
+
+	var cfg model.LockBudgetConfig
+	err := row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.CreatedAt, &cfg.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (s *Storage) ListLockBudgetConfigs() ([]model.LockBudgetConfig, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, created_at, updated_at
+		FROM lock_budget_configs ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var configs []model.LockBudgetConfig
+	for rows.Next() {
+		var cfg model.LockBudgetConfig
+		if err := rows.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
+			return nil, err
+		}
+		configs = append(configs, cfg)
+	}
+	return configs, nil
+}
+
+func (s *Storage) DeleteLockBudgetConfig(callerID string) error {
+	_, err := s.db.Exec(`DELETE FROM lock_budget_configs WHERE caller_id = ?`, callerID)
+	return err
+}
+
+type BudgetHoldingRecord struct {
+	ID            int64
+	CallerID      string
+	LockName      string
+	AcquiredAt    time.Time
+	ExpiresAt     time.Time
+	LastMeteredAt time.Time
+	UnitsAccrued  int
+}
+
+func (s *Storage) UpsertBudgetHolding(callerID, lockName string, acquiredAt, expiresAt, lastMeteredAt time.Time, unitsAccrued int) error {
+	_, err := s.db.Exec(`
+		INSERT INTO lock_budget_holdings (caller_id, lock_name, acquired_at, expires_at, last_metered_at, units_accrued)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id, lock_name) DO UPDATE SET
+			expires_at = excluded.expires_at,
+			last_metered_at = excluded.last_metered_at,
+			units_accrued = excluded.units_accrued
+	`, callerID, lockName, acquiredAt, expiresAt, lastMeteredAt, unitsAccrued)
+	return err
+}
+
+func (s *Storage) UpdateBudgetHoldingMeter(callerID, lockName string, lastMeteredAt time.Time, unitsAccrued int) error {
+	_, err := s.db.Exec(`
+		UPDATE lock_budget_holdings SET last_metered_at = ?, units_accrued = ?
+		WHERE caller_id = ? AND lock_name = ?
+	`, lastMeteredAt, unitsAccrued, callerID, lockName)
+	return err
+}
+
+func (s *Storage) UpdateBudgetHoldingExpiry(callerID, lockName string, expiresAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE lock_budget_holdings SET expires_at = ?
+		WHERE caller_id = ? AND lock_name = ?
+	`, expiresAt, callerID, lockName)
+	return err
+}
+
+func (s *Storage) RemoveBudgetHolding(callerID, lockName string) error {
+	_, err := s.db.Exec(`
+		DELETE FROM lock_budget_holdings WHERE caller_id = ? AND lock_name = ?
+	`, callerID, lockName)
+	return err
+}
+
+func (s *Storage) ListBudgetHoldingsByCaller(callerID string) ([]BudgetHoldingRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, lock_name, acquired_at, expires_at, last_metered_at, units_accrued
+		FROM lock_budget_holdings WHERE caller_id = ? ORDER BY acquired_at
+	`, callerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []BudgetHoldingRecord
+	for rows.Next() {
+		var r BudgetHoldingRecord
+		if err := rows.Scan(&r.ID, &r.CallerID, &r.LockName, &r.AcquiredAt, &r.ExpiresAt, &r.LastMeteredAt, &r.UnitsAccrued); err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+func (s *Storage) ListAllBudgetHoldings() ([]BudgetHoldingRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, lock_name, acquired_at, expires_at, last_metered_at, units_accrued
+		FROM lock_budget_holdings ORDER BY caller_id, acquired_at
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []BudgetHoldingRecord
+	for rows.Next() {
+		var r BudgetHoldingRecord
+		if err := rows.Scan(&r.ID, &r.CallerID, &r.LockName, &r.AcquiredAt, &r.ExpiresAt, &r.LastMeteredAt, &r.UnitsAccrued); err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+func (s *Storage) CountActiveBudgetHoldingsByCaller(callerID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM lock_budget_holdings WHERE caller_id = ?`, callerID).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) AddBudgetExhaustEvent(e *model.BudgetExhaustEvent) error {
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_exhaust_events (
+			caller_id, consumed_units, budget_limit, period_start_at, period_end_at,
+			attempted_lock, units_requested, detail, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, e.CallerID, e.ConsumedUnits, e.BudgetLimit, e.PeriodStartAt, e.PeriodEndAt,
+		e.AttemptedLock, e.UnitsRequested, e.Detail, e.CreatedAt)
+	if err != nil {
+		return err
+	}
+	e.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListBudgetExhaustEvents(callerID string, limit int) ([]model.BudgetExhaustEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	var rows *sql.Rows
+	var err error
+
+	if callerID != "" {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, consumed_units, budget_limit, period_start_at, period_end_at,
+				attempted_lock, units_requested, detail, created_at
+			FROM lock_budget_exhaust_events WHERE caller_id = ? ORDER BY id DESC LIMIT ?
+		`, callerID, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, consumed_units, budget_limit, period_start_at, period_end_at,
+				attempted_lock, units_requested, detail, created_at
+			FROM lock_budget_exhaust_events ORDER BY id DESC LIMIT ?
+		`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []model.BudgetExhaustEvent
+	for rows.Next() {
+		var e model.BudgetExhaustEvent
+		if err := rows.Scan(&e.ID, &e.CallerID, &e.ConsumedUnits, &e.BudgetLimit, &e.PeriodStartAt, &e.PeriodEndAt,
+			&e.AttemptedLock, &e.UnitsRequested, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+func (s *Storage) CountBudgetExhaustEventsSince(callerID string, since time.Time) (int64, error) {
+	var count int64
+	var err error
+
+	if callerID != "" {
+		err = s.db.QueryRow(`
+			SELECT COUNT(*) FROM lock_budget_exhaust_events WHERE caller_id = ? AND created_at >= ?
+		`, callerID, since).Scan(&count)
+	} else {
+		err = s.db.QueryRow(`
+			SELECT COUNT(*) FROM lock_budget_exhaust_events WHERE created_at >= ?
+		`, since).Scan(&count)
+	}
+	return count, err
+}
+
+func (s *Storage) UpsertBudgetPeriodSummary(summary *model.BudgetPeriodSummary) error {
+	_, err := s.db.Exec(`
+		INSERT INTO lock_budget_period_summaries (
+			caller_id, period_start_at, period_end_at, budget_limit, total_consumed,
+			peak_concurrent, lock_count, exhaust_events, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id, period_start_at) DO UPDATE SET
+			period_end_at = excluded.period_end_at,
+			budget_limit = excluded.budget_limit,
+			total_consumed = excluded.total_consumed,
+			peak_concurrent = MAX(peak_concurrent, excluded.peak_concurrent),
+			lock_count = excluded.lock_count,
+			exhaust_events = lock_budget_period_summaries.exhaust_events + excluded.exhaust_events
+	`, summary.CallerID, summary.PeriodStartAt, summary.PeriodEndAt, summary.BudgetLimit,
+		summary.TotalConsumed, summary.PeakConcurrent, summary.LockCount, summary.ExhaustEvents, time.Now())
+	return err
+}
+
+func (s *Storage) ListBudgetPeriodSummaries(callerID string, limit int) ([]model.BudgetPeriodSummary, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	var rows *sql.Rows
+	var err error
+
+	if callerID != "" {
+		rows, err = s.db.Query(`
+			SELECT caller_id, period_start_at, period_end_at, budget_limit, total_consumed,
+				peak_concurrent, lock_count, exhaust_events
+			FROM lock_budget_period_summaries WHERE caller_id = ? ORDER BY period_start_at DESC LIMIT ?
+		`, callerID, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT caller_id, period_start_at, period_end_at, budget_limit, total_consumed,
+				peak_concurrent, lock_count, exhaust_events
+			FROM lock_budget_period_summaries ORDER BY period_start_at DESC LIMIT ?
+		`, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []model.BudgetPeriodSummary
+	for rows.Next() {
+		var s model.BudgetPeriodSummary
+		if err := rows.Scan(&s.CallerID, &s.PeriodStartAt, &s.PeriodEndAt, &s.BudgetLimit,
+			&s.TotalConsumed, &s.PeakConcurrent, &s.LockCount, &s.ExhaustEvents); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, s)
+	}
+	return summaries, nil
+}
+
+func (s *Storage) SumTotalConsumedSince(since time.Time) (int64, error) {
+	var total sql.NullInt64
+	err := s.db.QueryRow(`
+		SELECT COALESCE(SUM(total_consumed), 0)
+		FROM lock_budget_period_summaries WHERE period_start_at >= ?
+	`, since).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	if total.Valid {
+		return total.Int64, nil
+	}
+	return 0, nil
+}
+

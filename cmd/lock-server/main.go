@@ -11,6 +11,7 @@ import (
 	"rtm-107/internal/heartbeat"
 	"rtm-107/internal/heatmap"
 	"rtm-107/internal/lock"
+	"rtm-107/internal/lockbudget"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
@@ -39,6 +40,13 @@ func main() {
 	defer s.Close()
 
 	mgr := lock.NewManager(s)
+
+	budgetMgr := lockbudget.NewManager(s)
+	if err := budgetMgr.Start(); err != nil {
+		log.Fatalf("start budget manager: %v", err)
+	}
+	defer budgetMgr.Stop()
+	mgr.SetBudgetManager(budgetMgr)
 
 	heatmapMgr := heatmap.NewManager(s, mgr)
 	mgr.SetHeatmap(heatmapMgr)
@@ -153,7 +161,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr, heatmapMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr, heatmapMgr, budgetMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")

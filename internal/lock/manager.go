@@ -3,6 +3,7 @@ package lock
 import (
 	"fmt"
 	"log"
+	"rtm-107/internal/lockbudget"
 	"rtm-107/internal/model"
 	"rtm-107/internal/storage"
 	"sort"
@@ -15,13 +16,14 @@ const (
 )
 
 type Manager struct {
-	storage          *storage.Storage
-	mu               sync.Mutex
-	timers           map[string]*time.Timer
-	stopCh           chan struct{}
-	heatmap          HeatmapRecorder
+	storage           *storage.Storage
+	mu                sync.Mutex
+	timers            map[string]*time.Timer
+	stopCh            chan struct{}
+	heatmap           HeatmapRecorder
 	acceleratedGrants map[string]int
-	heatmapMgr       HeatmapCooldownManager
+	heatmapMgr        HeatmapCooldownManager
+	budgetMgr         *lockbudget.Manager
 }
 
 type HeatmapCooldownManager interface {
@@ -57,6 +59,18 @@ func (m *Manager) SetHeatmap(h HeatmapRecorder) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.heatmap = h
+}
+
+func (m *Manager) SetBudgetManager(b *lockbudget.Manager) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.budgetMgr = b
+}
+
+func (m *Manager) BudgetManager() *lockbudget.Manager {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.budgetMgr
 }
 
 func (m *Manager) Start() error {
@@ -121,13 +135,15 @@ func (m *Manager) stopLeaseTimerLocked(lockName string) {
 }
 
 type AcquireResult struct {
-	Acquired       bool
-	Queued         bool
-	Lock           *model.Lock
-	Lease          *model.Lease
-	Position       int
-	Deadlock       bool
-	DeadlockCycle  *model.DeadlockCycle
+	Acquired           bool
+	Queued             bool
+	Lock               *model.Lock
+	Lease              *model.Lease
+	Position           int
+	Deadlock           bool
+	DeadlockCycle      *model.DeadlockCycle
+	BudgetRejected     bool
+	BudgetCheckResult  *model.BudgetAcquireCheckResult
 }
 
 func (m *Manager) AcquireLock(lockName, holder string, leaseSec int, reentrant bool) (*AcquireResult, error) {
@@ -144,6 +160,22 @@ func (m *Manager) AcquireLock(lockName, holder string, leaseSec int, reentrant b
 func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reentrant bool) (*AcquireResult, error) {
 	if m.heatmap != nil {
 		m.heatmap.RecordLockRequest(lockName)
+	}
+
+	if m.budgetMgr != nil {
+		checkResult, err := m.budgetMgr.CheckAcquire(holder, lockName, leaseSec)
+		if err != nil {
+			log.Printf("[lock-manager] budget check error: holder=%s lock=%s err=%v", holder, lockName, err)
+		}
+		if checkResult != nil && !checkResult.Allowed {
+			m.addHistoryLocked(lockName, holder, model.OpAcquire,
+				fmt.Sprintf("rejected: budget exhausted (consumed=%d, limit=%d, remaining=%d)",
+					checkResult.ConsumedUnits, checkResult.BudgetLimit, checkResult.RemainingUnits))
+			return &AcquireResult{
+				BudgetRejected:    true,
+				BudgetCheckResult: checkResult,
+			}, nil
+		}
 	}
 
 	lock, err := m.storage.GetLock(lockName)
@@ -179,7 +211,12 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 				m.addHistoryLocked(lockName, holder, model.OpAcquire, fmt.Sprintf("reentrant acquire, count=%d", lock.Count))
 				lease, _ := m.storage.GetActiveLease(lockName)
 				fillLeaseRemaining(lease)
-				return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
+				result := &AcquireResult{Acquired: true, Lock: lock, Lease: lease}
+				if m.budgetMgr != nil {
+					check, _ := m.budgetMgr.CheckAcquire(holder, lockName, leaseSec)
+					result.BudgetCheckResult = check
+				}
+				return result, nil
 			}
 			return nil, fmt.Errorf("already hold this lock (non-reentrant)")
 		}
@@ -261,6 +298,12 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 
 	m.setLeaseTimerLocked(lockName, time.Duration(effectiveLeaseSec)*time.Second)
 
+	if m.budgetMgr != nil {
+		if err := m.budgetMgr.StartHolding(holder, lockName, lease.AcquiredAt, lease.ExpiresAt); err != nil {
+			log.Printf("[lock-manager] start holding budget error: holder=%s lock=%s err=%v", holder, lockName, err)
+		}
+	}
+
 	historyDetail := fmt.Sprintf("acquired, lease=%ds", effectiveLeaseSec)
 	if accelerated {
 		historyDetail += fmt.Sprintf(" (加速授予: 原租约%ds)", leaseSec)
@@ -270,8 +313,13 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 	}
 	m.addHistoryLocked(lockName, holder, model.OpAcquire, historyDetail)
 
+	result := &AcquireResult{Acquired: true, Lock: lock, Lease: lease}
+	if m.budgetMgr != nil {
+		check, _ := m.budgetMgr.CheckAcquire(holder, lockName, leaseSec)
+		result.BudgetCheckResult = check
+	}
 	fillLeaseRemaining(lease)
-	return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
+	return result, nil
 }
 
 type ReleaseResult struct {
@@ -314,6 +362,15 @@ func (m *Manager) releaseLockLocked(lockName, holder string) (*ReleaseResult, er
 		return &ReleaseResult{Released: true, Count: lock.Count}, nil
 	}
 
+	releaseTime := time.Now()
+	if m.budgetMgr != nil {
+		units, err := m.budgetMgr.StopHolding(holder, lockName, releaseTime)
+		if err != nil {
+			log.Printf("[lock-manager] stop holding budget error: holder=%s lock=%s err=%v", holder, lockName, err)
+		}
+		_ = units
+	}
+
 	m.stopLeaseTimerLocked(lockName)
 
 	if err := m.storage.DeactivateLease(lockName); err != nil {
@@ -323,7 +380,7 @@ func (m *Manager) releaseLockLocked(lockName, holder string) (*ReleaseResult, er
 	lock.Status = model.LockStatusFree
 	lock.Holder = ""
 	lock.Count = 0
-	lock.UpdatedAt = time.Now()
+	lock.UpdatedAt = releaseTime
 	if err := m.storage.UpsertLock(lock); err != nil {
 		return nil, err
 	}
@@ -354,6 +411,19 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 			m.heatmap.RecordLockTimeoutWithEnqueue(lockName, item.Holder, item.EnqueuedAt)
 		}
 		return m.tryGrantNextLocked(lockName)
+	}
+
+	if m.budgetMgr != nil {
+		checkResult, err := m.budgetMgr.CheckAcquire(item.Holder, lockName, item.LeaseSec)
+		if err != nil {
+			log.Printf("[lock-manager] budget check error on grant: holder=%s lock=%s err=%v", item.Holder, lockName, err)
+		}
+		if checkResult != nil && !checkResult.Allowed {
+			m.addHistoryLocked(lockName, item.Holder, model.OpTimeout,
+				fmt.Sprintf("skipped from queue: budget exhausted (consumed=%d, limit=%d, remaining=%d)",
+					checkResult.ConsumedUnits, checkResult.BudgetLimit, checkResult.RemainingUnits))
+			return m.tryGrantNextLocked(lockName)
+		}
 	}
 
 	lock, err := m.storage.GetLock(lockName)
@@ -392,6 +462,12 @@ func (m *Manager) tryGrantNextLocked(lockName string) (*model.Lock, error) {
 	}
 
 	m.setLeaseTimerLocked(lockName, time.Duration(leaseSec)*time.Second)
+
+	if m.budgetMgr != nil {
+		if err := m.budgetMgr.StartHolding(item.Holder, lockName, lease.AcquiredAt, lease.ExpiresAt); err != nil {
+			log.Printf("[lock-manager] start holding budget error on grant: holder=%s lock=%s err=%v", item.Holder, lockName, err)
+		}
+	}
 
 	grantDetail := fmt.Sprintf("granted from queue, lease=%ds", leaseSec)
 	if accelerated {
@@ -446,6 +522,12 @@ func (m *Manager) RenewLease(lockName, holder string, addSec int) (*model.Lease,
 		return nil, err
 	}
 
+	if m.budgetMgr != nil {
+		if err := m.budgetMgr.RenewHolding(holder, lockName, newExpiresAt); err != nil {
+			log.Printf("[lock-manager] renew holding budget error: holder=%s lock=%s err=%v", holder, lockName, err)
+		}
+	}
+
 	remaining := time.Until(newExpiresAt)
 	m.setLeaseTimerLocked(lockName, remaining)
 	lease.ExpiresAt = newExpiresAt
@@ -477,6 +559,15 @@ func (m *Manager) expireLockLocked(lockName string) {
 	}
 
 	holder := lock.Holder
+	expireTime := time.Now()
+
+	if m.budgetMgr != nil {
+		units, err := m.budgetMgr.StopHolding(holder, lockName, expireTime)
+		if err != nil {
+			log.Printf("[lock-manager] stop holding budget error on expire: holder=%s lock=%s err=%v", holder, lockName, err)
+		}
+		_ = units
+	}
 
 	delete(m.timers, lockName)
 
@@ -488,7 +579,7 @@ func (m *Manager) expireLockLocked(lockName string) {
 	lock.Status = model.LockStatusExpired
 	lock.Holder = ""
 	lock.Count = 0
-	lock.UpdatedAt = time.Now()
+	lock.UpdatedAt = expireTime
 	if err := m.storage.UpsertLock(lock); err != nil {
 		log.Printf("[lock-manager] upsert lock error: %v", err)
 		return
@@ -497,7 +588,7 @@ func (m *Manager) expireLockLocked(lockName string) {
 	m.addHistoryLocked(lockName, holder, model.OpExpire, "lease expired")
 
 	lock.Status = model.LockStatusFree
-	lock.UpdatedAt = time.Now()
+	lock.UpdatedAt = expireTime
 	if err := m.storage.UpsertLock(lock); err != nil {
 		log.Printf("[lock-manager] upsert lock free error: %v", err)
 		return
@@ -937,6 +1028,23 @@ func (m *Manager) AcquireLocksBatch(lockNames []string, holder string, leaseSec 
 }
 
 func (m *Manager) acquireLockNoQueueLocked(lockName, holder string, leaseSec int, reentrant bool) (*AcquireResult, error) {
+	if m.budgetMgr != nil {
+		checkResult, err := m.budgetMgr.CheckAcquire(holder, lockName, leaseSec)
+		if err != nil {
+			log.Printf("[lock-manager] budget check error (noqueue): holder=%s lock=%s err=%v", holder, lockName, err)
+		}
+		if checkResult != nil && !checkResult.Allowed {
+			m.addHistoryLocked(lockName, holder, model.OpAcquire,
+				fmt.Sprintf("rejected (batch): budget exhausted (consumed=%d, limit=%d, remaining=%d)",
+					checkResult.ConsumedUnits, checkResult.BudgetLimit, checkResult.RemainingUnits))
+			return &AcquireResult{
+				BudgetRejected:    true,
+				BudgetCheckResult: checkResult,
+			}, fmt.Errorf("budget exhausted for caller %s: consumed=%d, limit=%d, remaining=%d",
+				holder, checkResult.ConsumedUnits, checkResult.BudgetLimit, checkResult.RemainingUnits)
+		}
+	}
+
 	lock, err := m.storage.GetLock(lockName)
 	if err != nil {
 		return nil, err
@@ -970,7 +1078,12 @@ func (m *Manager) acquireLockNoQueueLocked(lockName, holder string, leaseSec int
 				m.addHistoryLocked(lockName, holder, model.OpAcquire, fmt.Sprintf("reentrant acquire, count=%d", lock.Count))
 				lease, _ := m.storage.GetActiveLease(lockName)
 				fillLeaseRemaining(lease)
-				return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
+				result := &AcquireResult{Acquired: true, Lock: lock, Lease: lease}
+				if m.budgetMgr != nil {
+					check, _ := m.budgetMgr.CheckAcquire(holder, lockName, leaseSec)
+					result.BudgetCheckResult = check
+				}
+				return result, nil
 			}
 			return nil, fmt.Errorf("already hold this lock (non-reentrant)")
 		}
@@ -1000,8 +1113,19 @@ func (m *Manager) acquireLockNoQueueLocked(lockName, holder string, leaseSec int
 
 	m.setLeaseTimerLocked(lockName, time.Duration(leaseSec)*time.Second)
 
+	if m.budgetMgr != nil {
+		if err := m.budgetMgr.StartHolding(holder, lockName, lease.AcquiredAt, lease.ExpiresAt); err != nil {
+			log.Printf("[lock-manager] start holding budget error (batch): holder=%s lock=%s err=%v", holder, lockName, err)
+		}
+	}
+
+	result := &AcquireResult{Acquired: true, Lock: lock, Lease: lease}
+	if m.budgetMgr != nil {
+		check, _ := m.budgetMgr.CheckAcquire(holder, lockName, leaseSec)
+		result.BudgetCheckResult = check
+	}
 	fillLeaseRemaining(lease)
-	return &AcquireResult{Acquired: true, Lock: lock, Lease: lease}, nil
+	return result, nil
 }
 
 func (m *Manager) rollbackBatchLocked(locks []*model.Lock, holder string) {

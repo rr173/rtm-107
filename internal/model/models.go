@@ -1353,3 +1353,96 @@ const (
 	OpCooldownStart OperationType = "cooldown_start"
 	OpCooldownEnd   OperationType = "cooldown_end"
 )
+
+type LockBudgetConfig struct {
+	ID           int64     `json:"id"`
+	CallerID     string    `json:"caller_id"`
+	BudgetLimit  int       `json:"budget_limit"`
+	PeriodSec    int       `json:"period_sec"`
+	WarningPct   int       `json:"warning_pct"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type LockBudgetStatus struct {
+	CallerID       string    `json:"caller_id"`
+	BudgetLimit    int       `json:"budget_limit"`
+	PeriodSec      int       `json:"period_sec"`
+	ConsumedUnits  int       `json:"consumed_units"`
+	RemainingUnits int       `json:"remaining_units"`
+	WarningPct     int       `json:"warning_pct"`
+	WarningTriggered bool    `json:"warning_triggered"`
+	Exhausted      bool      `json:"exhausted"`
+	PeriodStartAt  time.Time `json:"period_start_at"`
+	PeriodEndAt    time.Time `json:"period_end_at"`
+	ActiveLocks    int       `json:"active_locks"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type HeldLockDetail struct {
+	LockName      string    `json:"lock_name"`
+	AcquiredAt    time.Time `json:"acquired_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	HeldSec       float64   `json:"held_sec"`
+	UnitsConsumed int       `json:"units_consumed"`
+	UnitsProjected int      `json:"units_projected"`
+}
+
+type BudgetExhaustEvent struct {
+	ID             int64     `json:"id"`
+	CallerID       string    `json:"caller_id"`
+	ConsumedUnits  int       `json:"consumed_units"`
+	BudgetLimit    int       `json:"budget_limit"`
+	PeriodStartAt  time.Time `json:"period_start_at"`
+	PeriodEndAt    time.Time `json:"period_end_at"`
+	AttemptedLock  string    `json:"attempted_lock,omitempty"`
+	UnitsRequested int       `json:"units_requested,omitempty"`
+	Detail         string    `json:"detail,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type BudgetPeriodSummary struct {
+	CallerID       string    `json:"caller_id"`
+	PeriodStartAt  time.Time `json:"period_start_at"`
+	PeriodEndAt    time.Time `json:"period_end_at"`
+	BudgetLimit    int       `json:"budget_limit"`
+	TotalConsumed  int       `json:"total_consumed"`
+	PeakConcurrent int       `json:"peak_concurrent"`
+	LockCount      int       `json:"lock_count"`
+	ExhaustEvents  int       `json:"exhaust_events"`
+}
+
+type SetBudgetRequest struct {
+	CallerID    string `json:"caller_id" binding:"required"`
+	BudgetLimit int    `json:"budget_limit" binding:"required,min=1"`
+	PeriodSec   int    `json:"period_sec" binding:"required,min=1"`
+	WarningPct  int    `json:"warning_pct" binding:"min=0,max=100"`
+}
+
+type BudgetAcquireCheckResult struct {
+	Allowed        bool   `json:"allowed"`
+	ConsumedUnits  int    `json:"consumed_units"`
+	RemainingUnits int    `json:"remaining_units"`
+	BudgetLimit    int    `json:"budget_limit"`
+	Reason         string `json:"reason,omitempty"`
+}
+
+func (r *BudgetAcquireCheckResult) BudgetRejected() bool {
+	return !r.Allowed
+}
+
+type CallerBudgetStatusInfo struct {
+	Config    *LockBudgetConfig  `json:"config,omitempty"`
+	Status    *LockBudgetStatus  `json:"status,omitempty"`
+	HeldLocks []HeldLockDetail   `json:"held_locks,omitempty"`
+}
+
+type GlobalBudgetStats struct {
+	TotalCallers       int   `json:"total_callers"`
+	TotalActiveLocks   int   `json:"total_active_locks"`
+	TotalConsumedToday int64 `json:"total_consumed_today"`
+	ExhaustEvents24h   int64 `json:"exhaust_events_24h"`
+	CallersOverBudget  int   `json:"callers_over_budget"`
+	CallersNearBudget  int   `json:"callers_near_budget"`
+}
+

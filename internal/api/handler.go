@@ -11,6 +11,7 @@ import (
 	"rtm-107/internal/heartbeat"
 	"rtm-107/internal/heatmap"
 	"rtm-107/internal/lock"
+	"rtm-107/internal/lockbudget"
 	"rtm-107/internal/model"
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratelimit"
@@ -34,10 +35,14 @@ type Handler struct {
 	handoverMgr  *handover.Manager
 	heartbeatMgr *heartbeat.Manager
 	heatmapMgr   *heatmap.Manager
+	budgetMgr    *lockbudget.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager, hmm *heatmap.Manager) *Handler {
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm, heatmapMgr: hmm}
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager, hmm *heatmap.Manager, bm *lockbudget.Manager) *Handler {
+	if bm == nil {
+		bm = m.BudgetManager()
+	}
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm, heatmapMgr: hmm, budgetMgr: bm}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -241,6 +246,22 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			heartbeatGroup.GET("/dependencies", h.ListGroupDependencies)
 
 			heartbeatGroup.GET("/degraded", h.ListDegradedGroups)
+		}
+
+		budgetGroup := api.Group("/budget")
+		{
+			budgetGroup.GET("/configs", h.ListBudgetConfigs)
+			budgetGroup.POST("/configs", h.SetBudgetConfig)
+			budgetGroup.GET("/configs/:caller", h.GetBudgetConfig)
+			budgetGroup.DELETE("/configs/:caller", h.DeleteBudgetConfig)
+
+			budgetGroup.GET("/statuses", h.ListBudgetStatuses)
+			budgetGroup.GET("/statuses/:caller", h.GetBudgetStatus)
+
+			budgetGroup.GET("/holdings/:caller", h.ListHeldLocks)
+
+			budgetGroup.GET("/events", h.ListBudgetExhaustEvents)
+			budgetGroup.GET("/events/:caller", h.GetCallerBudgetExhaustEvents)
 		}
 
 		heatmapGroup := api.Group("/heatmap")
@@ -2427,4 +2448,159 @@ func (h *Handler) ManualStopCooldown(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "cooldown": state})
+}
+
+type SetBudgetConfigRequest struct {
+	CallerID    string `json:"caller_id" binding:"required"`
+	BudgetLimit int    `json:"budget_limit" binding:"required,min=1"`
+	PeriodSec   int    `json:"period_sec" binding:"required,min=1"`
+	WarningPct  int    `json:"warning_pct"`
+}
+
+func (h *Handler) ListBudgetConfigs(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	configs, err := h.budgetMgr.ListConfigs()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, configs)
+}
+
+func (h *Handler) GetBudgetConfig(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	callerID := c.Param("caller")
+	cfg, err := h.budgetMgr.GetConfig(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if cfg == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, cfg)
+}
+
+func (h *Handler) SetBudgetConfig(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	var req SetBudgetConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.WarningPct <= 0 || req.WarningPct > 100 {
+		req.WarningPct = 80
+	}
+	cfg, err := h.budgetMgr.SetConfig(req.CallerID, req.BudgetLimit, req.PeriodSec, req.WarningPct)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, cfg)
+}
+
+func (h *Handler) DeleteBudgetConfig(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	callerID := c.Param("caller")
+	if err := h.budgetMgr.DeleteConfig(callerID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *Handler) ListBudgetStatuses(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	statuses, err := h.budgetMgr.ListStatuses()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, statuses)
+}
+
+func (h *Handler) GetBudgetStatus(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	callerID := c.Param("caller")
+	status, err := h.budgetMgr.GetStatus(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if status == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no budget config for caller"})
+		return
+	}
+	c.JSON(http.StatusOK, status)
+}
+
+func (h *Handler) ListHeldLocks(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	callerID := c.Param("caller")
+	now := time.Now()
+	holdings, err := h.budgetMgr.ListHeldLocks(callerID, now)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"caller": callerID, "holdings": holdings})
+}
+
+func (h *Handler) ListBudgetExhaustEvents(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 {
+		limit = 100
+	}
+	events, err := h.budgetMgr.ListExhaustEvents("", limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+func (h *Handler) GetCallerBudgetExhaustEvents(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	callerID := c.Param("caller")
+	limitStr := c.DefaultQuery("limit", "100")
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 {
+		limit = 100
+	}
+	events, err := h.budgetMgr.ListExhaustEvents(callerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"caller": callerID, "events": events})
 }
