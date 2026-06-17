@@ -5277,7 +5277,7 @@ func (s *Storage) RechargeBudget(callerID string, amount int) (*model.BudgetRech
 	defer tx.Rollback()
 
 	row := tx.QueryRow(`
-		SELECT id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
 		FROM lock_budget_configs WHERE caller_id = ?
 	`, callerID)
 
