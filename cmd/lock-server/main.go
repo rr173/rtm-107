@@ -16,6 +16,7 @@ import (
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratealert"
 	"rtm-107/internal/ratelimit"
+	"rtm-107/internal/reputation"
 	"rtm-107/internal/shadow"
 	"rtm-107/internal/storage"
 	"rtm-107/internal/topology"
@@ -55,6 +56,14 @@ func main() {
 	}
 	defer rateAlertMgr.Stop()
 	budgetMgr.SetRateAlertManager(rateAlertMgr)
+
+	reputationMgr := reputation.NewManager(s)
+	if err := reputationMgr.Start(); err != nil {
+		log.Fatalf("start reputation manager: %v", err)
+	}
+	defer reputationMgr.Stop()
+	mgr.SetReputationChecker(reputationMgr)
+	budgetMgr.SetReputationChecker(reputationMgr)
 
 	heatmapMgr := heatmap.NewManager(s, mgr)
 	mgr.SetHeatmap(heatmapMgr)
@@ -173,7 +182,7 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr, heatmapMgr, budgetMgr, rateAlertMgr)
+	handler := api.NewHandler(mgr, rlMgr, orchMgr, auditMgr, topoMgr, shadowMgr, debtMgr, handoverMgr, heartbeatMgr, heatmapMgr, budgetMgr, rateAlertMgr, reputationMgr)
 	handler.RegisterRoutes(r)
 
 	addr := os.Getenv("ADDR")

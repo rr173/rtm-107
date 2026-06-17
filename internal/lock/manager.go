@@ -24,6 +24,7 @@ type Manager struct {
 	acceleratedGrants map[string]int
 	heatmapMgr        HeatmapCooldownManager
 	budgetMgr         *lockbudget.Manager
+	reputationChecker ReputationChecker
 }
 
 type HeatmapCooldownManager interface {
@@ -38,6 +39,12 @@ type HeatmapRecorder interface {
 	RecordLockTimeout(lockName, holder string)
 	RecordLockTimeoutWithEnqueue(lockName, holder string, enqueuedAt time.Time)
 	RecordLockRequestWithWait(lockName string, waitMs int64)
+}
+
+type ReputationChecker interface {
+	ShouldPrioritizeInQueue(callerID string) bool
+	CheckBronzeLockLimit(callerID string, currentHeldLocks int, configuredMax int) (bool, string)
+	IsBronze(callerID string) bool
 }
 
 func NewManager(s *storage.Storage) *Manager {
@@ -65,6 +72,12 @@ func (m *Manager) SetBudgetManager(b *lockbudget.Manager) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.budgetMgr = b
+}
+
+func (m *Manager) SetReputationChecker(rc ReputationChecker) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reputationChecker = rc
 }
 
 func (m *Manager) BudgetManager() *lockbudget.Manager {
@@ -178,6 +191,24 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 		}
 	}
 
+	if m.reputationChecker != nil && m.budgetMgr != nil {
+		heldLocks, _ := m.storage.CountActiveLeasesByHolder(holder)
+		budgetCfg, _ := m.storage.GetLockBudgetConfig(holder)
+		configuredMax := 0
+		if budgetCfg != nil {
+			configuredMax = budgetCfg.MaxConcurrentLocks
+		}
+		if configuredMax > 0 {
+			allowed, reason := m.reputationChecker.CheckBronzeLockLimit(holder, heldLocks, configuredMax)
+			if !allowed {
+				m.addHistoryLocked(lockName, holder, model.OpAcquire, "rejected: "+reason)
+				return &AcquireResult{
+					BudgetRejected: false,
+				}, fmt.Errorf("rejected: %s", reason)
+			}
+		}
+	}
+
 	lock, err := m.storage.GetLock(lockName)
 	if err != nil {
 		return nil, err
@@ -256,6 +287,14 @@ func (m *Manager) acquireLockLocked(lockName, holder string, leaseSec int, reent
 		if err := m.storage.Enqueue(item); err != nil {
 			return nil, err
 		}
+
+		if m.reputationChecker != nil && m.reputationChecker.ShouldPrioritizeInQueue(holder) {
+			goldHolders := map[string]bool{holder: true}
+			if err := m.storage.ReorderWaitQueueForGold(lockName, goldHolders); err != nil {
+				log.Printf("[lock-manager] reorder queue for gold error: lock=%s holder=%s err=%v", lockName, holder, err)
+			}
+		}
+
 		m.addHistoryLocked(lockName, holder, model.OpAcquire, "queued")
 		if m.heatmap != nil {
 			m.heatmap.RecordLockEnqueue(lockName, holder)

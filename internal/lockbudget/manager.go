@@ -39,14 +39,20 @@ type holdingState struct {
 	inOverdraft     bool
 }
 
+type ReputationChecker interface {
+	GetEffectiveOverdraftLimit(callerID string, configOverdraftLimit int) int
+	CanTransferBudget(callerID string) bool
+}
+
 type Manager struct {
-	storage     *storage.Storage
-	mu          sync.Mutex
-	callers     map[string]*callerRuntimeState
-	stopCh      chan struct{}
-	ticker      *time.Ticker
-	dirty       bool
-	rateAlertMgr *ratealert.Manager
+	storage          *storage.Storage
+	mu               sync.Mutex
+	callers          map[string]*callerRuntimeState
+	stopCh           chan struct{}
+	ticker           *time.Ticker
+	dirty            bool
+	rateAlertMgr     *ratealert.Manager
+	reputationChecker ReputationChecker
 }
 
 func NewManager(s *storage.Storage) *Manager {
@@ -61,6 +67,12 @@ func (m *Manager) SetRateAlertManager(ram *ratealert.Manager) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.rateAlertMgr = ram
+}
+
+func (m *Manager) SetReputationChecker(rc ReputationChecker) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reputationChecker = rc
 }
 
 func (m *Manager) RateAlertManager() *ratealert.Manager {
@@ -610,6 +622,10 @@ func (m *Manager) TransferBudget(fromCaller, toCaller string, amount int, reason
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.reputationChecker != nil && !m.reputationChecker.CanTransferBudget(fromCaller) {
+		return nil, fmt.Errorf("铜牌调用方不允许使用预算转移功能: %s", fromCaller)
+	}
+
 	now := time.Now()
 
 	fromRT, ok := m.callers[fromCaller]
@@ -709,13 +725,19 @@ func (m *Manager) CheckAcquire(callerID string, lockName string, leaseSec int) (
 		CurrentOverdraft: rt.currentOverdraft,
 	}
 
-	if rt.config.OverdraftLimit > 0 {
-		effectiveLimit := rt.config.BudgetLimit + rt.config.OverdraftLimit
+	effectiveOverdraftLimit := rt.config.OverdraftLimit
+	if m.reputationChecker != nil {
+		effectiveOverdraftLimit = m.reputationChecker.GetEffectiveOverdraftLimit(callerID, rt.config.OverdraftLimit)
+	}
+	result.OverdraftLimit = effectiveOverdraftLimit
+
+	if effectiveOverdraftLimit > 0 {
+		effectiveLimit := rt.config.BudgetLimit + effectiveOverdraftLimit
 		if rt.consumedUnits >= effectiveLimit {
 			result.Allowed = false
 			result.UsingOverdraft = true
 			result.Reason = fmt.Sprintf("budget and overdraft exhausted: consumed=%d, budget=%d, overdraft_limit=%d, effective_limit=%d",
-				rt.consumedUnits, rt.config.BudgetLimit, rt.config.OverdraftLimit, effectiveLimit)
+				rt.consumedUnits, rt.config.BudgetLimit, effectiveOverdraftLimit, effectiveLimit)
 
 			event := &model.BudgetExhaustEvent{
 				CallerID:       callerID,
@@ -732,7 +754,7 @@ func (m *Manager) CheckAcquire(callerID string, lockName string, leaseSec int) (
 			rt.exhaustCount++
 
 			log.Printf("[lockbudget] acquire rejected (overdraft exhausted): caller=%s lock=%s consumed=%d budget=%d overdraft=%d",
-				callerID, lockName, rt.consumedUnits, rt.config.BudgetLimit, rt.config.OverdraftLimit)
+				callerID, lockName, rt.consumedUnits, rt.config.BudgetLimit, effectiveOverdraftLimit)
 			return result, nil
 		}
 
@@ -740,7 +762,7 @@ func (m *Manager) CheckAcquire(callerID string, lockName string, leaseSec int) (
 			result.Allowed = true
 			result.UsingOverdraft = true
 			result.Reason = fmt.Sprintf("using overdraft: consumed=%d, budget=%d, current_overdraft=%d, overdraft_limit=%d (penalty x%.1f)",
-				rt.consumedUnits, rt.config.BudgetLimit, rt.currentOverdraft, rt.config.OverdraftLimit, model.OverdraftPenaltyMultiplier)
+				rt.consumedUnits, rt.config.BudgetLimit, rt.currentOverdraft, effectiveOverdraftLimit, model.OverdraftPenaltyMultiplier)
 			return result, nil
 		}
 	} else {

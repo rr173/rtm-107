@@ -16,6 +16,7 @@ import (
 	"rtm-107/internal/orchestration"
 	"rtm-107/internal/ratealert"
 	"rtm-107/internal/ratelimit"
+	"rtm-107/internal/reputation"
 	"rtm-107/internal/shadow"
 	"rtm-107/internal/topology"
 	"strconv"
@@ -26,28 +27,29 @@ import (
 )
 
 type Handler struct {
-	manager      *lock.Manager
-	rateLimiter  *ratelimit.Manager
-	orchMgr      *orchestration.Manager
-	auditMgr     *audit.Manager
-	topoMgr      *topology.Manager
-	shadowMgr    *shadow.Manager
-	debtMgr      *debt.Manager
-	handoverMgr  *handover.Manager
-	heartbeatMgr *heartbeat.Manager
-	heatmapMgr   *heatmap.Manager
-	budgetMgr    *lockbudget.Manager
-	rateAlertMgr *ratealert.Manager
+	manager       *lock.Manager
+	rateLimiter   *ratelimit.Manager
+	orchMgr       *orchestration.Manager
+	auditMgr      *audit.Manager
+	topoMgr       *topology.Manager
+	shadowMgr     *shadow.Manager
+	debtMgr       *debt.Manager
+	handoverMgr   *handover.Manager
+	heartbeatMgr  *heartbeat.Manager
+	heatmapMgr    *heatmap.Manager
+	budgetMgr     *lockbudget.Manager
+	rateAlertMgr  *ratealert.Manager
+	reputationMgr *reputation.Manager
 }
 
-func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager, hmm *heatmap.Manager, bm *lockbudget.Manager, ram *ratealert.Manager) *Handler {
+func NewHandler(m *lock.Manager, rl *ratelimit.Manager, om *orchestration.Manager, am *audit.Manager, tm *topology.Manager, sm *shadow.Manager, dm *debt.Manager, hm *handover.Manager, hbm *heartbeat.Manager, hmm *heatmap.Manager, bm *lockbudget.Manager, ram *ratealert.Manager, repMgr *reputation.Manager) *Handler {
 	if bm == nil {
 		bm = m.BudgetManager()
 	}
 	if ram == nil && bm != nil {
 		ram = bm.RateAlertManager()
 	}
-	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm, heatmapMgr: hmm, budgetMgr: bm, rateAlertMgr: ram}
+	return &Handler{manager: m, rateLimiter: rl, orchMgr: om, auditMgr: am, topoMgr: tm, shadowMgr: sm, debtMgr: dm, handoverMgr: hm, heartbeatMgr: hbm, heatmapMgr: hmm, budgetMgr: bm, rateAlertMgr: ram, reputationMgr: repMgr}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -315,6 +317,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			heatmapGroup.GET("/cooldowns/suggestions", h.GetCooldownSuggestions)
 			heatmapGroup.POST("/cooldowns/:name/start", h.ManualStartCooldown)
 			heatmapGroup.POST("/cooldowns/:name/stop", h.ManualStopCooldown)
+		}
+
+		reputationGroup := api.Group("/reputation")
+		{
+			reputationGroup.GET("/ranking", h.GetReputationRanking)
+			reputationGroup.GET("/callers/:caller", h.GetCallerReputationDetail)
+			reputationGroup.GET("/callers/:caller/events", h.ListCallerTierChangeEvents)
 		}
 	}
 }
@@ -3057,4 +3066,61 @@ func (h *Handler) UnfreezeCaller(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "caller unfrozen"})
+}
+
+func (h *Handler) GetReputationRanking(c *gin.Context) {
+	if h.reputationMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reputation module not enabled"})
+		return
+	}
+	result, err := h.reputationMgr.GetRanking()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) GetCallerReputationDetail(c *gin.Context) {
+	if h.reputationMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reputation module not enabled"})
+		return
+	}
+	callerID := c.Param("caller")
+	if callerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller is required"})
+		return
+	}
+	detail, err := h.reputationMgr.GetCallerDetail(callerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, detail)
+}
+
+func (h *Handler) ListCallerTierChangeEvents(c *gin.Context) {
+	if h.reputationMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reputation module not enabled"})
+		return
+	}
+	callerID := c.Param("caller")
+	if callerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "caller is required"})
+		return
+	}
+	limit := 50
+	offset := 0
+	if l, err := strconv.Atoi(c.DefaultQuery("limit", "50")); err == nil && l > 0 {
+		limit = l
+	}
+	if o, err := strconv.Atoi(c.DefaultQuery("offset", "0")); err == nil && o >= 0 {
+		offset = o
+	}
+	result, err := h.reputationMgr.ListTierChangeEvents(callerID, limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }

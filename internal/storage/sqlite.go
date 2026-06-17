@@ -669,6 +669,7 @@ func (s *Storage) initSchema() error {
 		period_sec INTEGER NOT NULL,
 		warning_pct INTEGER NOT NULL DEFAULT 80,
 		overdraft_limit INTEGER NOT NULL DEFAULT 0,
+		max_concurrent_locks INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -842,6 +843,38 @@ func (s *Storage) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_caller_freezes_active ON lock_budget_caller_freezes(active);
 	CREATE INDEX IF NOT EXISTS idx_caller_freezes_caller ON lock_budget_caller_freezes(caller_id);
+
+	CREATE TABLE IF NOT EXISTS caller_reputations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		score REAL NOT NULL DEFAULT 0,
+		tier TEXT NOT NULL DEFAULT 'silver',
+		on_time_release_score REAL NOT NULL DEFAULT 0,
+		overdraft_reverse_score REAL NOT NULL DEFAULT 0,
+		circuit_breaker_score REAL NOT NULL DEFAULT 0,
+		arrear_score REAL NOT NULL DEFAULT 0,
+		rate_alert_score REAL NOT NULL DEFAULT 0,
+		calculated_at DATETIME NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_reputation_caller ON caller_reputations(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_reputation_tier ON caller_reputations(tier);
+	CREATE INDEX IF NOT EXISTS idx_reputation_score ON caller_reputations(score DESC);
+
+	CREATE TABLE IF NOT EXISTS tier_change_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		old_tier TEXT NOT NULL,
+		new_tier TEXT NOT NULL,
+		score REAL NOT NULL,
+		changed_at DATETIME NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_tier_change_caller ON tier_change_events(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_tier_change_changed ON tier_change_events(changed_at);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -963,7 +996,8 @@ func (s *Storage) migrateSchema() error {
 	}
 
 	lbCfgColumns := map[string]int{
-		"overdraft_limit": 0,
+		"overdraft_limit":      0,
+		"max_concurrent_locks": 0,
 	}
 	for col, defaultValue := range lbCfgColumns {
 		row := s.db.QueryRow(`
@@ -4684,15 +4718,16 @@ func (s *Storage) UpdateHeatmapConfig(cfg *model.HeatmapConfig) error {
 
 func (s *Storage) UpsertLockBudgetConfig(cfg *model.LockBudgetConfig) error {
 	result, err := s.db.Exec(`
-		INSERT INTO lock_budget_configs (caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO lock_budget_configs (caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, max_concurrent_locks, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(caller_id) DO UPDATE SET
 			budget_limit = excluded.budget_limit,
 			period_sec = excluded.period_sec,
 			warning_pct = excluded.warning_pct,
 			overdraft_limit = excluded.overdraft_limit,
+			max_concurrent_locks = excluded.max_concurrent_locks,
 			updated_at = excluded.updated_at
-	`, cfg.CallerID, cfg.BudgetLimit, cfg.PeriodSec, cfg.WarningPct, cfg.OverdraftLimit, cfg.CreatedAt, cfg.UpdatedAt)
+	`, cfg.CallerID, cfg.BudgetLimit, cfg.PeriodSec, cfg.WarningPct, cfg.OverdraftLimit, cfg.MaxConcurrentLocks, cfg.CreatedAt, cfg.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -4704,12 +4739,12 @@ func (s *Storage) UpsertLockBudgetConfig(cfg *model.LockBudgetConfig) error {
 
 func (s *Storage) GetLockBudgetConfig(callerID string) (*model.LockBudgetConfig, error) {
 	row := s.db.QueryRow(`
-		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, COALESCE(max_concurrent_locks, 0), created_at, updated_at
 		FROM lock_budget_configs WHERE caller_id = ?
 	`, callerID)
 
 	var cfg model.LockBudgetConfig
-	err := row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.CreatedAt, &cfg.UpdatedAt)
+	err := row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.MaxConcurrentLocks, &cfg.CreatedAt, &cfg.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -4721,7 +4756,7 @@ func (s *Storage) GetLockBudgetConfig(callerID string) (*model.LockBudgetConfig,
 
 func (s *Storage) ListLockBudgetConfigs() ([]model.LockBudgetConfig, error) {
 	rows, err := s.db.Query(`
-		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, COALESCE(max_concurrent_locks, 0), created_at, updated_at
 		FROM lock_budget_configs ORDER BY id
 	`)
 	if err != nil {
@@ -4732,7 +4767,7 @@ func (s *Storage) ListLockBudgetConfigs() ([]model.LockBudgetConfig, error) {
 	var configs []model.LockBudgetConfig
 	for rows.Next() {
 		var cfg model.LockBudgetConfig
-		if err := rows.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
+		if err := rows.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.MaxConcurrentLocks, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
 			return nil, err
 		}
 		configs = append(configs, cfg)
@@ -5320,12 +5355,12 @@ func (s *Storage) RechargeBudget(callerID string, amount int) (*model.BudgetRech
 	defer tx.Rollback()
 
 	row := tx.QueryRow(`
-		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, COALESCE(max_concurrent_locks, 0), created_at, updated_at
 		FROM lock_budget_configs WHERE caller_id = ?
 	`, callerID)
 
 	var cfg model.LockBudgetConfig
-	err = row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.CreatedAt, &cfg.UpdatedAt)
+	err = row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.MaxConcurrentLocks, &cfg.CreatedAt, &cfg.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("no budget configured for caller: %s", callerID)
 	}
@@ -5703,5 +5738,241 @@ func (s *Storage) CountConsecutiveAlertsSince(callerID string, since time.Time) 
 		WHERE caller_id = ? AND created_at >= ?
 	`, callerID, since).Scan(&count)
 	return count, err
+}
+
+func (s *Storage) UpsertCallerReputation(rep *model.CallerReputation) error {
+	_, err := s.db.Exec(`
+		INSERT INTO caller_reputations (
+			caller_id, score, tier, on_time_release_score, overdraft_reverse_score,
+			circuit_breaker_score, arrear_score, rate_alert_score, calculated_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			score = excluded.score,
+			tier = excluded.tier,
+			on_time_release_score = excluded.on_time_release_score,
+			overdraft_reverse_score = excluded.overdraft_reverse_score,
+			circuit_breaker_score = excluded.circuit_breaker_score,
+			arrear_score = excluded.arrear_score,
+			rate_alert_score = excluded.rate_alert_score,
+			calculated_at = excluded.calculated_at,
+			updated_at = excluded.updated_at
+	`, rep.CallerID, rep.Score, rep.Tier, rep.OnTimeReleaseScore, rep.OverdraftReverseScore,
+		rep.CircuitBreakerScore, rep.ArrearScore, rep.RateAlertScore, rep.CalculatedAt,
+		rep.CreatedAt, rep.UpdatedAt)
+	return err
+}
+
+func (s *Storage) GetCallerReputation(callerID string) (*model.CallerReputation, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, score, tier, on_time_release_score, overdraft_reverse_score,
+			circuit_breaker_score, arrear_score, rate_alert_score, calculated_at, created_at, updated_at
+		FROM caller_reputations WHERE caller_id = ?
+	`, callerID)
+	var rep model.CallerReputation
+	err := row.Scan(&rep.ID, &rep.CallerID, &rep.Score, &rep.Tier, &rep.OnTimeReleaseScore,
+		&rep.OverdraftReverseScore, &rep.CircuitBreakerScore, &rep.ArrearScore, &rep.RateAlertScore,
+		&rep.CalculatedAt, &rep.CreatedAt, &rep.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rep, nil
+}
+
+func (s *Storage) ListAllCallerReputations() ([]model.CallerReputation, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, score, tier, on_time_release_score, overdraft_reverse_score,
+			circuit_breaker_score, arrear_score, rate_alert_score, calculated_at, created_at, updated_at
+		FROM caller_reputations ORDER BY score DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var reps []model.CallerReputation
+	for rows.Next() {
+		var rep model.CallerReputation
+		if err := rows.Scan(&rep.ID, &rep.CallerID, &rep.Score, &rep.Tier, &rep.OnTimeReleaseScore,
+			&rep.OverdraftReverseScore, &rep.CircuitBreakerScore, &rep.ArrearScore, &rep.RateAlertScore,
+			&rep.CalculatedAt, &rep.CreatedAt, &rep.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reps = append(reps, rep)
+	}
+	return reps, nil
+}
+
+func (s *Storage) AddTierChangeEvent(evt *model.TierChangeEvent) error {
+	result, err := s.db.Exec(`
+		INSERT INTO tier_change_events (caller_id, old_tier, new_tier, score, changed_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, evt.CallerID, evt.OldTier, evt.NewTier, evt.Score, evt.ChangedAt, evt.CreatedAt)
+	if err != nil {
+		return err
+	}
+	evt.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListTierChangeEvents(callerID string, limit int, offset int) ([]model.TierChangeEvent, int64, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int64
+	var rows *sql.Rows
+	var err error
+	if callerID != "" {
+		err = s.db.QueryRow(`SELECT COUNT(*) FROM tier_change_events WHERE caller_id = ?`, callerID).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, old_tier, new_tier, score, changed_at, created_at
+			FROM tier_change_events WHERE caller_id = ?
+			ORDER BY changed_at DESC LIMIT ? OFFSET ?
+		`, callerID, limit, offset)
+	} else {
+		err = s.db.QueryRow(`SELECT COUNT(*) FROM tier_change_events`).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+		rows, err = s.db.Query(`
+			SELECT id, caller_id, old_tier, new_tier, score, changed_at, created_at
+			FROM tier_change_events
+			ORDER BY changed_at DESC LIMIT ? OFFSET ?
+		`, limit, offset)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var events []model.TierChangeEvent
+	for rows.Next() {
+		var evt model.TierChangeEvent
+		if err := rows.Scan(&evt.ID, &evt.CallerID, &evt.OldTier, &evt.NewTier, &evt.Score, &evt.ChangedAt, &evt.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		events = append(events, evt)
+	}
+	return events, total, nil
+}
+
+func (s *Storage) CountOnTimeReleases(callerID string, since time.Time) (total int, onTime int, err error) {
+	err = s.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(CASE WHEN operation = 'release' AND detail NOT LIKE '%expired%' THEN 1 ELSE 0 END), 0)
+		FROM op_history
+		WHERE holder = ? AND created_at >= ? AND (operation = 'release' OR operation = 'expire')
+	`, callerID, since).Scan(&total, &onTime)
+	return
+}
+
+func (s *Storage) CountOverdraftPeriods(callerID string, since time.Time) (totalPeriods int, overdraftPeriods int, err error) {
+	err = s.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(CASE WHEN overdraft_used > 0 THEN 1 ELSE 0 END), 0)
+		FROM lock_budget_period_summaries
+		WHERE caller_id = ? AND period_start_at >= ?
+	`, callerID, since).Scan(&totalPeriods, &overdraftPeriods)
+	return
+}
+
+func (s *Storage) CountCircuitBreakerTriggers(callerID string, since time.Time) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM cb_history WHERE caller_id = ? AND triggered_at >= ?
+	`, callerID, since).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) CountArrearEvents(callerID string, since time.Time) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM debt_ledger_events
+		WHERE debtor = ? AND event_type = 'overdue_mark' AND created_at >= ?
+	`, callerID, since).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) CountRateAlertEventsSince(callerID string, since time.Time) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM lock_budget_rate_alert_events
+		WHERE caller_id = ? AND created_at >= ?
+	`, callerID, since).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) ListBudgetConfigs() ([]model.LockBudgetConfig, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, COALESCE(max_concurrent_locks, 0), created_at, updated_at
+		FROM lock_budget_configs ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var configs []model.LockBudgetConfig
+	for rows.Next() {
+		var cfg model.LockBudgetConfig
+		if err := rows.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.MaxConcurrentLocks, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
+			return nil, err
+		}
+		configs = append(configs, cfg)
+	}
+	return configs, nil
+}
+
+func (s *Storage) CountActiveLeasesByHolder(holder string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM leases WHERE holder = ? AND active = 1`, holder).Scan(&count)
+	return count, err
+}
+
+func (s *Storage) ReorderWaitQueueForGold(lockName string, goldHolders map[string]bool) error {
+	items, err := s.ListWaitQueue(lockName)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return nil
+	}
+
+	var goldItems, otherItems []model.WaitQueueItem
+	for _, item := range items {
+		if goldHolders[item.Holder] {
+			goldItems = append(goldItems, item)
+		} else {
+			otherItems = append(otherItems, item)
+		}
+	}
+
+	if len(goldItems) == 0 || len(otherItems) == 0 {
+		return nil
+	}
+
+	if err := s.RemoveFromQueueByLock(lockName); err != nil {
+		return err
+	}
+
+	for _, item := range goldItems {
+		if err := s.Enqueue(&item); err != nil {
+			return err
+		}
+	}
+	for _, item := range otherItems {
+		if err := s.Enqueue(&item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Storage) RemoveFromQueueByLock(lockName string) error {
+	_, err := s.db.Exec(`DELETE FROM wait_queue WHERE lock_name = ?`, lockName)
+	return err
 }
 

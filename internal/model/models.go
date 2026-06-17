@@ -1357,14 +1357,15 @@ const (
 )
 
 type LockBudgetConfig struct {
-	ID              int64     `json:"id"`
-	CallerID        string    `json:"caller_id"`
-	BudgetLimit     int       `json:"budget_limit"`
-	PeriodSec       int       `json:"period_sec"`
-	WarningPct      int       `json:"warning_pct"`
-	OverdraftLimit  int       `json:"overdraft_limit"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID               int64     `json:"id"`
+	CallerID         string    `json:"caller_id"`
+	BudgetLimit      int       `json:"budget_limit"`
+	PeriodSec        int       `json:"period_sec"`
+	WarningPct       int       `json:"warning_pct"`
+	OverdraftLimit   int       `json:"overdraft_limit"`
+	MaxConcurrentLocks int     `json:"max_concurrent_locks"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type LockBudgetStatus struct {
@@ -1724,6 +1725,70 @@ type UnfreezeRequest struct {
 	CallerID string `json:"caller_id" binding:"required"`
 	Operator string `json:"operator" binding:"required"`
 	Reason   string `json:"reason,omitempty"`
+}
+
+type ServiceTier string
+
+const (
+	ServiceTierGold   ServiceTier = "gold"
+	ServiceTierSilver ServiceTier = "silver"
+	ServiceTierBronze ServiceTier = "bronze"
+)
+
+type CallerReputation struct {
+	ID                    int64     `json:"id"`
+	CallerID              string    `json:"caller_id"`
+	Score                 float64   `json:"score"`
+	Tier                  ServiceTier `json:"tier"`
+	OnTimeReleaseScore    float64   `json:"on_time_release_score"`
+	OverdraftReverseScore float64   `json:"overdraft_reverse_score"`
+	CircuitBreakerScore   float64   `json:"circuit_breaker_score"`
+	ArrearScore           float64   `json:"arrear_score"`
+	RateAlertScore        float64   `json:"rate_alert_score"`
+	CalculatedAt          time.Time `json:"calculated_at"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+type TierChangeEvent struct {
+	ID          int64       `json:"id"`
+	CallerID    string      `json:"caller_id"`
+	OldTier     ServiceTier `json:"old_tier"`
+	NewTier     ServiceTier `json:"new_tier"`
+	Score       float64     `json:"score"`
+	ChangedAt   time.Time   `json:"changed_at"`
+	CreatedAt   time.Time   `json:"created_at"`
+}
+
+type CallerReputationDetail struct {
+	CallerID              string      `json:"caller_id"`
+	Score                 float64     `json:"score"`
+	Tier                  ServiceTier `json:"tier"`
+	OnTimeReleaseScore    float64     `json:"on_time_release_score"`
+	OverdraftReverseScore float64     `json:"overdraft_reverse_score"`
+	CircuitBreakerScore   float64     `json:"circuit_breaker_score"`
+	ArrearScore           float64     `json:"arrear_score"`
+	RateAlertScore        float64     `json:"rate_alert_score"`
+	CalculatedAt          time.Time   `json:"calculated_at"`
+}
+
+type CallerReputationRanking struct {
+	CallerID string      `json:"caller_id"`
+	Score    float64     `json:"score"`
+	Tier     ServiceTier `json:"tier"`
+	Rank     int         `json:"rank"`
+}
+
+type ReputationRankingResult struct {
+	Total  int                      `json:"total"`
+	Rankings []CallerReputationRanking `json:"rankings"`
+}
+
+type TierChangeEventListResult struct {
+	Total  int64              `json:"total"`
+	Items  []TierChangeEvent  `json:"items"`
+	Limit  int                `json:"limit"`
+	Offset int                `json:"offset"`
 }
 
 type CallerRateStatus struct {
