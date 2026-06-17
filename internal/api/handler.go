@@ -262,6 +262,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 			budgetGroup.GET("/events", h.ListBudgetExhaustEvents)
 			budgetGroup.GET("/events/:caller", h.GetCallerBudgetExhaustEvents)
+
+			budgetGroup.POST("/transfer", h.TransferBudget)
+			budgetGroup.GET("/transfers", h.ListBudgetTransferRecords)
+
+			budgetGroup.GET("/overdrafts", h.ListOverdraftCallers)
+
+			budgetGroup.GET("/next-period-deductions", h.ListAllNextPeriodDeductions)
+			budgetGroup.GET("/next-period-deductions/:caller", h.GetNextPeriodDeduction)
 		}
 
 		heatmapGroup := api.Group("/heatmap")
@@ -2477,10 +2485,11 @@ func (h *Handler) ManualStopCooldown(c *gin.Context) {
 }
 
 type SetBudgetConfigRequest struct {
-	CallerID    string `json:"caller_id" binding:"required"`
-	BudgetLimit int    `json:"budget_limit" binding:"required,min=1"`
-	PeriodSec   int    `json:"period_sec" binding:"required,min=1"`
-	WarningPct  int    `json:"warning_pct"`
+	CallerID       string `json:"caller_id" binding:"required"`
+	BudgetLimit    int    `json:"budget_limit" binding:"required,min=1"`
+	PeriodSec      int    `json:"period_sec" binding:"required,min=1"`
+	WarningPct     int    `json:"warning_pct"`
+	OverdraftLimit int    `json:"overdraft_limit" binding:"min=0"`
 }
 
 func (h *Handler) ListBudgetConfigs(c *gin.Context) {
@@ -2527,7 +2536,10 @@ func (h *Handler) SetBudgetConfig(c *gin.Context) {
 	if req.WarningPct <= 0 || req.WarningPct > 100 {
 		req.WarningPct = 80
 	}
-	cfg, err := h.budgetMgr.SetConfig(req.CallerID, req.BudgetLimit, req.PeriodSec, req.WarningPct)
+	if req.OverdraftLimit < 0 {
+		req.OverdraftLimit = 0
+	}
+	cfg, err := h.budgetMgr.SetConfigWithOverdraft(req.CallerID, req.BudgetLimit, req.PeriodSec, req.WarningPct, req.OverdraftLimit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -2629,4 +2641,92 @@ func (h *Handler) GetCallerBudgetExhaustEvents(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"caller": callerID, "events": events})
+}
+
+func (h *Handler) TransferBudget(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	var req model.BudgetTransferRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	record, err := h.budgetMgr.TransferBudget(req.FromCaller, req.ToCaller, req.Amount, req.Reason)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "record": record})
+}
+
+func (h *Handler) ListBudgetTransferRecords(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	limitStr := c.DefaultQuery("limit", "50")
+	offsetStr := c.DefaultQuery("offset", "0")
+	limit, _ := strconv.Atoi(limitStr)
+	offset, _ := strconv.Atoi(offsetStr)
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	query := &model.BudgetTransferListQuery{
+		CallerID:   c.Query("caller_id"),
+		FromCaller: c.Query("from_caller"),
+		ToCaller:   c.Query("to_caller"),
+		Limit:      limit,
+		Offset:     offset,
+	}
+	result, err := h.budgetMgr.ListTransferRecords(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) ListOverdraftCallers(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	result, err := h.budgetMgr.ListOverdraftCallers()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) GetNextPeriodDeduction(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	callerID := c.Param("caller")
+	info, err := h.budgetMgr.GetNextPeriodDeduction(callerID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
+func (h *Handler) ListAllNextPeriodDeductions(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+	result, err := h.budgetMgr.ListAllNextPeriodDeductions()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": result, "count": len(result)})
 }
