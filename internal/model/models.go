@@ -1445,6 +1445,8 @@ type BudgetAcquireCheckResult struct {
 	CurrentOverdraft  int    `json:"current_overdraft"`
 	UsingOverdraft    bool   `json:"using_overdraft"`
 	Reason            string `json:"reason,omitempty"`
+	ArrearsRejected   bool   `json:"arrears_rejected,omitempty"`
+	ArrearsAmount     int    `json:"arrears_amount,omitempty"`
 }
 
 func (r *BudgetAcquireCheckResult) BudgetRejected() bool {
@@ -1535,4 +1537,123 @@ type BudgetTransferListResult struct {
 }
 
 const OverdraftPenaltyMultiplier = 1.5
+
+type BudgetBillStatus string
+
+const (
+	BudgetBillStatusFinalized BudgetBillStatus = "finalized"
+)
+
+type BudgetTransferDirection string
+
+const (
+	BudgetTransferOut BudgetTransferDirection = "out"
+	BudgetTransferIn  BudgetTransferDirection = "in"
+)
+
+type BudgetSettlementBill struct {
+	ID                    int64               `json:"id"`
+	CallerID              string              `json:"caller_id"`
+	PeriodStartAt         time.Time           `json:"period_start_at"`
+	PeriodEndAt           time.Time           `json:"period_end_at"`
+	BudgetLimit           int                 `json:"budget_limit"`
+	OverdraftLimit        int                 `json:"overdraft_limit"`
+	NormalConsumption     int                 `json:"normal_consumption"`
+	OverdraftConsumption  int                 `json:"overdraft_consumption"`
+	OverdraftPenalty      int                 `json:"overdraft_penalty"`
+	TotalConsumption      int                 `json:"total_consumption"`
+	TransferredIn         int                 `json:"transferred_in"`
+	TransferredOut        int                 `json:"transferred_out"`
+	EndingBalance         int                 `json:"ending_balance"`
+	HadOverdraft          bool                `json:"had_overdraft"`
+	PeakOverdraft         int                 `json:"peak_overdraft"`
+	PeakConcurrent        int                 `json:"peak_concurrent"`
+	ExhaustEvents         int                 `json:"exhaust_events"`
+	CarryOverToNextPeriod int                 `json:"carry_over_to_next_period"`
+	Status                BudgetBillStatus    `json:"status"`
+	CreatedAt             time.Time           `json:"created_at"`
+}
+
+type BudgetBillTransferDetail struct {
+	ID          int64                    `json:"id"`
+	BillID      int64                    `json:"bill_id"`
+	CallerID    string                   `json:"caller_id"`
+	Direction   BudgetTransferDirection  `json:"direction"`
+	PeerCaller  string                   `json:"peer_caller"`
+	Amount      int                      `json:"amount"`
+	Reason      string                   `json:"reason,omitempty"`
+	CreatedAt   time.Time                `json:"created_at"`
+}
+
+type BudgetArrearsStatus string
+
+const (
+	BudgetArrearsStatusActive   BudgetArrearsStatus = "active"
+	BudgetArrearsStatusCleared  BudgetArrearsStatus = "cleared"
+)
+
+type BudgetCallerArrears struct {
+	ID                int64               `json:"id"`
+	CallerID          string              `json:"caller_id"`
+	ArrearsAmount     int                 `json:"arrears_amount"`
+	OriginalBillID    int64               `json:"original_bill_id"`
+	OriginalPeriodStartAt time.Time       `json:"original_period_start_at"`
+	OriginalPeriodEndAt   time.Time       `json:"original_period_end_at"`
+	Status            BudgetArrearsStatus `json:"status"`
+	ClearedAt         *time.Time          `json:"cleared_at,omitempty"`
+	CreatedAt         time.Time           `json:"created_at"`
+	UpdatedAt         time.Time           `json:"updated_at"`
+}
+
+type BudgetArrearsCallerInfo struct {
+	CallerID          string    `json:"caller_id"`
+	ArrearsAmount     int       `json:"arrears_amount"`
+	OriginalBillID    int64     `json:"original_bill_id"`
+	OriginalPeriodStartAt time.Time `json:"original_period_start_at"`
+	OriginalPeriodEndAt   time.Time `json:"original_period_end_at"`
+	CurrentBudgetLimit int      `json:"current_budget_limit"`
+	CurrentPeriodStartAt time.Time `json:"current_period_start_at"`
+	CurrentPeriodEndAt   time.Time `json:"current_period_end_at"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+type BudgetArrearsListResult struct {
+	TotalInArrears     int                      `json:"total_in_arrears"`
+	TotalArrearsAmount int                      `json:"total_arrears_amount"`
+	Items              []BudgetArrearsCallerInfo `json:"items"`
+}
+
+type BudgetBillDetailResult struct {
+	Bill           *BudgetSettlementBill       `json:"bill"`
+	TransferDetails []BudgetBillTransferDetail `json:"transfer_details"`
+}
+
+type BudgetBillListResult struct {
+	Total  int64                   `json:"total"`
+	Items  []BudgetSettlementBill  `json:"items"`
+	Limit  int                     `json:"limit"`
+	Offset int                     `json:"offset"`
+}
+
+type BudgetRechargeRequest struct {
+	CallerID string `json:"caller_id" binding:"required"`
+	Amount   int    `json:"amount" binding:"required,min=1"`
+	Reason   string `json:"reason"`
+}
+
+type BudgetRechargeResult struct {
+	Success          bool   `json:"success"`
+	CallerID         string `json:"caller_id"`
+	RechargedAmount  int    `json:"recharged_amount"`
+	ArrearsCleared   int    `json:"arrears_cleared"`
+	RemainingArrears int    `json:"remaining_arrears"`
+	NewBudgetLimit   int    `json:"new_budget_limit"`
+	Message          string `json:"message,omitempty"`
+}
+
+type BudgetBillListQuery struct {
+	CallerID string `form:"caller_id"`
+	Limit    int    `form:"limit,default=50"`
+	Offset   int    `form:"offset,default=0"`
+}
 

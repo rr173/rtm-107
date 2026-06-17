@@ -270,6 +270,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 			budgetGroup.GET("/next-period-deductions", h.ListAllNextPeriodDeductions)
 			budgetGroup.GET("/next-period-deductions/:caller", h.GetNextPeriodDeduction)
+
+			budgetGroup.GET("/bills", h.ListBudgetSettlementBills)
+			budgetGroup.GET("/bills/:id", h.GetBudgetSettlementBillDetail)
+			budgetGroup.GET("/arrears", h.ListBudgetArrears)
+			budgetGroup.POST("/recharge", h.RechargeBudget)
 		}
 
 		heatmapGroup := api.Group("/heatmap")
@@ -2729,4 +2734,95 @@ func (h *Handler) ListAllNextPeriodDeductions(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"items": result, "count": len(result)})
+}
+
+type BudgetRechargeRequest struct {
+	CallerID string `json:"caller_id" binding:"required"`
+	Amount   int    `json:"amount" binding:"required,min=1"`
+}
+
+func (h *Handler) ListBudgetSettlementBills(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+
+	callerID := c.Query("caller_id")
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+
+	query := &model.BudgetBillListQuery{
+		CallerID: callerID,
+		Limit:    limit,
+		Offset:   offset,
+	}
+
+	result, err := h.budgetMgr.ListSettlementBills(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) GetBudgetSettlementBillDetail(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+
+	billID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid bill id"})
+		return
+	}
+
+	result, err := h.budgetMgr.GetSettlementBillDetail(billID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) ListBudgetArrears(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+
+	result, err := h.budgetMgr.ListActiveArrears()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) RechargeBudget(c *gin.Context) {
+	if h.budgetMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "budget manager not initialized"})
+		return
+	}
+
+	var req BudgetRechargeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.budgetMgr.RechargeBudget(req.CallerID, req.Amount)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
 }

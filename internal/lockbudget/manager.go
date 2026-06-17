@@ -21,6 +21,8 @@ type callerRuntimeState struct {
 	holdings            map[string]*holdingState
 
 	currentOverdraft    int
+	peakOverdraft       int
+	hadOverdraft        bool
 	overdraftPenalty    int
 	carryOverDeduction  int
 	transferredIn       int
@@ -209,6 +211,8 @@ func (m *Manager) checkPeriodResetLocked(callerID string, rt *callerRuntimeState
 	rt.carryOverDeduction = rt.currentOverdraft + rt.overdraftPenalty
 	rt.consumedUnits = rt.carryOverDeduction
 	rt.currentOverdraft = 0
+	rt.peakOverdraft = 0
+	rt.hadOverdraft = false
 	rt.overdraftPenalty = 0
 	rt.peakConcurrent = 0
 	rt.lockCount = len(rt.holdings)
@@ -246,9 +250,15 @@ func (m *Manager) finalizeCurrentPeriodLocked(callerID string, rt *callerRuntime
 		rt.peakConcurrent = rt.lockCount
 	}
 
+	if rt.currentOverdraft > rt.peakOverdraft {
+		rt.peakOverdraft = rt.currentOverdraft
+	}
+
 	overdraftUsed := 0
+	normalConsumption := rt.consumedUnits
 	if rt.consumedUnits > rt.config.BudgetLimit {
 		overdraftUsed = rt.consumedUnits - rt.config.BudgetLimit
+		normalConsumption = rt.config.BudgetLimit
 	}
 
 	summary := &model.BudgetPeriodSummary{
@@ -268,6 +278,78 @@ func (m *Manager) finalizeCurrentPeriodLocked(callerID string, rt *callerRuntime
 		ExhaustEvents:      rt.exhaustCount,
 	}
 	_ = m.storage.UpsertBudgetPeriodSummary(summary)
+
+	endingBalance := rt.config.BudgetLimit - rt.consumedUnits + rt.transferredIn - rt.transferredOut
+	carryOverToNextPeriod := 0
+	if endingBalance < 0 {
+		carryOverToNextPeriod = -endingBalance
+	}
+
+	bill := &model.BudgetSettlementBill{
+		CallerID:              callerID,
+		PeriodStartAt:         rt.periodStartAt,
+		PeriodEndAt:           endTime,
+		BudgetLimit:           rt.config.BudgetLimit,
+		OverdraftLimit:        rt.config.OverdraftLimit,
+		NormalConsumption:     normalConsumption,
+		OverdraftConsumption:  overdraftUsed,
+		OverdraftPenalty:      rt.overdraftPenalty,
+		TotalConsumption:      rt.consumedUnits + rt.overdraftPenalty,
+		TransferredIn:         rt.transferredIn,
+		TransferredOut:        rt.transferredOut,
+		EndingBalance:         endingBalance,
+		HadOverdraft:          rt.hadOverdraft,
+		PeakOverdraft:         rt.peakOverdraft,
+		PeakConcurrent:        rt.peakConcurrent,
+		ExhaustEvents:         rt.exhaustCount,
+		CarryOverToNextPeriod: carryOverToNextPeriod,
+		Status:                model.BudgetBillStatusFinalized,
+		CreatedAt:             time.Now(),
+	}
+	_ = m.storage.CreateBudgetSettlementBill(bill)
+
+	transfers, _ := m.storage.ListBudgetTransfersInPeriod(callerID, rt.periodStartAt, endTime)
+	for _, t := range transfers {
+		detail := &model.BudgetBillTransferDetail{
+			BillID:    bill.ID,
+			CallerID:  callerID,
+			Amount:    t.Amount,
+			Reason:    t.Reason,
+			CreatedAt: t.CreatedAt,
+		}
+		if t.FromCaller == callerID {
+			detail.Direction = "out"
+			detail.PeerCaller = t.ToCaller
+		} else {
+			detail.Direction = "in"
+			detail.PeerCaller = t.FromCaller
+		}
+		_ = m.storage.AddBudgetBillTransferDetail(detail)
+	}
+
+	if carryOverToNextPeriod > 0 {
+		newBudget := rt.config.BudgetLimit
+		if newBudget < carryOverToNextPeriod {
+			arrearsAmount := carryOverToNextPeriod - newBudget
+			arrears := &model.BudgetCallerArrears{
+				CallerID:              callerID,
+				ArrearsAmount:         arrearsAmount,
+				OriginalBillID:        bill.ID,
+				OriginalPeriodStartAt: bill.PeriodStartAt,
+				OriginalPeriodEndAt:   bill.PeriodEndAt,
+				Status:                model.BudgetArrearsStatusActive,
+				CreatedAt:             time.Now(),
+				UpdatedAt:             time.Now(),
+			}
+			_ = m.storage.CreateBudgetCallerArrears(arrears)
+			log.Printf("[lockbudget] caller in arrears: caller=%s bill_id=%d arrears_amount=%d period=%v~%v",
+				callerID, bill.ID, arrearsAmount, bill.PeriodStartAt, bill.PeriodEndAt)
+		}
+	}
+
+	log.Printf("[lockbudget] settlement bill generated: caller=%s bill_id=%d period=%v~%v total_consumption=%d ending_balance=%d had_overdraft=%v",
+		callerID, bill.ID, bill.PeriodStartAt.Format(time.RFC3339), bill.PeriodEndAt.Format(time.RFC3339),
+		bill.TotalConsumption, bill.EndingBalance, bill.HadOverdraft)
 }
 
 func (m *Manager) applyOverdraftPenaltyLocked(rt *callerRuntimeState, units int) (int, int) {
@@ -318,6 +400,10 @@ func (m *Manager) meterCallerLocked(callerID string, rt *callerRuntimeState, now
 				if rt.consumedUnits > rt.config.BudgetLimit {
 					rt.currentOverdraft = rt.consumedUnits - rt.config.BudgetLimit
 					h.inOverdraft = true
+					rt.hadOverdraft = true
+					if rt.currentOverdraft > rt.peakOverdraft {
+						rt.peakOverdraft = rt.currentOverdraft
+					}
 				}
 
 				_ = m.storage.UpdateBudgetHoldingMeter(callerID, lockName, h.lastMeteredAt, h.unitsAccrued)
@@ -518,6 +604,16 @@ func (m *Manager) CheckAcquire(callerID string, lockName string, leaseSec int) (
 		return &model.BudgetAcquireCheckResult{
 			Allowed: true,
 			Reason:  "no budget configured, unlimited",
+		}, nil
+	}
+
+	arrears, _ := m.storage.GetBudgetCallerArrears(callerID)
+	if arrears != nil {
+		return &model.BudgetAcquireCheckResult{
+			Allowed:           false,
+			ArrearsRejected:   true,
+			ArrearsAmount:     arrears.ArrearsAmount,
+			Reason:            fmt.Sprintf("caller is in arrears: owe %d units, please recharge before acquiring new locks", arrears.ArrearsAmount),
 		}, nil
 	}
 
@@ -1082,6 +1178,114 @@ func (m *Manager) ListAllNextPeriodDeductions() ([]model.BudgetNextPeriodDeducti
 			ProjectedRemaining:   projectedRemaining,
 		})
 	}
+
+	return result, nil
+}
+
+func (m *Manager) ListSettlementBills(query *model.BudgetBillListQuery) (*model.BudgetBillListResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bills, total, err := m.storage.ListBudgetSettlementBills(query)
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.BudgetBillListResult{
+		Items:  bills,
+		Total:  total,
+		Limit:  query.Limit,
+		Offset: query.Offset,
+	}, nil
+}
+
+func (m *Manager) GetSettlementBillDetail(billID int64) (*model.BudgetBillDetailResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bill, err := m.storage.GetBudgetSettlementBill(billID)
+	if err != nil {
+		return nil, err
+	}
+	if bill == nil {
+		return nil, fmt.Errorf("bill not found: %d", billID)
+	}
+
+	transferDetails, err := m.storage.ListBudgetBillTransferDetails(billID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.BudgetBillDetailResult{
+		Bill:            bill,
+		TransferDetails: transferDetails,
+	}, nil
+}
+
+func (m *Manager) ListActiveArrears() (*model.BudgetArrearsListResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	arrearsList, err := m.storage.ListActiveBudgetArrears()
+	if err != nil {
+		return nil, err
+	}
+
+	totalArrearsAmount := 0
+	var items []model.BudgetArrearsCallerInfo
+	for _, a := range arrearsList {
+		totalArrearsAmount += a.ArrearsAmount
+
+		currentBudgetLimit := 0
+		currentPeriodStartAt := a.OriginalPeriodEndAt
+		currentPeriodEndAt := a.OriginalPeriodEndAt
+		rt, ok := m.callers[a.CallerID]
+		if ok {
+			currentBudgetLimit = rt.config.BudgetLimit
+			currentPeriodStartAt = rt.periodStartAt
+			currentPeriodEndAt = rt.periodEndAt
+		}
+
+		items = append(items, model.BudgetArrearsCallerInfo{
+			CallerID:              a.CallerID,
+			ArrearsAmount:         a.ArrearsAmount,
+			OriginalBillID:        a.OriginalBillID,
+			OriginalPeriodStartAt: a.OriginalPeriodStartAt,
+			OriginalPeriodEndAt:   a.OriginalPeriodEndAt,
+			CurrentBudgetLimit:    currentBudgetLimit,
+			CurrentPeriodStartAt:  currentPeriodStartAt,
+			CurrentPeriodEndAt:    currentPeriodEndAt,
+			CreatedAt:             a.CreatedAt,
+		})
+	}
+
+	return &model.BudgetArrearsListResult{
+		TotalInArrears:     len(items),
+		TotalArrearsAmount: totalArrearsAmount,
+		Items:              items,
+	}, nil
+}
+
+func (m *Manager) RechargeBudget(callerID string, amount int) (*model.BudgetRechargeResult, error) {
+	if amount <= 0 {
+		return nil, fmt.Errorf("recharge amount must be positive")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	result, err := m.storage.RechargeBudget(callerID, amount)
+	if err != nil {
+		return nil, err
+	}
+
+	rt, ok := m.callers[callerID]
+	if ok {
+		rt.config.BudgetLimit = result.NewBudgetLimit
+	}
+
+	log.Printf("[lockbudget] recharge: caller=%s amount=%d new_budget=%d arrears_cleared=%d remaining_arrears=%d",
+		callerID, amount, result.NewBudgetLimit, result.ArrearsCleared, result.RemainingArrears)
 
 	return result, nil
 }

@@ -739,6 +739,66 @@ func (s *Storage) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_budget_transfers_from ON lock_budget_transfers(from_caller);
 	CREATE INDEX IF NOT EXISTS idx_budget_transfers_to ON lock_budget_transfers(to_caller);
 	CREATE INDEX IF NOT EXISTS idx_budget_transfers_created ON lock_budget_transfers(created_at);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_settlement_bills (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL,
+		period_start_at DATETIME NOT NULL,
+		period_end_at DATETIME NOT NULL,
+		budget_limit INTEGER NOT NULL,
+		overdraft_limit INTEGER NOT NULL DEFAULT 0,
+		normal_consumption INTEGER NOT NULL DEFAULT 0,
+		overdraft_consumption INTEGER NOT NULL DEFAULT 0,
+		overdraft_penalty INTEGER NOT NULL DEFAULT 0,
+		total_consumption INTEGER NOT NULL DEFAULT 0,
+		transferred_in INTEGER NOT NULL DEFAULT 0,
+		transferred_out INTEGER NOT NULL DEFAULT 0,
+		ending_balance INTEGER NOT NULL DEFAULT 0,
+		had_overdraft INTEGER NOT NULL DEFAULT 0,
+		peak_overdraft INTEGER NOT NULL DEFAULT 0,
+		peak_concurrent INTEGER NOT NULL DEFAULT 0,
+		exhaust_events INTEGER NOT NULL DEFAULT 0,
+		carry_over_to_next_period INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'finalized',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(caller_id, period_start_at)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_budget_bills_caller ON lock_budget_settlement_bills(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_budget_bills_period ON lock_budget_settlement_bills(period_start_at);
+	CREATE INDEX IF NOT EXISTS idx_budget_bills_status ON lock_budget_settlement_bills(status);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_bill_transfer_details (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		bill_id INTEGER NOT NULL,
+		caller_id TEXT NOT NULL,
+		direction TEXT NOT NULL,
+		peer_caller TEXT NOT NULL,
+		amount INTEGER NOT NULL,
+		reason TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(bill_id) REFERENCES lock_budget_settlement_bills(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_budget_bill_details_bill ON lock_budget_bill_transfer_details(bill_id);
+	CREATE INDEX IF NOT EXISTS idx_budget_bill_details_caller ON lock_budget_bill_transfer_details(caller_id);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_caller_arrears (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		caller_id TEXT NOT NULL UNIQUE,
+		arrears_amount INTEGER NOT NULL,
+		original_bill_id INTEGER NOT NULL,
+		original_period_start_at DATETIME NOT NULL,
+		original_period_end_at DATETIME NOT NULL,
+		status TEXT NOT NULL DEFAULT 'active',
+		cleared_at DATETIME,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(original_bill_id) REFERENCES lock_budget_settlement_bills(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_budget_arrears_caller ON lock_budget_caller_arrears(caller_id);
+	CREATE INDEX IF NOT EXISTS idx_budget_arrears_status ON lock_budget_caller_arrears(status);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -4969,6 +5029,353 @@ func (s *Storage) ListBudgetTransfersByCaller(callerID string, limit int) ([]mod
 		WHERE from_caller = ? OR to_caller = ?
 		ORDER BY id DESC LIMIT ?
 	`, callerID, callerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []model.BudgetTransferRecord
+	for rows.Next() {
+		var r model.BudgetTransferRecord
+		if err := rows.Scan(&r.ID, &r.FromCaller, &r.ToCaller, &r.Amount, &r.Reason, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+func (s *Storage) CreateBudgetSettlementBill(bill *model.BudgetSettlementBill) error {
+	hadOverdraftInt := 0
+	if bill.HadOverdraft {
+		hadOverdraftInt = 1
+	}
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_settlement_bills (
+			caller_id, period_start_at, period_end_at, budget_limit, overdraft_limit,
+			normal_consumption, overdraft_consumption, overdraft_penalty, total_consumption,
+			transferred_in, transferred_out, ending_balance, had_overdraft, peak_overdraft,
+			peak_concurrent, exhaust_events, carry_over_to_next_period, status, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, bill.CallerID, bill.PeriodStartAt, bill.PeriodEndAt, bill.BudgetLimit, bill.OverdraftLimit,
+		bill.NormalConsumption, bill.OverdraftConsumption, bill.OverdraftPenalty, bill.TotalConsumption,
+		bill.TransferredIn, bill.TransferredOut, bill.EndingBalance, hadOverdraftInt, bill.PeakOverdraft,
+		bill.PeakConcurrent, bill.ExhaustEvents, bill.CarryOverToNextPeriod, bill.Status, bill.CreatedAt)
+	if err != nil {
+		return err
+	}
+	bill.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) GetBudgetSettlementBill(id int64) (*model.BudgetSettlementBill, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, period_start_at, period_end_at, budget_limit, overdraft_limit,
+			normal_consumption, overdraft_consumption, overdraft_penalty, total_consumption,
+			transferred_in, transferred_out, ending_balance, had_overdraft, peak_overdraft,
+			peak_concurrent, exhaust_events, carry_over_to_next_period, status, created_at
+		FROM lock_budget_settlement_bills WHERE id = ?
+	`, id)
+
+	var bill model.BudgetSettlementBill
+	var hadOverdraftInt int
+	err := row.Scan(&bill.ID, &bill.CallerID, &bill.PeriodStartAt, &bill.PeriodEndAt, &bill.BudgetLimit, &bill.OverdraftLimit,
+		&bill.NormalConsumption, &bill.OverdraftConsumption, &bill.OverdraftPenalty, &bill.TotalConsumption,
+		&bill.TransferredIn, &bill.TransferredOut, &bill.EndingBalance, &hadOverdraftInt, &bill.PeakOverdraft,
+		&bill.PeakConcurrent, &bill.ExhaustEvents, &bill.CarryOverToNextPeriod, &bill.Status, &bill.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	bill.HadOverdraft = hadOverdraftInt != 0
+	return &bill, nil
+}
+
+func (s *Storage) ListBudgetSettlementBills(query *model.BudgetBillListQuery) ([]model.BudgetSettlementBill, int64, error) {
+	if query == nil {
+		query = &model.BudgetBillListQuery{Limit: 50}
+	}
+	if query.Limit <= 0 {
+		query.Limit = 50
+	}
+	if query.Offset < 0 {
+		query.Offset = 0
+	}
+
+	where := []string{"1=1"}
+	args := []interface{}{}
+
+	if query.CallerID != "" {
+		where = append(where, "caller_id = ?")
+		args = append(args, query.CallerID)
+	}
+
+	whereClause := strings.Join(where, " AND ")
+
+	var total int64
+	countQuery := "SELECT COUNT(*) FROM lock_budget_settlement_bills WHERE " + whereClause
+	if err := s.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	listQuery := `
+		SELECT id, caller_id, period_start_at, period_end_at, budget_limit, overdraft_limit,
+			normal_consumption, overdraft_consumption, overdraft_penalty, total_consumption,
+			transferred_in, transferred_out, ending_balance, had_overdraft, peak_overdraft,
+			peak_concurrent, exhaust_events, carry_over_to_next_period, status, created_at
+		FROM lock_budget_settlement_bills WHERE ` + whereClause + `
+		ORDER BY period_start_at DESC LIMIT ? OFFSET ?
+	`
+	args = append(args, query.Limit, query.Offset)
+
+	rows, err := s.db.Query(listQuery, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var bills []model.BudgetSettlementBill
+	for rows.Next() {
+		var bill model.BudgetSettlementBill
+		var hadOverdraftInt int
+		if err := rows.Scan(&bill.ID, &bill.CallerID, &bill.PeriodStartAt, &bill.PeriodEndAt, &bill.BudgetLimit, &bill.OverdraftLimit,
+			&bill.NormalConsumption, &bill.OverdraftConsumption, &bill.OverdraftPenalty, &bill.TotalConsumption,
+			&bill.TransferredIn, &bill.TransferredOut, &bill.EndingBalance, &hadOverdraftInt, &bill.PeakOverdraft,
+			&bill.PeakConcurrent, &bill.ExhaustEvents, &bill.CarryOverToNextPeriod, &bill.Status, &bill.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		bill.HadOverdraft = hadOverdraftInt != 0
+		bills = append(bills, bill)
+	}
+	return bills, total, nil
+}
+
+func (s *Storage) AddBudgetBillTransferDetail(detail *model.BudgetBillTransferDetail) error {
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_bill_transfer_details (
+			bill_id, caller_id, direction, peer_caller, amount, reason, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, detail.BillID, detail.CallerID, detail.Direction, detail.PeerCaller, detail.Amount, detail.Reason, detail.CreatedAt)
+	if err != nil {
+		return err
+	}
+	detail.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListBudgetBillTransferDetails(billID int64) ([]model.BudgetBillTransferDetail, error) {
+	rows, err := s.db.Query(`
+		SELECT id, bill_id, caller_id, direction, peer_caller, amount, reason, created_at
+		FROM lock_budget_bill_transfer_details WHERE bill_id = ? ORDER BY id
+	`, billID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var details []model.BudgetBillTransferDetail
+	for rows.Next() {
+		var d model.BudgetBillTransferDetail
+		if err := rows.Scan(&d.ID, &d.BillID, &d.CallerID, &d.Direction, &d.PeerCaller, &d.Amount, &d.Reason, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		details = append(details, d)
+	}
+	return details, nil
+}
+
+func (s *Storage) CreateBudgetCallerArrears(arrears *model.BudgetCallerArrears) error {
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_caller_arrears (
+			caller_id, arrears_amount, original_bill_id, original_period_start_at,
+			original_period_end_at, status, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(caller_id) DO UPDATE SET
+			arrears_amount = excluded.arrears_amount,
+			original_bill_id = excluded.original_bill_id,
+			original_period_start_at = excluded.original_period_start_at,
+			original_period_end_at = excluded.original_period_end_at,
+			status = excluded.status,
+			updated_at = excluded.updated_at
+	`, arrears.CallerID, arrears.ArrearsAmount, arrears.OriginalBillID, arrears.OriginalPeriodStartAt,
+		arrears.OriginalPeriodEndAt, arrears.Status, arrears.CreatedAt, arrears.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if arrears.ID == 0 {
+		arrears.ID, _ = result.LastInsertId()
+	}
+	return nil
+}
+
+func (s *Storage) GetBudgetCallerArrears(callerID string) (*model.BudgetCallerArrears, error) {
+	row := s.db.QueryRow(`
+		SELECT id, caller_id, arrears_amount, original_bill_id, original_period_start_at,
+			original_period_end_at, status, cleared_at, created_at, updated_at
+		FROM lock_budget_caller_arrears WHERE caller_id = ? AND status = 'active'
+	`, callerID)
+
+	var a model.BudgetCallerArrears
+	var clearedAt sql.NullTime
+	err := row.Scan(&a.ID, &a.CallerID, &a.ArrearsAmount, &a.OriginalBillID, &a.OriginalPeriodStartAt,
+		&a.OriginalPeriodEndAt, &a.Status, &clearedAt, &a.CreatedAt, &a.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if clearedAt.Valid {
+		a.ClearedAt = &clearedAt.Time
+	}
+	return &a, nil
+}
+
+func (s *Storage) ListActiveBudgetArrears() ([]model.BudgetCallerArrears, error) {
+	rows, err := s.db.Query(`
+		SELECT id, caller_id, arrears_amount, original_bill_id, original_period_start_at,
+			original_period_end_at, status, cleared_at, created_at, updated_at
+		FROM lock_budget_caller_arrears WHERE status = 'active' ORDER BY created_at
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var arrearsList []model.BudgetCallerArrears
+	for rows.Next() {
+		var a model.BudgetCallerArrears
+		var clearedAt sql.NullTime
+		if err := rows.Scan(&a.ID, &a.CallerID, &a.ArrearsAmount, &a.OriginalBillID, &a.OriginalPeriodStartAt,
+			&a.OriginalPeriodEndAt, &a.Status, &clearedAt, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if clearedAt.Valid {
+			a.ClearedAt = &clearedAt.Time
+		}
+		arrearsList = append(arrearsList, a)
+	}
+	return arrearsList, nil
+}
+
+func (s *Storage) ClearBudgetCallerArrears(callerID string, clearedAt time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE lock_budget_caller_arrears
+		SET status = 'cleared', cleared_at = ?, updated_at = ?
+		WHERE caller_id = ? AND status = 'active'
+	`, clearedAt, clearedAt, callerID)
+	return err
+}
+
+func (s *Storage) RechargeBudget(callerID string, amount int) (*model.BudgetRechargeResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	row := tx.QueryRow(`
+		SELECT id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
+		FROM lock_budget_configs WHERE caller_id = ?
+	`, callerID)
+
+	var cfg model.LockBudgetConfig
+	err = row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.CreatedAt, &cfg.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("no budget configured for caller: %s", callerID)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	arrearsRow := tx.QueryRow(`
+		SELECT id, arrears_amount FROM lock_budget_caller_arrears WHERE caller_id = ? AND status = 'active'
+	`, callerID)
+
+	var arrearsID int64
+	var arrearsAmount int
+	err = arrearsRow.Scan(&arrearsID, &arrearsAmount)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	arrearsCleared := 0
+	remainingArrears := 0
+	now := time.Now()
+
+	if arrearsAmount > 0 {
+		if amount >= arrearsAmount {
+			arrearsCleared = arrearsAmount
+			remainingArrears = 0
+			amount -= arrearsAmount
+
+			_, err = tx.Exec(`
+				UPDATE lock_budget_caller_arrears
+				SET status = 'cleared', cleared_at = ?, updated_at = ?
+				WHERE id = ?
+			`, now, now, arrearsID)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			arrearsCleared = amount
+			remainingArrears = arrearsAmount - amount
+			amount = 0
+
+			_, err = tx.Exec(`
+				UPDATE lock_budget_caller_arrears
+				SET arrears_amount = ?, updated_at = ?
+				WHERE id = ?
+			`, remainingArrears, now, arrearsID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	newBudgetLimit := cfg.BudgetLimit + amount
+	_, err = tx.Exec(`
+		UPDATE lock_budget_configs
+		SET budget_limit = ?, updated_at = ?
+		WHERE id = ?
+	`, newBudgetLimit, now, cfg.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	result := &model.BudgetRechargeResult{
+		Success:          true,
+		CallerID:         callerID,
+		RechargedAmount:  arrearsCleared + amount,
+		ArrearsCleared:   arrearsCleared,
+		RemainingArrears: remainingArrears,
+		NewBudgetLimit:   newBudgetLimit,
+	}
+	if arrearsCleared > 0 && remainingArrears == 0 {
+		result.Message = "充值成功，欠费已全部结清"
+	} else if arrearsCleared > 0 {
+		result.Message = fmt.Sprintf("充值成功，已抵扣部分欠费，仍欠 %d 单位", remainingArrears)
+	} else {
+		result.Message = "充值成功"
+	}
+
+	return result, nil
+}
+
+func (s *Storage) ListBudgetTransfersInPeriod(callerID string, startAt, endAt time.Time) ([]model.BudgetTransferRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT id, from_caller, to_caller, amount, reason, created_at
+		FROM lock_budget_transfers
+		WHERE (from_caller = ? OR to_caller = ?)
+		  AND created_at >= ? AND created_at < ?
+		ORDER BY created_at
+	`, callerID, callerID, startAt, endAt)
 	if err != nil {
 		return nil, err
 	}
