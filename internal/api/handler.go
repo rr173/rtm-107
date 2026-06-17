@@ -373,6 +373,19 @@ func (h *Handler) AcquireLock(c *gin.Context) {
 		return
 	}
 
+	if result.BudgetRejected && result.BudgetCheckResult != nil {
+		br := result.BudgetCheckResult
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"acquired":        false,
+			"budget_rejected": true,
+			"reason":          br.Reason,
+			"consumed_units":  br.ConsumedUnits,
+			"remaining_units": br.RemainingUnits,
+			"budget_limit":    br.BudgetLimit,
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"acquired": result.Acquired,
 		"queued":   result.Queued,
@@ -506,6 +519,19 @@ func (h *Handler) AcquireLocksBatch(c *gin.Context) {
 	}
 
 	if !result.Acquired {
+		if result.BudgetRejected && result.BudgetCheckResult != nil {
+			br := result.BudgetCheckResult
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"acquired":        false,
+				"budget_rejected": true,
+				"failed_lock":     result.FailedLock,
+				"reason":          br.Reason,
+				"consumed_units":  br.ConsumedUnits,
+				"remaining_units": br.RemainingUnits,
+				"budget_limit":    br.BudgetLimit,
+			})
+			return
+		}
 		c.JSON(http.StatusConflict, gin.H{
 			"acquired":    false,
 			"failed_lock": result.FailedLock,

@@ -3,6 +3,7 @@ package lockbudget
 import (
 	"fmt"
 	"log"
+	"math"
 	"rtm-107/internal/model"
 	"rtm-107/internal/storage"
 	"sync"
@@ -206,8 +207,8 @@ func (m *Manager) checkPeriodResetLocked(callerID string, rt *callerRuntimeState
 func (m *Manager) finalizeCurrentPeriodLocked(callerID string, rt *callerRuntimeState, endTime time.Time) {
 	for _, h := range rt.holdings {
 		if h.lastMeteredAt.Before(endTime) {
-			elapsed := endTime.Sub(h.lastMeteredAt).Seconds()
-			units := int(elapsed)
+			elapsed := endTime.Sub(h.lastMeteredAt)
+			units := int(elapsed.Seconds())
 			if units > 0 {
 				rt.consumedUnits += units
 				h.unitsAccrued += units
@@ -246,12 +247,12 @@ func (m *Manager) meterCallerLocked(callerID string, rt *callerRuntimeState, now
 		concurrentCount++
 
 		if h.lastMeteredAt.Before(now) {
-			elapsed := now.Sub(h.lastMeteredAt).Seconds()
-			units := int(elapsed)
+			elapsed := now.Sub(h.lastMeteredAt)
+			units := int(elapsed.Seconds())
 			if units > 0 {
 				rt.consumedUnits += units
 				h.unitsAccrued += units
-				h.lastMeteredAt = now
+				h.lastMeteredAt = h.lastMeteredAt.Add(time.Duration(units) * time.Second)
 				_ = m.storage.UpdateBudgetHoldingMeter(callerID, lockName, h.lastMeteredAt, h.unitsAccrued)
 				m.dirty = true
 			}
@@ -265,7 +266,7 @@ func (m *Manager) meterCallerLocked(callerID string, rt *callerRuntimeState, now
 
 	rt.lockCount = concurrentCount
 	if concurrentCount > rt.peakConcurrent {
-		rt.peakConcurrent = concurrentCount
+		rt.peakConcurrent = rt.lockCount
 	}
 }
 
@@ -466,8 +467,8 @@ func (m *Manager) StopHolding(callerID string, lockName string, releasedAt time.
 
 	var unitsThisRelease int
 	if h.lastMeteredAt.Before(releasedAt) {
-		elapsed := releasedAt.Sub(h.lastMeteredAt).Seconds()
-		unitsThisRelease = int(elapsed)
+		elapsedSec := releasedAt.Sub(h.lastMeteredAt).Seconds()
+		unitsThisRelease = int(math.Ceil(elapsedSec))
 		if unitsThisRelease > 0 {
 			rt.consumedUnits += unitsThisRelease
 			h.unitsAccrued += unitsThisRelease

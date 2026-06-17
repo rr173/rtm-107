@@ -100,11 +100,13 @@ type BatchAcquireRequest struct {
 }
 
 type BatchAcquireResult struct {
-	Acquired    bool     `json:"acquired"`
-	FailedLock  string   `json:"failed_lock,omitempty"`
-	FailedBy    string   `json:"failed_by,omitempty"`
-	Locks       []Lock   `json:"locks,omitempty"`
-	Leases      []Lease  `json:"leases,omitempty"`
+	Acquired          bool                   `json:"acquired"`
+	FailedLock        string                 `json:"failed_lock,omitempty"`
+	FailedBy          string                 `json:"failed_by,omitempty"`
+	Locks             []Lock                 `json:"locks,omitempty"`
+	Leases            []Lease                `json:"leases,omitempty"`
+	BudgetRejected    bool                   `json:"budget_rejected,omitempty"`
+	BudgetCheckResult *BudgetAcquireCheckResult `json:"budget_check_result,omitempty"`
 }
 
 type WaitGraph struct {

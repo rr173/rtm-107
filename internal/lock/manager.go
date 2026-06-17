@@ -999,6 +999,17 @@ func (m *Manager) AcquireLocksBatch(lockNames []string, holder string, leaseSec 
 				FailedBy:   err.Error(),
 			}, nil
 		}
+		if result.BudgetRejected {
+			m.rollbackBatchLocked(acquiredLocks, holder)
+			br := result.BudgetCheckResult
+			return &model.BatchAcquireResult{
+				Acquired:        false,
+				FailedLock:      lockName,
+				FailedBy:        fmt.Sprintf("budget exhausted: consumed=%d, limit=%d, remaining=%d", br.ConsumedUnits, br.BudgetLimit, br.RemainingUnits),
+				BudgetRejected:  true,
+				BudgetCheckResult: br,
+			}, nil
+		}
 		if result != nil {
 			acquiredLocks = append(acquiredLocks, result.Lock)
 			acquiredLeases = append(acquiredLeases, result.Lease)
@@ -1040,8 +1051,7 @@ func (m *Manager) acquireLockNoQueueLocked(lockName, holder string, leaseSec int
 			return &AcquireResult{
 				BudgetRejected:    true,
 				BudgetCheckResult: checkResult,
-			}, fmt.Errorf("budget exhausted for caller %s: consumed=%d, limit=%d, remaining=%d",
-				holder, checkResult.ConsumedUnits, checkResult.BudgetLimit, checkResult.RemainingUnits)
+			}, nil
 		}
 	}
 
