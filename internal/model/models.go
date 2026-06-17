@@ -1357,28 +1357,36 @@ const (
 )
 
 type LockBudgetConfig struct {
-	ID           int64     `json:"id"`
-	CallerID     string    `json:"caller_id"`
-	BudgetLimit  int       `json:"budget_limit"`
-	PeriodSec    int       `json:"period_sec"`
-	WarningPct   int       `json:"warning_pct"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID              int64     `json:"id"`
+	CallerID        string    `json:"caller_id"`
+	BudgetLimit     int       `json:"budget_limit"`
+	PeriodSec       int       `json:"period_sec"`
+	WarningPct      int       `json:"warning_pct"`
+	OverdraftLimit  int       `json:"overdraft_limit"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type LockBudgetStatus struct {
-	CallerID       string    `json:"caller_id"`
-	BudgetLimit    int       `json:"budget_limit"`
-	PeriodSec      int       `json:"period_sec"`
-	ConsumedUnits  int       `json:"consumed_units"`
-	RemainingUnits int       `json:"remaining_units"`
-	WarningPct     int       `json:"warning_pct"`
-	WarningTriggered bool    `json:"warning_triggered"`
-	Exhausted      bool      `json:"exhausted"`
-	PeriodStartAt  time.Time `json:"period_start_at"`
-	PeriodEndAt    time.Time `json:"period_end_at"`
-	ActiveLocks    int       `json:"active_locks"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	CallerID          string    `json:"caller_id"`
+	BudgetLimit       int       `json:"budget_limit"`
+	PeriodSec         int       `json:"period_sec"`
+	ConsumedUnits     int       `json:"consumed_units"`
+	RemainingUnits    int       `json:"remaining_units"`
+	WarningPct        int       `json:"warning_pct"`
+	WarningTriggered  bool      `json:"warning_triggered"`
+	Exhausted         bool      `json:"exhausted"`
+	OverdraftLimit    int       `json:"overdraft_limit"`
+	CurrentOverdraft  int       `json:"current_overdraft"`
+	InOverdraft       bool      `json:"in_overdraft"`
+	OverdraftPenaltyUnits int   `json:"overdraft_penalty_units"`
+	NextPeriodDeduction int     `json:"next_period_deduction"`
+	TransferredIn     int       `json:"transferred_in"`
+	TransferredOut    int       `json:"transferred_out"`
+	PeriodStartAt     time.Time `json:"period_start_at"`
+	PeriodEndAt       time.Time `json:"period_end_at"`
+	ActiveLocks       int       `json:"active_locks"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type HeldLockDetail struct {
@@ -1404,29 +1412,39 @@ type BudgetExhaustEvent struct {
 }
 
 type BudgetPeriodSummary struct {
-	CallerID       string    `json:"caller_id"`
-	PeriodStartAt  time.Time `json:"period_start_at"`
-	PeriodEndAt    time.Time `json:"period_end_at"`
-	BudgetLimit    int       `json:"budget_limit"`
-	TotalConsumed  int       `json:"total_consumed"`
-	PeakConcurrent int       `json:"peak_concurrent"`
-	LockCount      int       `json:"lock_count"`
-	ExhaustEvents  int       `json:"exhaust_events"`
+	CallerID           string    `json:"caller_id"`
+	PeriodStartAt      time.Time `json:"period_start_at"`
+	PeriodEndAt        time.Time `json:"period_end_at"`
+	BudgetLimit        int       `json:"budget_limit"`
+	OverdraftLimit     int       `json:"overdraft_limit"`
+	TotalConsumed      int       `json:"total_consumed"`
+	OverdraftUsed      int       `json:"overdraft_used"`
+	OverdraftPenalty   int       `json:"overdraft_penalty"`
+	TransferredIn      int       `json:"transferred_in"`
+	TransferredOut     int       `json:"transferred_out"`
+	CarryOverDeduction int       `json:"carry_over_deduction"`
+	PeakConcurrent     int       `json:"peak_concurrent"`
+	LockCount          int       `json:"lock_count"`
+	ExhaustEvents      int       `json:"exhaust_events"`
 }
 
 type SetBudgetRequest struct {
-	CallerID    string `json:"caller_id" binding:"required"`
-	BudgetLimit int    `json:"budget_limit" binding:"required,min=1"`
-	PeriodSec   int    `json:"period_sec" binding:"required,min=1"`
-	WarningPct  int    `json:"warning_pct" binding:"min=0,max=100"`
+	CallerID       string `json:"caller_id" binding:"required"`
+	BudgetLimit    int    `json:"budget_limit" binding:"required,min=1"`
+	PeriodSec      int    `json:"period_sec" binding:"required,min=1"`
+	WarningPct     int    `json:"warning_pct" binding:"min=0,max=100"`
+	OverdraftLimit int    `json:"overdraft_limit" binding:"min=0"`
 }
 
 type BudgetAcquireCheckResult struct {
-	Allowed        bool   `json:"allowed"`
-	ConsumedUnits  int    `json:"consumed_units"`
-	RemainingUnits int    `json:"remaining_units"`
-	BudgetLimit    int    `json:"budget_limit"`
-	Reason         string `json:"reason,omitempty"`
+	Allowed           bool   `json:"allowed"`
+	ConsumedUnits     int    `json:"consumed_units"`
+	RemainingUnits    int    `json:"remaining_units"`
+	BudgetLimit       int    `json:"budget_limit"`
+	OverdraftLimit    int    `json:"overdraft_limit"`
+	CurrentOverdraft  int    `json:"current_overdraft"`
+	UsingOverdraft    bool   `json:"using_overdraft"`
+	Reason            string `json:"reason,omitempty"`
 }
 
 func (r *BudgetAcquireCheckResult) BudgetRejected() bool {
@@ -1446,5 +1464,75 @@ type GlobalBudgetStats struct {
 	ExhaustEvents24h   int64 `json:"exhaust_events_24h"`
 	CallersOverBudget  int   `json:"callers_over_budget"`
 	CallersNearBudget  int   `json:"callers_near_budget"`
+	CallersInOverdraft int   `json:"callers_in_overdraft"`
+	TotalOverdraftAmount int `json:"total_overdraft_amount"`
 }
+
+type BudgetTransferRecord struct {
+	ID          int64     `json:"id"`
+	FromCaller  string    `json:"from_caller"`
+	ToCaller    string    `json:"to_caller"`
+	Amount      int       `json:"amount"`
+	Reason      string    `json:"reason,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type BudgetTransferRequest struct {
+	FromCaller string `json:"from_caller" binding:"required"`
+	ToCaller   string `json:"to_caller" binding:"required"`
+	Amount     int    `json:"amount" binding:"required,min=1"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+type BudgetTransferResult struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Record  *BudgetTransferRecord `json:"record,omitempty"`
+}
+
+type BudgetOverdraftInfo struct {
+	CallerID           string `json:"caller_id"`
+	CurrentOverdraft   int    `json:"current_overdraft"`
+	OverdraftLimit     int    `json:"overdraft_limit"`
+	OverdraftRemaining int    `json:"overdraft_remaining"`
+	OverdraftPenaltyUnits int `json:"overdraft_penalty_units"`
+	NextPeriodDeduction int   `json:"next_period_deduction"`
+	InOverdraft        bool   `json:"in_overdraft"`
+	ActiveLocks        int    `json:"active_locks"`
+	PeriodStartAt      time.Time `json:"period_start_at"`
+	PeriodEndAt        time.Time `json:"period_end_at"`
+}
+
+type BudgetOverdraftListResult struct {
+	TotalInOverdraft int                  `json:"total_in_overdraft"`
+	TotalOverdraftAmount int               `json:"total_overdraft_amount"`
+	Items            []BudgetOverdraftInfo `json:"items"`
+}
+
+type BudgetNextPeriodDeductionInfo struct {
+	CallerID           string `json:"caller_id"`
+	NextPeriodDeduction int   `json:"next_period_deduction"`
+	CurrentOverdraft   int    `json:"current_overdraft"`
+	OverdraftPenaltyUnits int `json:"overdraft_penalty_units"`
+	PeriodEndAt        time.Time `json:"period_end_at"`
+	BudgetLimit        int    `json:"budget_limit"`
+	ProjectedRemaining int    `json:"projected_remaining"`
+}
+
+type BudgetTransferListQuery struct {
+	CallerID   string `form:"caller_id"`
+	FromCaller string `form:"from_caller"`
+	ToCaller   string `form:"to_caller"`
+	Limit      int    `form:"limit,default=50"`
+	Offset     int    `form:"offset,default=0"`
+}
+
+type BudgetTransferListResult struct {
+	Total  int64                  `json:"total"`
+	Items  []BudgetTransferRecord `json:"items"`
+	Limit  int                    `json:"limit"`
+	Offset int                    `json:"offset"`
+}
+
+const OverdraftPenaltyMultiplier = 1.5
 

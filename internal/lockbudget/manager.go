@@ -11,22 +11,29 @@ import (
 )
 
 type callerRuntimeState struct {
-	config        *model.LockBudgetConfig
-	periodStartAt time.Time
-	periodEndAt   time.Time
-	consumedUnits int
-	peakConcurrent int
-	lockCount     int
-	exhaustCount  int
-	holdings      map[string]*holdingState
+	config              *model.LockBudgetConfig
+	periodStartAt       time.Time
+	periodEndAt         time.Time
+	consumedUnits       int
+	peakConcurrent      int
+	lockCount           int
+	exhaustCount        int
+	holdings            map[string]*holdingState
+
+	currentOverdraft    int
+	overdraftPenalty    int
+	carryOverDeduction  int
+	transferredIn       int
+	transferredOut      int
 }
 
 type holdingState struct {
-	lockName      string
-	acquiredAt    time.Time
-	expiresAt     time.Time
-	lastMeteredAt time.Time
-	unitsAccrued  int
+	lockName        string
+	acquiredAt      time.Time
+	expiresAt       time.Time
+	lastMeteredAt   time.Time
+	unitsAccrued    int
+	inOverdraft     bool
 }
 
 type Manager struct {
@@ -176,32 +183,47 @@ func (m *Manager) checkPeriodResetLocked(callerID string, rt *callerRuntimeState
 
 	rt.periodStartAt = rt.periodEndAt
 	for i := 1; i < periodsToAdvance; i++ {
-		rt.periodStartAt = rt.periodStartAt.Add(time.Duration(rt.config.PeriodSec) * time.Second)
+		periodStart := rt.periodStartAt
+		periodEnd := periodStart.Add(time.Duration(rt.config.PeriodSec) * time.Second)
+
 		summary := &model.BudgetPeriodSummary{
-			CallerID:      callerID,
-			PeriodStartAt: rt.periodStartAt,
-			PeriodEndAt:   rt.periodStartAt.Add(time.Duration(rt.config.PeriodSec) * time.Second),
-			BudgetLimit:   rt.config.BudgetLimit,
-			TotalConsumed: 0,
+			CallerID:       callerID,
+			PeriodStartAt:  periodStart,
+			PeriodEndAt:    periodEnd,
+			BudgetLimit:    rt.config.BudgetLimit,
+			OverdraftLimit: rt.config.OverdraftLimit,
+			TotalConsumed:  0,
 			PeakConcurrent: 0,
-			LockCount:     0,
-			ExhaustEvents: 0,
+			LockCount:      0,
+			ExhaustEvents:  0,
+		}
+		if i == periodsToAdvance-1 {
+			summary.CarryOverDeduction = rt.currentOverdraft + rt.overdraftPenalty
 		}
 		_ = m.storage.UpsertBudgetPeriodSummary(summary)
+		rt.periodStartAt = periodEnd
 	}
+
 	rt.periodEndAt = rt.periodStartAt.Add(time.Duration(rt.config.PeriodSec) * time.Second)
-	rt.consumedUnits = 0
+
+	rt.carryOverDeduction = rt.currentOverdraft + rt.overdraftPenalty
+	rt.consumedUnits = rt.carryOverDeduction
+	rt.currentOverdraft = 0
+	rt.overdraftPenalty = 0
 	rt.peakConcurrent = 0
 	rt.lockCount = len(rt.holdings)
 	rt.exhaustCount = 0
+	rt.transferredIn = 0
+	rt.transferredOut = 0
 
 	for _, h := range rt.holdings {
 		h.lastMeteredAt = now
 		h.unitsAccrued = 0
+		h.inOverdraft = rt.consumedUnits > rt.config.BudgetLimit
 	}
 
-	log.Printf("[lockbudget] period reset: caller=%s period_start=%v period_end=%v",
-		callerID, rt.periodStartAt.Format(time.RFC3339), rt.periodEndAt.Format(time.RFC3339))
+	log.Printf("[lockbudget] period reset: caller=%s period_start=%v period_end=%v carry_over_deduction=%d",
+		callerID, rt.periodStartAt.Format(time.RFC3339), rt.periodEndAt.Format(time.RFC3339), rt.carryOverDeduction)
 }
 
 func (m *Manager) finalizeCurrentPeriodLocked(callerID string, rt *callerRuntimeState, endTime time.Time) {
@@ -210,8 +232,10 @@ func (m *Manager) finalizeCurrentPeriodLocked(callerID string, rt *callerRuntime
 			elapsed := endTime.Sub(h.lastMeteredAt)
 			units := int(elapsed.Seconds())
 			if units > 0 {
-				rt.consumedUnits += units
-				h.unitsAccrued += units
+				unitsToAdd, penalty := m.applyOverdraftPenaltyLocked(rt, units)
+				rt.consumedUnits += unitsToAdd
+				rt.overdraftPenalty += penalty
+				h.unitsAccrued += unitsToAdd
 				h.lastMeteredAt = endTime
 				_ = m.storage.UpdateBudgetHoldingMeter(callerID, h.lockName, h.lastMeteredAt, h.unitsAccrued)
 			}
@@ -222,17 +246,52 @@ func (m *Manager) finalizeCurrentPeriodLocked(callerID string, rt *callerRuntime
 		rt.peakConcurrent = rt.lockCount
 	}
 
+	overdraftUsed := 0
+	if rt.consumedUnits > rt.config.BudgetLimit {
+		overdraftUsed = rt.consumedUnits - rt.config.BudgetLimit
+	}
+
 	summary := &model.BudgetPeriodSummary{
-		CallerID:       callerID,
-		PeriodStartAt:  rt.periodStartAt,
-		PeriodEndAt:    endTime,
-		BudgetLimit:    rt.config.BudgetLimit,
-		TotalConsumed:  rt.consumedUnits,
-		PeakConcurrent: rt.peakConcurrent,
-		LockCount:      rt.lockCount,
-		ExhaustEvents:  rt.exhaustCount,
+		CallerID:           callerID,
+		PeriodStartAt:      rt.periodStartAt,
+		PeriodEndAt:        endTime,
+		BudgetLimit:        rt.config.BudgetLimit,
+		OverdraftLimit:     rt.config.OverdraftLimit,
+		TotalConsumed:      rt.consumedUnits,
+		OverdraftUsed:      overdraftUsed,
+		OverdraftPenalty:   rt.overdraftPenalty,
+		TransferredIn:      rt.transferredIn,
+		TransferredOut:     rt.transferredOut,
+		CarryOverDeduction: rt.currentOverdraft + rt.overdraftPenalty,
+		PeakConcurrent:     rt.peakConcurrent,
+		LockCount:          rt.lockCount,
+		ExhaustEvents:      rt.exhaustCount,
 	}
 	_ = m.storage.UpsertBudgetPeriodSummary(summary)
+}
+
+func (m *Manager) applyOverdraftPenaltyLocked(rt *callerRuntimeState, units int) (int, int) {
+	if rt.config.OverdraftLimit <= 0 {
+		return units, 0
+	}
+
+	budgetLimit := rt.config.BudgetLimit
+	currentWithNew := rt.consumedUnits + units
+
+	if currentWithNew <= budgetLimit {
+		return units, 0
+	}
+
+	normalUnits := 0
+	if rt.consumedUnits < budgetLimit {
+		normalUnits = budgetLimit - rt.consumedUnits
+	}
+	overdraftUnits := units - normalUnits
+
+	penaltyUnits := int(math.Ceil(float64(overdraftUnits) * (model.OverdraftPenaltyMultiplier - 1.0)))
+	totalUnits := normalUnits + overdraftUnits + penaltyUnits
+
+	return totalUnits, penaltyUnits
 }
 
 func (m *Manager) meterCallerLocked(callerID string, rt *callerRuntimeState, now time.Time) {
@@ -250,9 +309,17 @@ func (m *Manager) meterCallerLocked(callerID string, rt *callerRuntimeState, now
 			elapsed := now.Sub(h.lastMeteredAt)
 			units := int(elapsed.Seconds())
 			if units > 0 {
-				rt.consumedUnits += units
-				h.unitsAccrued += units
+				unitsToAdd, penalty := m.applyOverdraftPenaltyLocked(rt, units)
+				rt.consumedUnits += unitsToAdd
+				rt.overdraftPenalty += penalty
+				h.unitsAccrued += unitsToAdd
 				h.lastMeteredAt = h.lastMeteredAt.Add(time.Duration(units) * time.Second)
+
+				if rt.consumedUnits > rt.config.BudgetLimit {
+					rt.currentOverdraft = rt.consumedUnits - rt.config.BudgetLimit
+					h.inOverdraft = true
+				}
+
 				_ = m.storage.UpdateBudgetHoldingMeter(callerID, lockName, h.lastMeteredAt, h.unitsAccrued)
 				m.dirty = true
 			}
@@ -275,6 +342,10 @@ func (m *Manager) persistDirtyLocked(now time.Time) {
 }
 
 func (m *Manager) SetBudget(callerID string, budgetLimit int, periodSec int, warningPct int) (*model.LockBudgetConfig, error) {
+	return m.SetBudgetWithOverdraft(callerID, budgetLimit, periodSec, warningPct, 0)
+}
+
+func (m *Manager) SetBudgetWithOverdraft(callerID string, budgetLimit int, periodSec int, warningPct int, overdraftLimit int) (*model.LockBudgetConfig, error) {
 	if callerID == "" {
 		return nil, fmt.Errorf("caller_id is required")
 	}
@@ -287,18 +358,22 @@ func (m *Manager) SetBudget(callerID string, budgetLimit int, periodSec int, war
 	if warningPct < 0 || warningPct > 100 {
 		warningPct = 80
 	}
+	if overdraftLimit < 0 {
+		overdraftLimit = 0
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := time.Now()
 	cfg := &model.LockBudgetConfig{
-		CallerID:    callerID,
-		BudgetLimit: budgetLimit,
-		PeriodSec:   periodSec,
-		WarningPct:  warningPct,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		CallerID:       callerID,
+		BudgetLimit:    budgetLimit,
+		PeriodSec:      periodSec,
+		WarningPct:     warningPct,
+		OverdraftLimit: overdraftLimit,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 
 	if rt, ok := m.callers[callerID]; ok {
@@ -308,11 +383,17 @@ func (m *Manager) SetBudget(callerID string, budgetLimit int, periodSec int, war
 		rt.periodStartAt = now
 		rt.periodEndAt = now.Add(time.Duration(periodSec) * time.Second)
 		rt.consumedUnits = 0
+		rt.currentOverdraft = 0
+		rt.overdraftPenalty = 0
+		rt.carryOverDeduction = 0
 		rt.peakConcurrent = 0
 		rt.exhaustCount = 0
+		rt.transferredIn = 0
+		rt.transferredOut = 0
 		for _, h := range rt.holdings {
 			h.lastMeteredAt = now
 			h.unitsAccrued = 0
+			h.inOverdraft = false
 		}
 	} else {
 		rt = &callerRuntimeState{
@@ -328,8 +409,8 @@ func (m *Manager) SetBudget(callerID string, budgetLimit int, periodSec int, war
 		return nil, err
 	}
 
-	log.Printf("[lockbudget] budget set: caller=%s limit=%d period=%ds warning=%d%%",
-		callerID, budgetLimit, periodSec, warningPct)
+	log.Printf("[lockbudget] budget set: caller=%s limit=%d period=%ds warning=%d%% overdraft=%d",
+		callerID, budgetLimit, periodSec, warningPct, overdraftLimit)
 	return cfg, nil
 }
 
@@ -358,6 +439,76 @@ func (m *Manager) DeleteBudget(callerID string) error {
 	return nil
 }
 
+func (m *Manager) TransferBudget(fromCaller, toCaller string, amount int, reason string) (*model.BudgetTransferRecord, error) {
+	if fromCaller == "" {
+		return nil, fmt.Errorf("from_caller is required")
+	}
+	if toCaller == "" {
+		return nil, fmt.Errorf("to_caller is required")
+	}
+	if fromCaller == toCaller {
+		return nil, fmt.Errorf("cannot transfer to self")
+	}
+	if amount <= 0 {
+		return nil, fmt.Errorf("amount must be positive")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+
+	fromRT, ok := m.callers[fromCaller]
+	if !ok {
+		return nil, fmt.Errorf("no budget configured for source caller: %s", fromCaller)
+	}
+	toRT, ok := m.callers[toCaller]
+	if !ok {
+		return nil, fmt.Errorf("no budget configured for target caller: %s", toCaller)
+	}
+
+	m.checkPeriodResetLocked(fromCaller, fromRT, now)
+	m.meterCallerLocked(fromCaller, fromRT, now)
+	m.checkPeriodResetLocked(toCaller, toRT, now)
+	m.meterCallerLocked(toCaller, toRT, now)
+
+	fromRemaining := fromRT.config.BudgetLimit - fromRT.consumedUnits
+	if fromRemaining < amount {
+		return nil, fmt.Errorf("insufficient remaining budget: caller=%s remaining=%d requested=%d",
+			fromCaller, fromRemaining, amount)
+	}
+
+	fromRT.consumedUnits += amount
+	fromRT.transferredOut += amount
+	if fromRT.consumedUnits > fromRT.config.BudgetLimit {
+		fromRT.currentOverdraft = fromRT.consumedUnits - fromRT.config.BudgetLimit
+	}
+
+	toRT.consumedUnits -= amount
+	if toRT.consumedUnits < 0 {
+		toRT.consumedUnits = 0
+	}
+	toRT.currentOverdraft = 0
+	if toRT.consumedUnits > toRT.config.BudgetLimit {
+		toRT.currentOverdraft = toRT.consumedUnits - toRT.config.BudgetLimit
+	}
+	toRT.transferredIn += amount
+
+	record := &model.BudgetTransferRecord{
+		FromCaller: fromCaller,
+		ToCaller:   toCaller,
+		Amount:     amount,
+		Reason:     reason,
+		CreatedAt:  now,
+	}
+	if err := m.storage.AddBudgetTransfer(record); err != nil {
+		return nil, err
+	}
+
+	log.Printf("[lockbudget] transfer: from=%s to=%s amount=%d reason=%q", fromCaller, toCaller, amount, reason)
+	return record, nil
+}
+
 func (m *Manager) CheckAcquire(callerID string, lockName string, leaseSec int) (*model.BudgetAcquireCheckResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -380,33 +531,71 @@ func (m *Manager) CheckAcquire(callerID string, lockName string, leaseSec int) (
 	}
 
 	result := &model.BudgetAcquireCheckResult{
-		ConsumedUnits:  rt.consumedUnits,
-		RemainingUnits: remaining,
-		BudgetLimit:    rt.config.BudgetLimit,
+		ConsumedUnits:    rt.consumedUnits,
+		RemainingUnits:   remaining,
+		BudgetLimit:      rt.config.BudgetLimit,
+		OverdraftLimit:   rt.config.OverdraftLimit,
+		CurrentOverdraft: rt.currentOverdraft,
 	}
 
-	if rt.consumedUnits >= rt.config.BudgetLimit {
-		result.Allowed = false
-		result.Reason = fmt.Sprintf("budget exhausted: consumed=%d, limit=%d, remaining=%d",
-			rt.consumedUnits, rt.config.BudgetLimit, remaining)
+	if rt.config.OverdraftLimit > 0 {
+		effectiveLimit := rt.config.BudgetLimit + rt.config.OverdraftLimit
+		if rt.consumedUnits >= effectiveLimit {
+			result.Allowed = false
+			result.UsingOverdraft = true
+			result.Reason = fmt.Sprintf("budget and overdraft exhausted: consumed=%d, budget=%d, overdraft_limit=%d, effective_limit=%d",
+				rt.consumedUnits, rt.config.BudgetLimit, rt.config.OverdraftLimit, effectiveLimit)
 
-		event := &model.BudgetExhaustEvent{
-			CallerID:       callerID,
-			ConsumedUnits:  rt.consumedUnits,
-			BudgetLimit:    rt.config.BudgetLimit,
-			PeriodStartAt:  rt.periodStartAt,
-			PeriodEndAt:    rt.periodEndAt,
-			AttemptedLock:  lockName,
-			UnitsRequested: leaseSec,
-			Detail:         result.Reason,
-			CreatedAt:      now,
+			event := &model.BudgetExhaustEvent{
+				CallerID:       callerID,
+				ConsumedUnits:  rt.consumedUnits,
+				BudgetLimit:    rt.config.BudgetLimit,
+				PeriodStartAt:  rt.periodStartAt,
+				PeriodEndAt:    rt.periodEndAt,
+				AttemptedLock:  lockName,
+				UnitsRequested: leaseSec,
+				Detail:         result.Reason,
+				CreatedAt:      now,
+			}
+			_ = m.storage.AddBudgetExhaustEvent(event)
+			rt.exhaustCount++
+
+			log.Printf("[lockbudget] acquire rejected (overdraft exhausted): caller=%s lock=%s consumed=%d budget=%d overdraft=%d",
+				callerID, lockName, rt.consumedUnits, rt.config.BudgetLimit, rt.config.OverdraftLimit)
+			return result, nil
 		}
-		_ = m.storage.AddBudgetExhaustEvent(event)
-		rt.exhaustCount++
 
-		log.Printf("[lockbudget] acquire rejected: caller=%s lock=%s consumed=%d limit=%d",
-			callerID, lockName, rt.consumedUnits, rt.config.BudgetLimit)
-		return result, nil
+		if rt.consumedUnits >= rt.config.BudgetLimit {
+			result.Allowed = true
+			result.UsingOverdraft = true
+			result.Reason = fmt.Sprintf("using overdraft: consumed=%d, budget=%d, current_overdraft=%d, overdraft_limit=%d (penalty x%.1f)",
+				rt.consumedUnits, rt.config.BudgetLimit, rt.currentOverdraft, rt.config.OverdraftLimit, model.OverdraftPenaltyMultiplier)
+			return result, nil
+		}
+	} else {
+		if rt.consumedUnits >= rt.config.BudgetLimit {
+			result.Allowed = false
+			result.Reason = fmt.Sprintf("budget exhausted: consumed=%d, limit=%d, remaining=%d",
+				rt.consumedUnits, rt.config.BudgetLimit, remaining)
+
+			event := &model.BudgetExhaustEvent{
+				CallerID:       callerID,
+				ConsumedUnits:  rt.consumedUnits,
+				BudgetLimit:    rt.config.BudgetLimit,
+				PeriodStartAt:  rt.periodStartAt,
+				PeriodEndAt:    rt.periodEndAt,
+				AttemptedLock:  lockName,
+				UnitsRequested: leaseSec,
+				Detail:         result.Reason,
+				CreatedAt:      now,
+			}
+			_ = m.storage.AddBudgetExhaustEvent(event)
+			rt.exhaustCount++
+
+			log.Printf("[lockbudget] acquire rejected: caller=%s lock=%s consumed=%d limit=%d",
+				callerID, lockName, rt.consumedUnits, rt.config.BudgetLimit)
+			return result, nil
+		}
 	}
 
 	result.Allowed = true
@@ -434,12 +623,15 @@ func (m *Manager) StartHolding(callerID string, lockName string, acquiredAt time
 		meterStart = rt.periodStartAt
 	}
 
+	inOverdraft := rt.consumedUnits >= rt.config.BudgetLimit
+
 	h := &holdingState{
 		lockName:      lockName,
 		acquiredAt:    acquiredAt,
 		expiresAt:     expiresAt,
 		lastMeteredAt: meterStart,
 		unitsAccrued:  0,
+		inOverdraft:   inOverdraft,
 	}
 
 	rt.holdings[lockName] = h
@@ -465,14 +657,19 @@ func (m *Manager) StopHolding(callerID string, lockName string, releasedAt time.
 		return 0, nil
 	}
 
-	var unitsThisRelease int
 	if h.lastMeteredAt.Before(releasedAt) {
 		elapsedSec := releasedAt.Sub(h.lastMeteredAt).Seconds()
-		unitsThisRelease = int(math.Ceil(elapsedSec))
-		if unitsThisRelease > 0 {
-			rt.consumedUnits += unitsThisRelease
-			h.unitsAccrued += unitsThisRelease
+		rawUnits := int(math.Ceil(elapsedSec))
+		if rawUnits > 0 {
+			unitsToAdd, penalty := m.applyOverdraftPenaltyLocked(rt, rawUnits)
+			rt.consumedUnits += unitsToAdd
+			rt.overdraftPenalty += penalty
+			h.unitsAccrued += unitsToAdd
 			h.lastMeteredAt = releasedAt
+
+			if rt.consumedUnits > rt.config.BudgetLimit {
+				rt.currentOverdraft = rt.consumedUnits - rt.config.BudgetLimit
+			}
 		}
 	}
 
@@ -527,26 +724,38 @@ func (m *Manager) GetCallerStatus(callerID string) (*model.CallerBudgetStatusInf
 	if remaining < 0 {
 		remaining = 0
 	}
-	exhausted := rt.consumedUnits >= rt.config.BudgetLimit
+	exhausted := rt.consumedUnits >= rt.config.BudgetLimit && (rt.config.OverdraftLimit <= 0 || rt.currentOverdraft >= rt.config.OverdraftLimit)
 	warningTriggered := false
 	if rt.config.WarningPct > 0 {
 		threshold := rt.config.BudgetLimit * rt.config.WarningPct / 100
 		warningTriggered = rt.consumedUnits >= threshold
 	}
 
+	inOverdraft := rt.consumedUnits > rt.config.BudgetLimit
+	if rt.currentOverdraft < 0 {
+		rt.currentOverdraft = 0
+	}
+
 	status := &model.LockBudgetStatus{
-		CallerID:         callerID,
-		BudgetLimit:      rt.config.BudgetLimit,
-		PeriodSec:        rt.config.PeriodSec,
-		ConsumedUnits:    rt.consumedUnits,
-		RemainingUnits:   remaining,
-		WarningPct:       rt.config.WarningPct,
-		WarningTriggered: warningTriggered,
-		Exhausted:        exhausted,
-		PeriodStartAt:    rt.periodStartAt,
-		PeriodEndAt:      rt.periodEndAt,
-		ActiveLocks:      rt.lockCount,
-		UpdatedAt:        now,
+		CallerID:             callerID,
+		BudgetLimit:          rt.config.BudgetLimit,
+		PeriodSec:            rt.config.PeriodSec,
+		ConsumedUnits:        rt.consumedUnits,
+		RemainingUnits:       remaining,
+		WarningPct:           rt.config.WarningPct,
+		WarningTriggered:     warningTriggered,
+		Exhausted:            exhausted,
+		OverdraftLimit:       rt.config.OverdraftLimit,
+		CurrentOverdraft:     rt.currentOverdraft,
+		InOverdraft:          inOverdraft,
+		OverdraftPenaltyUnits: rt.overdraftPenalty,
+		NextPeriodDeduction:  rt.currentOverdraft + rt.overdraftPenalty,
+		TransferredIn:        rt.transferredIn,
+		TransferredOut:       rt.transferredOut,
+		PeriodStartAt:        rt.periodStartAt,
+		PeriodEndAt:          rt.periodEndAt,
+		ActiveLocks:          rt.lockCount,
+		UpdatedAt:            now,
 	}
 
 	heldLocks := make([]model.HeldLockDetail, 0, len(rt.holdings))
@@ -592,26 +801,38 @@ func (m *Manager) ListAllStatuses() ([]model.LockBudgetStatus, error) {
 		if remaining < 0 {
 			remaining = 0
 		}
-		exhausted := rt.consumedUnits >= rt.config.BudgetLimit
+		exhausted := rt.consumedUnits >= rt.config.BudgetLimit && (rt.config.OverdraftLimit <= 0 || rt.currentOverdraft >= rt.config.OverdraftLimit)
 		warningTriggered := false
 		if rt.config.WarningPct > 0 {
 			threshold := rt.config.BudgetLimit * rt.config.WarningPct / 100
 			warningTriggered = rt.consumedUnits >= threshold
 		}
 
+		inOverdraft := rt.consumedUnits > rt.config.BudgetLimit
+		if rt.currentOverdraft < 0 {
+			rt.currentOverdraft = 0
+		}
+
 		result = append(result, model.LockBudgetStatus{
-			CallerID:         callerID,
-			BudgetLimit:      rt.config.BudgetLimit,
-			PeriodSec:        rt.config.PeriodSec,
-			ConsumedUnits:    rt.consumedUnits,
-			RemainingUnits:   remaining,
-			WarningPct:       rt.config.WarningPct,
-			WarningTriggered: warningTriggered,
-			Exhausted:        exhausted,
-			PeriodStartAt:    rt.periodStartAt,
-			PeriodEndAt:      rt.periodEndAt,
-			ActiveLocks:      rt.lockCount,
-			UpdatedAt:        now,
+			CallerID:             callerID,
+			BudgetLimit:          rt.config.BudgetLimit,
+			PeriodSec:            rt.config.PeriodSec,
+			ConsumedUnits:        rt.consumedUnits,
+			RemainingUnits:       remaining,
+			WarningPct:           rt.config.WarningPct,
+			WarningTriggered:     warningTriggered,
+			Exhausted:            exhausted,
+			OverdraftLimit:       rt.config.OverdraftLimit,
+			CurrentOverdraft:     rt.currentOverdraft,
+			InOverdraft:          inOverdraft,
+			OverdraftPenaltyUnits: rt.overdraftPenalty,
+			NextPeriodDeduction:  rt.currentOverdraft + rt.overdraftPenalty,
+			TransferredIn:        rt.transferredIn,
+			TransferredOut:       rt.transferredOut,
+			PeriodStartAt:        rt.periodStartAt,
+			PeriodEndAt:          rt.periodEndAt,
+			ActiveLocks:          rt.lockCount,
+			UpdatedAt:            now,
 		})
 	}
 
@@ -641,12 +862,27 @@ func (m *Manager) GetGlobalStats() (*model.GlobalBudgetStats, error) {
 	totalActiveLocks := 0
 	callersOverBudget := 0
 	callersNearBudget := 0
+	callersInOverdraft := 0
+	totalOverdraftAmount := 0
 
 	for callerID, rt := range m.callers {
 		m.checkPeriodResetLocked(callerID, rt, now)
 		m.meterCallerLocked(callerID, rt, now)
 		totalActiveLocks += rt.lockCount
-		if rt.consumedUnits >= rt.config.BudgetLimit {
+
+		inOverdraft := rt.consumedUnits > rt.config.BudgetLimit
+		if inOverdraft && rt.config.OverdraftLimit > 0 {
+			callersInOverdraft++
+			if rt.currentOverdraft > 0 {
+				totalOverdraftAmount += rt.currentOverdraft
+			}
+		}
+
+		effectiveLimit := rt.config.BudgetLimit
+		if rt.config.OverdraftLimit > 0 {
+			effectiveLimit += rt.config.OverdraftLimit
+		}
+		if rt.consumedUnits >= effectiveLimit {
 			callersOverBudget++
 		} else if rt.config.WarningPct > 0 {
 			threshold := rt.config.BudgetLimit * rt.config.WarningPct / 100
@@ -660,12 +896,14 @@ func (m *Manager) GetGlobalStats() (*model.GlobalBudgetStats, error) {
 	exhaustEvents24h, _ := m.storage.CountBudgetExhaustEventsSince("", yesterday)
 
 	return &model.GlobalBudgetStats{
-		TotalCallers:       len(m.callers),
-		TotalActiveLocks:   totalActiveLocks,
-		TotalConsumedToday: totalConsumedToday,
-		ExhaustEvents24h:   exhaustEvents24h,
-		CallersOverBudget:  callersOverBudget,
-		CallersNearBudget:  callersNearBudget,
+		TotalCallers:         len(m.callers),
+		TotalActiveLocks:     totalActiveLocks,
+		TotalConsumedToday:   totalConsumedToday,
+		ExhaustEvents24h:     exhaustEvents24h,
+		CallersOverBudget:    callersOverBudget,
+		CallersNearBudget:    callersNearBudget,
+		CallersInOverdraft:   callersInOverdraft,
+		TotalOverdraftAmount: totalOverdraftAmount,
 	}, nil
 }
 
@@ -691,6 +929,10 @@ func (m *Manager) SetConfig(callerID string, budgetLimit int, periodSec int, war
 	return m.SetBudget(callerID, budgetLimit, periodSec, warningPct)
 }
 
+func (m *Manager) SetConfigWithOverdraft(callerID string, budgetLimit int, periodSec int, warningPct int, overdraftLimit int) (*model.LockBudgetConfig, error) {
+	return m.SetBudgetWithOverdraft(callerID, budgetLimit, periodSec, warningPct, overdraftLimit)
+}
+
 func (m *Manager) DeleteConfig(callerID string) error {
 	return m.DeleteBudget(callerID)
 }
@@ -714,4 +956,132 @@ func (m *Manager) ListHeldLocks(callerID string, now time.Time) ([]model.HeldLoc
 	}
 	_ = now
 	return info.HeldLocks, nil
+}
+
+func (m *Manager) ListTransferRecords(query *model.BudgetTransferListQuery) (*model.BudgetTransferListResult, error) {
+	if query == nil {
+		query = &model.BudgetTransferListQuery{Limit: 50}
+	}
+	records, total, err := m.storage.ListBudgetTransfers(query)
+	if err != nil {
+		return nil, err
+	}
+	return &model.BudgetTransferListResult{
+		Total:  total,
+		Items:  records,
+		Limit:  query.Limit,
+		Offset: query.Offset,
+	}, nil
+}
+
+func (m *Manager) ListOverdraftCallers() (*model.BudgetOverdraftListResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	var items []model.BudgetOverdraftInfo
+	totalAmount := 0
+
+	for callerID, rt := range m.callers {
+		m.checkPeriodResetLocked(callerID, rt, now)
+		m.meterCallerLocked(callerID, rt, now)
+
+		inOverdraft := rt.consumedUnits > rt.config.BudgetLimit
+		if !inOverdraft && rt.currentOverdraft <= 0 {
+			continue
+		}
+
+		overdraftRemaining := 0
+		if rt.config.OverdraftLimit > 0 {
+			overdraftRemaining = rt.config.OverdraftLimit - rt.currentOverdraft
+			if overdraftRemaining < 0 {
+				overdraftRemaining = 0
+			}
+		}
+
+		items = append(items, model.BudgetOverdraftInfo{
+			CallerID:             callerID,
+			CurrentOverdraft:     rt.currentOverdraft,
+			OverdraftLimit:       rt.config.OverdraftLimit,
+			OverdraftRemaining:   overdraftRemaining,
+			OverdraftPenaltyUnits: rt.overdraftPenalty,
+			NextPeriodDeduction:  rt.currentOverdraft + rt.overdraftPenalty,
+			InOverdraft:          inOverdraft,
+			ActiveLocks:          rt.lockCount,
+			PeriodStartAt:        rt.periodStartAt,
+			PeriodEndAt:          rt.periodEndAt,
+		})
+		totalAmount += rt.currentOverdraft
+	}
+
+	return &model.BudgetOverdraftListResult{
+		TotalInOverdraft:    len(items),
+		TotalOverdraftAmount: totalAmount,
+		Items:                items,
+	}, nil
+}
+
+func (m *Manager) GetNextPeriodDeduction(callerID string) (*model.BudgetNextPeriodDeductionInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rt, ok := m.callers[callerID]
+	if !ok {
+		return nil, fmt.Errorf("no budget configured for caller: %s", callerID)
+	}
+
+	now := time.Now()
+	m.checkPeriodResetLocked(callerID, rt, now)
+	m.meterCallerLocked(callerID, rt, now)
+
+	deduction := rt.currentOverdraft + rt.overdraftPenalty
+	projectedRemaining := rt.config.BudgetLimit - deduction
+	if projectedRemaining < 0 {
+		projectedRemaining = 0
+	}
+
+	return &model.BudgetNextPeriodDeductionInfo{
+		CallerID:             callerID,
+		NextPeriodDeduction:  deduction,
+		CurrentOverdraft:     rt.currentOverdraft,
+		OverdraftPenaltyUnits: rt.overdraftPenalty,
+		PeriodEndAt:          rt.periodEndAt,
+		BudgetLimit:          rt.config.BudgetLimit,
+		ProjectedRemaining:   projectedRemaining,
+	}, nil
+}
+
+func (m *Manager) ListAllNextPeriodDeductions() ([]model.BudgetNextPeriodDeductionInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	var result []model.BudgetNextPeriodDeductionInfo
+
+	for callerID, rt := range m.callers {
+		m.checkPeriodResetLocked(callerID, rt, now)
+		m.meterCallerLocked(callerID, rt, now)
+
+		deduction := rt.currentOverdraft + rt.overdraftPenalty
+		if deduction <= 0 {
+			continue
+		}
+
+		projectedRemaining := rt.config.BudgetLimit - deduction
+		if projectedRemaining < 0 {
+			projectedRemaining = 0
+		}
+
+		result = append(result, model.BudgetNextPeriodDeductionInfo{
+			CallerID:             callerID,
+			NextPeriodDeduction:  deduction,
+			CurrentOverdraft:     rt.currentOverdraft,
+			OverdraftPenaltyUnits: rt.overdraftPenalty,
+			PeriodEndAt:          rt.periodEndAt,
+			BudgetLimit:          rt.config.BudgetLimit,
+			ProjectedRemaining:   projectedRemaining,
+		})
+	}
+
+	return result, nil
 }

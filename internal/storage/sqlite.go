@@ -668,6 +668,7 @@ func (s *Storage) initSchema() error {
 		budget_limit INTEGER NOT NULL,
 		period_sec INTEGER NOT NULL,
 		warning_pct INTEGER NOT NULL DEFAULT 80,
+		overdraft_limit INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -709,7 +710,13 @@ func (s *Storage) initSchema() error {
 		period_start_at DATETIME NOT NULL,
 		period_end_at DATETIME NOT NULL,
 		budget_limit INTEGER NOT NULL,
+		overdraft_limit INTEGER NOT NULL DEFAULT 0,
 		total_consumed INTEGER NOT NULL,
+		overdraft_used INTEGER NOT NULL DEFAULT 0,
+		overdraft_penalty INTEGER NOT NULL DEFAULT 0,
+		transferred_in INTEGER NOT NULL DEFAULT 0,
+		transferred_out INTEGER NOT NULL DEFAULT 0,
+		carry_over_deduction INTEGER NOT NULL DEFAULT 0,
 		peak_concurrent INTEGER NOT NULL DEFAULT 0,
 		lock_count INTEGER NOT NULL DEFAULT 0,
 		exhaust_events INTEGER NOT NULL DEFAULT 0,
@@ -719,6 +726,19 @@ func (s *Storage) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_budget_summary_caller ON lock_budget_period_summaries(caller_id);
 	CREATE INDEX IF NOT EXISTS idx_budget_summary_period ON lock_budget_period_summaries(period_start_at);
+
+	CREATE TABLE IF NOT EXISTS lock_budget_transfers (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_caller TEXT NOT NULL,
+		to_caller TEXT NOT NULL,
+		amount INTEGER NOT NULL,
+		reason TEXT DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_budget_transfers_from ON lock_budget_transfers(from_caller);
+	CREATE INDEX IF NOT EXISTS idx_budget_transfers_to ON lock_budget_transfers(to_caller);
+	CREATE INDEX IF NOT EXISTS idx_budget_transfers_created ON lock_budget_transfers(created_at);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -833,6 +853,53 @@ func (s *Storage) migrateSchema() error {
 			log.Printf("[storage-migration] adding column %s to heatmap_config", col)
 			_, err := s.db.Exec(fmt.Sprintf(
 				"ALTER TABLE heatmap_config ADD COLUMN %s REAL NOT NULL DEFAULT %f", col, defaultValue))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	lbCfgColumns := map[string]int{
+		"overdraft_limit": 0,
+	}
+	for col, defaultValue := range lbCfgColumns {
+		row := s.db.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('lock_budget_configs') WHERE name = ?
+		`, col)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			log.Printf("[storage-migration] adding column %s to lock_budget_configs", col)
+			_, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE lock_budget_configs ADD COLUMN %s INTEGER NOT NULL DEFAULT %d", col, defaultValue))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	lbSummaryIntColumns := map[string]int{
+		"overdraft_limit":     0,
+		"overdraft_used":      0,
+		"overdraft_penalty":   0,
+		"transferred_in":      0,
+		"transferred_out":     0,
+		"carry_over_deduction": 0,
+	}
+	for col, defaultValue := range lbSummaryIntColumns {
+		row := s.db.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('lock_budget_period_summaries') WHERE name = ?
+		`, col)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			log.Printf("[storage-migration] adding column %s to lock_budget_period_summaries", col)
+			_, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE lock_budget_period_summaries ADD COLUMN %s INTEGER NOT NULL DEFAULT %d", col, defaultValue))
 			if err != nil {
 				return err
 			}
@@ -4514,14 +4581,15 @@ func (s *Storage) UpdateHeatmapConfig(cfg *model.HeatmapConfig) error {
 
 func (s *Storage) UpsertLockBudgetConfig(cfg *model.LockBudgetConfig) error {
 	result, err := s.db.Exec(`
-		INSERT INTO lock_budget_configs (caller_id, budget_limit, period_sec, warning_pct, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO lock_budget_configs (caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(caller_id) DO UPDATE SET
 			budget_limit = excluded.budget_limit,
 			period_sec = excluded.period_sec,
 			warning_pct = excluded.warning_pct,
+			overdraft_limit = excluded.overdraft_limit,
 			updated_at = excluded.updated_at
-	`, cfg.CallerID, cfg.BudgetLimit, cfg.PeriodSec, cfg.WarningPct, cfg.CreatedAt, cfg.UpdatedAt)
+	`, cfg.CallerID, cfg.BudgetLimit, cfg.PeriodSec, cfg.WarningPct, cfg.OverdraftLimit, cfg.CreatedAt, cfg.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -4533,12 +4601,12 @@ func (s *Storage) UpsertLockBudgetConfig(cfg *model.LockBudgetConfig) error {
 
 func (s *Storage) GetLockBudgetConfig(callerID string) (*model.LockBudgetConfig, error) {
 	row := s.db.QueryRow(`
-		SELECT id, caller_id, budget_limit, period_sec, warning_pct, created_at, updated_at
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
 		FROM lock_budget_configs WHERE caller_id = ?
 	`, callerID)
 
 	var cfg model.LockBudgetConfig
-	err := row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.CreatedAt, &cfg.UpdatedAt)
+	err := row.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.CreatedAt, &cfg.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -4550,7 +4618,7 @@ func (s *Storage) GetLockBudgetConfig(callerID string) (*model.LockBudgetConfig,
 
 func (s *Storage) ListLockBudgetConfigs() ([]model.LockBudgetConfig, error) {
 	rows, err := s.db.Query(`
-		SELECT id, caller_id, budget_limit, period_sec, warning_pct, created_at, updated_at
+		SELECT id, caller_id, budget_limit, period_sec, warning_pct, overdraft_limit, created_at, updated_at
 		FROM lock_budget_configs ORDER BY id
 	`)
 	if err != nil {
@@ -4561,7 +4629,7 @@ func (s *Storage) ListLockBudgetConfigs() ([]model.LockBudgetConfig, error) {
 	var configs []model.LockBudgetConfig
 	for rows.Next() {
 		var cfg model.LockBudgetConfig
-		if err := rows.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
+		if err := rows.Scan(&cfg.ID, &cfg.CallerID, &cfg.BudgetLimit, &cfg.PeriodSec, &cfg.WarningPct, &cfg.OverdraftLimit, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
 			return nil, err
 		}
 		configs = append(configs, cfg)
@@ -4739,18 +4807,27 @@ func (s *Storage) CountBudgetExhaustEventsSince(callerID string, since time.Time
 func (s *Storage) UpsertBudgetPeriodSummary(summary *model.BudgetPeriodSummary) error {
 	_, err := s.db.Exec(`
 		INSERT INTO lock_budget_period_summaries (
-			caller_id, period_start_at, period_end_at, budget_limit, total_consumed,
-			peak_concurrent, lock_count, exhaust_events, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			caller_id, period_start_at, period_end_at, budget_limit, overdraft_limit,
+			total_consumed, overdraft_used, overdraft_penalty, transferred_in, transferred_out,
+			carry_over_deduction, peak_concurrent, lock_count, exhaust_events, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(caller_id, period_start_at) DO UPDATE SET
 			period_end_at = excluded.period_end_at,
 			budget_limit = excluded.budget_limit,
+			overdraft_limit = excluded.overdraft_limit,
 			total_consumed = excluded.total_consumed,
+			overdraft_used = lock_budget_period_summaries.overdraft_used + excluded.overdraft_used,
+			overdraft_penalty = lock_budget_period_summaries.overdraft_penalty + excluded.overdraft_penalty,
+			transferred_in = lock_budget_period_summaries.transferred_in + excluded.transferred_in,
+			transferred_out = lock_budget_period_summaries.transferred_out + excluded.transferred_out,
+			carry_over_deduction = excluded.carry_over_deduction,
 			peak_concurrent = MAX(peak_concurrent, excluded.peak_concurrent),
 			lock_count = excluded.lock_count,
 			exhaust_events = lock_budget_period_summaries.exhaust_events + excluded.exhaust_events
-	`, summary.CallerID, summary.PeriodStartAt, summary.PeriodEndAt, summary.BudgetLimit,
-		summary.TotalConsumed, summary.PeakConcurrent, summary.LockCount, summary.ExhaustEvents, time.Now())
+	`, summary.CallerID, summary.PeriodStartAt, summary.PeriodEndAt, summary.BudgetLimit, summary.OverdraftLimit,
+		summary.TotalConsumed, summary.OverdraftUsed, summary.OverdraftPenalty,
+		summary.TransferredIn, summary.TransferredOut, summary.CarryOverDeduction,
+		summary.PeakConcurrent, summary.LockCount, summary.ExhaustEvents, time.Now())
 	return err
 }
 
@@ -4764,14 +4841,16 @@ func (s *Storage) ListBudgetPeriodSummaries(callerID string, limit int) ([]model
 
 	if callerID != "" {
 		rows, err = s.db.Query(`
-			SELECT caller_id, period_start_at, period_end_at, budget_limit, total_consumed,
-				peak_concurrent, lock_count, exhaust_events
+			SELECT caller_id, period_start_at, period_end_at, budget_limit, overdraft_limit,
+				total_consumed, overdraft_used, overdraft_penalty, transferred_in, transferred_out,
+				carry_over_deduction, peak_concurrent, lock_count, exhaust_events
 			FROM lock_budget_period_summaries WHERE caller_id = ? ORDER BY period_start_at DESC LIMIT ?
 		`, callerID, limit)
 	} else {
 		rows, err = s.db.Query(`
-			SELECT caller_id, period_start_at, period_end_at, budget_limit, total_consumed,
-				peak_concurrent, lock_count, exhaust_events
+			SELECT caller_id, period_start_at, period_end_at, budget_limit, overdraft_limit,
+				total_consumed, overdraft_used, overdraft_penalty, transferred_in, transferred_out,
+				carry_over_deduction, peak_concurrent, lock_count, exhaust_events
 			FROM lock_budget_period_summaries ORDER BY period_start_at DESC LIMIT ?
 		`, limit)
 	}
@@ -4783,8 +4862,10 @@ func (s *Storage) ListBudgetPeriodSummaries(callerID string, limit int) ([]model
 	var summaries []model.BudgetPeriodSummary
 	for rows.Next() {
 		var s model.BudgetPeriodSummary
-		if err := rows.Scan(&s.CallerID, &s.PeriodStartAt, &s.PeriodEndAt, &s.BudgetLimit,
-			&s.TotalConsumed, &s.PeakConcurrent, &s.LockCount, &s.ExhaustEvents); err != nil {
+		if err := rows.Scan(&s.CallerID, &s.PeriodStartAt, &s.PeriodEndAt, &s.BudgetLimit, &s.OverdraftLimit,
+			&s.TotalConsumed, &s.OverdraftUsed, &s.OverdraftPenalty,
+			&s.TransferredIn, &s.TransferredOut, &s.CarryOverDeduction,
+			&s.PeakConcurrent, &s.LockCount, &s.ExhaustEvents); err != nil {
 			return nil, err
 		}
 		summaries = append(summaries, s)
@@ -4805,5 +4886,102 @@ func (s *Storage) SumTotalConsumedSince(since time.Time) (int64, error) {
 		return total.Int64, nil
 	}
 	return 0, nil
+}
+
+func (s *Storage) AddBudgetTransfer(r *model.BudgetTransferRecord) error {
+	result, err := s.db.Exec(`
+		INSERT INTO lock_budget_transfers (from_caller, to_caller, amount, reason, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, r.FromCaller, r.ToCaller, r.Amount, r.Reason, r.CreatedAt)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = result.LastInsertId()
+	return nil
+}
+
+func (s *Storage) ListBudgetTransfers(query *model.BudgetTransferListQuery) ([]model.BudgetTransferRecord, int64, error) {
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	offset := query.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	whereClauses := []string{}
+	args := []interface{}{}
+
+	if query.CallerID != "" {
+		whereClauses = append(whereClauses, "(from_caller = ? OR to_caller = ?)")
+		args = append(args, query.CallerID, query.CallerID)
+	}
+	if query.FromCaller != "" {
+		whereClauses = append(whereClauses, "from_caller = ?")
+		args = append(args, query.FromCaller)
+	}
+	if query.ToCaller != "" {
+		whereClauses = append(whereClauses, "to_caller = ?")
+		args = append(args, query.ToCaller)
+	}
+
+	whereSQL := ""
+	if len(whereClauses) > 0 {
+		whereSQL = " WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	countRow := s.db.QueryRow("SELECT COUNT(*) FROM lock_budget_transfers" + whereSQL, args...)
+	var total int64
+	if err := countRow.Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	args = append(args, limit, offset)
+	rows, err := s.db.Query(`
+		SELECT id, from_caller, to_caller, amount, reason, created_at
+		FROM lock_budget_transfers`+whereSQL+`
+		ORDER BY id DESC LIMIT ? OFFSET ?
+	`, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var records []model.BudgetTransferRecord
+	for rows.Next() {
+		var r model.BudgetTransferRecord
+		if err := rows.Scan(&r.ID, &r.FromCaller, &r.ToCaller, &r.Amount, &r.Reason, &r.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		records = append(records, r)
+	}
+	return records, total, nil
+}
+
+func (s *Storage) ListBudgetTransfersByCaller(callerID string, limit int) ([]model.BudgetTransferRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`
+		SELECT id, from_caller, to_caller, amount, reason, created_at
+		FROM lock_budget_transfers
+		WHERE from_caller = ? OR to_caller = ?
+		ORDER BY id DESC LIMIT ?
+	`, callerID, callerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []model.BudgetTransferRecord
+	for rows.Next() {
+		var r model.BudgetTransferRecord
+		if err := rows.Scan(&r.ID, &r.FromCaller, &r.ToCaller, &r.Amount, &r.Reason, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	return records, nil
 }
 
